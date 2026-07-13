@@ -44,7 +44,7 @@
 }
 
 :root {
-  --font-app-sans: Arial, Helvetica, sans-serif;
+  --font-app-sans: var(--font-poppins), "Poppins", Arial, Helvetica, sans-serif;
   --font-app-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   --radius: 0.625rem;
   --background: oklch(1 0 0);
@@ -125,5 +125,9 @@
   }
   body {
     @apply bg-background text-foreground;
+    font-family: var(--font-app-sans);
+    font-feature-settings: "kern" 1, "liga" 1;
+    letter-spacing: 0;
+    text-rendering: optimizeLegibility;
   }
 }

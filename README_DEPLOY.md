@@ -17,7 +17,7 @@ npm run dev --workspace @autodealer/polaad-web
 
 ## Required environment variables
 
-Set the same values used by the existing Kalika frontend:
+Set the same values used by the existing Polaad frontend:
 
 ```env
 PORT=

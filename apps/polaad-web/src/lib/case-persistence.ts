@@ -7,6 +7,7 @@ import type {
   QueuedUpload,
 } from "@/types/pipeline";
 import { apiFetch } from "@/lib/api-client";
+import type { PacketIntelligence } from "@/lib/packet-intelligence";
 import { getQueuedUploadFiles, serializeQueuedUploadGroups } from "@/lib/upload-groups";
 
 export type SavedCaseRecord = {
@@ -32,6 +33,18 @@ export type DuplicateCaseReference = {
   displayName: string;
   status: string;
   createdAt: string;
+};
+
+export type ShipmentBatchCase = {
+  id: string;
+  displayName: string;
+  buyerName: string | null;
+  invoiceNumber: string | null;
+  status: string;
+  documentCount: number;
+  mismatchCount: number;
+  shipmentIndex: number;
+  isCurrent: boolean;
 };
 
 export type SavedCaseFile = {
@@ -78,6 +91,8 @@ export type SavedCaseDetail = {
   files: SavedCaseFile[];
   documents: SavedCaseDocument[];
   mismatches: SavedCaseMismatch[];
+  packetIntelligence?: PacketIntelligence | null;
+  shipmentCases?: ShipmentBatchCase[];
 };
 
 export type SavedAnalysisJob = {
@@ -143,6 +158,8 @@ export type FetchCasesOptions = {
   cursor?: string | null;
   page?: number | null;
   query?: string;
+  sortMode?: "recent" | "oldest" | "name";
+  statusFilter?: "all" | "pending" | "in_review" | "completed" | "failed";
   signal?: AbortSignal;
 };
 
@@ -375,12 +392,20 @@ export async function persistProcessedCase(params: {
   documents: CaseDoc[];
   mismatches: Mismatch[];
   comparisonOptions?: ComparisonOptions;
+  packetAiUsage?: unknown;
+  allowDuplicate?: boolean;
 }): Promise<CreateCaseResponse> {
   const formData = new FormData();
   formData.set("documents", JSON.stringify(params.documents));
   formData.set("mismatches", JSON.stringify(params.mismatches));
+  if (params.allowDuplicate) {
+    formData.set("allowDuplicate", "true");
+  }
   if (params.comparisonOptions) {
     formData.set("comparisonOptions", JSON.stringify(params.comparisonOptions));
+  }
+  if (params.packetAiUsage) {
+    formData.set("packetAiUsage", JSON.stringify(params.packetAiUsage));
   }
 
   appendUploadsToFormData(formData, params.uploads);
@@ -404,9 +429,13 @@ export async function persistProcessedCase(params: {
 
 export async function createDraftCase(params: {
   uploads: QueuedUpload[];
+  allowDuplicate?: boolean;
 }): Promise<CreateCaseResponse> {
   const formData = new FormData();
   formData.set("mode", "draft");
+  if (params.allowDuplicate) {
+    formData.set("allowDuplicate", "true");
+  }
 
   appendUploadsToFormData(formData, params.uploads);
 
@@ -495,6 +524,7 @@ export async function saveCaseAnalysis(
     documents: CaseDoc[];
     mismatches: Mismatch[];
     comparisonOptions?: ComparisonOptions;
+    packetAiUsage?: unknown;
   }
 ): Promise<CreateCaseResponse> {
   const formData = new FormData();
@@ -502,6 +532,9 @@ export async function saveCaseAnalysis(
   formData.set("mismatches", JSON.stringify(params.mismatches));
   if (params.comparisonOptions) {
     formData.set("comparisonOptions", JSON.stringify(params.comparisonOptions));
+  }
+  if (params.packetAiUsage) {
+    formData.set("packetAiUsage", JSON.stringify(params.packetAiUsage));
   }
 
   const response = await performApiFetch(`/api/cases/${caseId}/analysis`, {
@@ -559,6 +592,8 @@ export async function fetchCasePage({
   cursor,
   page,
   query: searchQuery,
+  sortMode,
+  statusFilter,
   signal,
 }: FetchCasesOptions): Promise<RecentCasesResponse> {
   const query = new URLSearchParams();
@@ -571,6 +606,12 @@ export async function fetchCasePage({
   }
   if (searchQuery?.trim()) {
     query.set("q", searchQuery.trim());
+  }
+  if (statusFilter && statusFilter !== "all") {
+    query.set("status", statusFilter);
+  }
+  if (sortMode && sortMode !== "recent") {
+    query.set("sort", sortMode);
   }
 
   const response = await performApiFetch(`/api/cases?${query.toString()}`, {
@@ -739,6 +780,7 @@ export async function fetchCaseDetail(caseId: string): Promise<CaseDetailRespons
     files: payload.files,
     documents: payload.documents,
     mismatches: payload.mismatches,
+    packetIntelligence: payload.packetIntelligence ?? null,
   };
 }
 

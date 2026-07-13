@@ -4,19 +4,53 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useRef, useState } from "react";
 import {
+  LayoutDashboard,
+  FolderOpen,
+  FileStack,
+  FileText,
   Landmark,
-  ReceiptText,
+  Trash2,
   LogOut,
   ChevronsUpDown,
+  Settings,
   ChevronLeft,
+  Receipt,
 } from "lucide-react";
 
 import styles from "./DashboardSidebar.module.css";
 
-/* ── Primary nav ─────────────────────────────── */
-const PRIMARY_NAV = [
-  { href: "/bank-statements", label: "Statements", icon: ReceiptText },
-  { href: "/tally-prime", label: "Tally", icon: Landmark },
+/* ── Sectioned nav ───────────────────────────── */
+const SIDEBAR_SECTIONS = [
+  {
+    id: "main",
+    title: "Main",
+    items: [
+      { href: "/", label: "Dashboard", icon: LayoutDashboard },
+    ],
+  },
+  {
+    id: "cases",
+    title: "Cases",
+    items: [
+      { href: "/workspace", label: "Add Case", icon: FileStack },
+      { href: "/cases", label: "All Cases", icon: FolderOpen },
+    ],
+  },
+  {
+    id: "reconciliation",
+    title: "Reconciliation",
+    items: [
+      { href: "/tally-prime", label: "Bank Statements", icon: Landmark },
+      { href: "/collections", label: "Cash Discounts", icon: FileText },
+    ],
+  },
+  {
+    id: "system",
+    title: "System",
+    items: [
+      { href: "/recycle-bin", label: "Recycle Bin", icon: Trash2 },
+    ],
+  },
 ];
 
 function isActivePath(pathname: string, href: string) {
@@ -68,10 +102,39 @@ export function DashboardSidebar({ user }: DashboardSidebarProps) {
         </button>
       </div>
 
-      {/* ── PRIMARY NAVIGATION ── */}
-      <nav className={styles.navSection}>
+      {/* ── DESKTOP SECTIONED NAVIGATION ── */}
+      <nav className={`${styles.navSection} ${styles.desktopNav}`}>
+        {SIDEBAR_SECTIONS.map((section) => (
+          <div key={section.id} className={styles.sectionGroup}>
+            {!collapsed && <h3 className={styles.sectionHeader}>{section.title}</h3>}
+            <ul className={styles.navList} role="list">
+              {section.items.map((item) => {
+                const active = isActivePath(pathname, item.href);
+                const Icon = item.icon;
+                return (
+                  <li key={item.href}>
+                    <Link
+                      href={item.href}
+                      className={`${styles.navItem} ${active ? styles.navItemActive : ""}`}
+                    >
+                      <div className={styles.navItemLeft}>
+                        {active && <div className={styles.activeBar} />}
+                        <Icon className={styles.navIcon} />
+                        <span className={styles.navTitle}>{item.label}</span>
+                      </div>
+                    </Link>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        ))}
+      </nav>
+
+      {/* ── MOBILE FLAT NAVIGATION ── */}
+      <nav className={`${styles.navSection} ${styles.mobileNav}`}>
         <ul className={styles.navList} role="list">
-          {PRIMARY_NAV.map((item) => {
+          {SIDEBAR_SECTIONS.flatMap((s) => s.items).map((item) => {
             const active = isActivePath(pathname, item.href);
             const Icon = item.icon;
             return (
@@ -123,6 +186,13 @@ export function DashboardSidebar({ user }: DashboardSidebarProps) {
                 </div>
               </div>
               
+              <div className={styles.popoverMenu}>
+                <Link href="/settings" className={styles.popoverMenuItem} onClick={() => setPopoverOpen(false)}>
+                  <Settings size={14} className={styles.popoverMenuIcon} />
+                  <span>Settings</span>
+                </Link>
+              </div>
+
               <div className={styles.popoverFooter}>
                 <form action="/auth/signout" method="post" className="w-full">
                   <button type="submit" className={styles.popoverLogoutBtn}>

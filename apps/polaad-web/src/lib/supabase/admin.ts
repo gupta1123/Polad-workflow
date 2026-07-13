@@ -1,5 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
 
+import { createSupabaseFetch } from "./fetch";
+
 function requireEnv(name: string, value?: string) {
   if (!value) {
     throw new Error(`Missing required environment variable: ${name}`);
@@ -18,6 +20,9 @@ export function createSupabaseAdminClient() {
   );
 
   return createClient(supabaseUrl, serviceRoleKey, {
+    global: {
+      fetch: createSupabaseFetch(),
+    },
     auth: {
       autoRefreshToken: false,
       persistSession: false,

@@ -1,17 +1,10 @@
-import { redirect } from "next/navigation";
-
 import { Login } from "@/components/login/Login";
-import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { Suspense } from "react";
 
-export default async function LoginPage() {
-  const supabase = await createSupabaseServerClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  if (user) {
-    redirect("/bank-statements");
-  }
-
-  return <Login />;
+export default function LoginPage() {
+  return (
+    <Suspense fallback={null}>
+      <Login />
+    </Suspense>
+  );
 }

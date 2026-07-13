@@ -18,6 +18,27 @@ function safeNextPath(value: string | null) {
   return value;
 }
 
+async function withAuthTimeout<T>(operation: Promise<T>, timeoutMs = 20_000): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_, reject) => {
+        timeout = setTimeout(() => {
+          reject(new Error("Authentication timed out. Check the Supabase URL/network and try again."));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+function isLocalDbMode() {
+  return process.env.NEXT_PUBLIC_LOCAL_DB_MODE === "true";
+}
+
 export function Login() {
   const searchParams = useSearchParams();
   const supabase = useMemo(() => createSupabaseBrowserClient(), []);
@@ -104,30 +125,42 @@ export function Login() {
     setError(null);
     setMessage(null);
 
-    const { data, error: signInError } = await supabase.auth.signInWithPassword({
-      email,
-      password,
-    });
-
-    if (signInError) {
-      setError(signInError.message);
-      setLoadingMode(null);
+    if (isLocalDbMode()) {
+      window.location.assign(nextPath);
       return;
     }
 
-    if (!data.session) {
-      const {
-        data: { session },
-      } = await supabase.auth.getSession();
+    try {
+      const { data, error: signInError } = await withAuthTimeout(
+        supabase.auth.signInWithPassword({
+          email,
+          password,
+        })
+      );
 
-      if (!session) {
-        setError("Signed in, but the secure session was not established. Refresh and try again.");
+      if (signInError) {
+        setError(signInError.message);
         setLoadingMode(null);
         return;
       }
-    }
 
-    window.location.assign(nextPath);
+      if (!data.session) {
+        const {
+          data: { session },
+        } = await withAuthTimeout(supabase.auth.getSession());
+
+        if (!session) {
+          setError("Signed in, but the secure session was not established. Refresh and try again.");
+          setLoadingMode(null);
+          return;
+        }
+      }
+
+      window.location.assign(nextPath);
+    } catch (authError) {
+      setError(authError instanceof Error ? authError.message : "Authentication failed. Try again.");
+      setLoadingMode(null);
+    }
   }
 
   return (
@@ -227,7 +260,7 @@ export function Login() {
           <div className={styles.cardHeader}>
             <h1 className={styles.cardTitle}>Identify.</h1>
             <p className={styles.cardSub}>
-              Authenticate to access statement and Tally workflows.
+              Authenticate to access your case workspace.
             </p>
           </div>
 

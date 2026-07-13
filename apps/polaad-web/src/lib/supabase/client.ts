@@ -1,5 +1,7 @@
 import { createBrowserClient } from "@supabase/ssr";
 
+import { createSupabaseFetch } from "./fetch";
+
 function requireEnv(name: string, value?: string) {
   if (!value) {
     throw new Error(`Missing required environment variable: ${name}`);
@@ -13,6 +15,11 @@ export function createSupabaseBrowserClient() {
     requireEnv(
       "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY",
       process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY
-    )
+    ),
+    {
+      global: {
+        fetch: createSupabaseFetch(),
+      },
+    }
   );
 }

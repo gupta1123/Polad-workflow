@@ -74,6 +74,20 @@ const MULTI_INSTANCE_IDENTIFIER_FIELDS = new Set<FieldKey>([
   "fastagReference",
   "transactionReference",
 ]);
+const MULTI_INVOICE_PARTIAL_FIELDS = new Set<FieldKey>([
+  "invoiceNumber",
+  "vehicleNumber",
+  "subtotal",
+  "taxAmount",
+  "totalAmount",
+  "itemQuantity",
+]);
+const MULTI_INVOICE_AGGREGATE_FIELDS = new Set<FieldKey>([
+  "subtotal",
+  "taxAmount",
+  "totalAmount",
+  "itemQuantity",
+]);
 const EXPECTATION_FIELD_ALIASES: Partial<Record<FieldKey, FieldKey[]>> = {
   poNumber: ["poNumber", "referencePoNumber"],
   invoiceNumber: ["invoiceNumber", "referenceInvoiceNumber"],
@@ -310,6 +324,283 @@ function shouldSuppressSplitWeighmentMismatch(
 
   const hasNonWeighmentValue = populated.some((entry) => entry.doc.type !== "Weighment Slip");
   return !hasNonWeighmentValue || context.aggregateMatches;
+}
+
+function normalizeDocReference(doc: CaseDoc, field: FieldKey, comparisonOptions: ComparisonOptions) {
+  return normalizeGroupValue(getComparableFieldValue(doc, field), comparisonOptions, field);
+}
+
+function getLineItemTaxAmount(line: CommercialLineItem) {
+  const direct = parseNumber(line.taxAmount);
+  if (direct !== null) return direct;
+
+  const componentAmounts = [line.cgstAmount, line.sgstAmount, line.igstAmount]
+    .map((value) => parseNumber(value))
+    .filter((value): value is number => value !== null);
+  return componentAmounts.length ? componentAmounts.reduce((sum, value) => sum + value, 0) : null;
+}
+
+function sumLineItemNumericValues(
+  lines: CommercialLineItem[] | undefined,
+  getValue: (line: CommercialLineItem) => number | null
+) {
+  let total = 0;
+  let count = 0;
+
+  for (const line of lines ?? []) {
+    const value = getValue(line);
+    if (value === null) continue;
+    total += value;
+    count += 1;
+  }
+
+  return count > 0 ? total : null;
+}
+
+function getLineItemAggregateValue(doc: CaseDoc, field: FieldKey): number | null {
+  if (field === "itemQuantity") {
+    return sumLineItemNumericValues(
+      doc.lineItems,
+      (line) => convertQuantityToBase(line.quantity, line.unit) ?? parseNumber(line.quantity)
+    );
+  }
+
+  if (field === "subtotal") {
+    return sumLineItemNumericValues(doc.lineItems, (line) =>
+      parseNumber(line.taxableAmount ?? line.lineTotal)
+    );
+  }
+
+  if (field === "taxAmount") {
+    return sumLineItemNumericValues(doc.lineItems, getLineItemTaxAmount);
+  }
+
+  if (field === "totalAmount") {
+    const lineTotal = sumLineItemNumericValues(doc.lineItems, (line) => parseNumber(line.lineTotal));
+    if (lineTotal !== null) return lineTotal;
+
+    const subtotal = getLineItemAggregateValue(doc, "subtotal");
+    const taxAmount = getLineItemAggregateValue(doc, "taxAmount");
+    return subtotal !== null && taxAmount !== null ? subtotal + taxAmount : null;
+  }
+
+  return null;
+}
+
+function getNumericDocumentFieldValue(doc: CaseDoc, field: FieldKey) {
+  if (field === "itemQuantity") {
+    return (
+      convertQuantityToBase(doc.fields.itemQuantity, doc.fields.unit) ??
+      parseNumber(doc.fields.itemQuantity) ??
+      getLineItemAggregateValue(doc, field)
+    );
+  }
+
+  if (MULTI_INVOICE_AGGREGATE_FIELDS.has(field)) {
+    return parseNumber(getComparableFieldValue(doc, field)) ?? getLineItemAggregateValue(doc, field);
+  }
+
+  return null;
+}
+
+function normalizedInvoicePartyField(doc: CaseDoc, field: FieldKey, comparisonOptions: ComparisonOptions) {
+  return normalizeGroupValue(doc.fields[field], comparisonOptions, field);
+}
+
+function invoicePartyValuesCompatible(left: CaseDoc, right: CaseDoc, comparisonOptions: ComparisonOptions) {
+  const partyFields: FieldKey[] = ["supplierGstin", "buyerGstin"];
+  return partyFields.every((field) => {
+    const leftValue = normalizedInvoicePartyField(left, field, comparisonOptions);
+    const rightValue = normalizedInvoicePartyField(right, field, comparisonOptions);
+    return !leftValue || !rightValue || leftValue === rightValue;
+  });
+}
+
+function invoiceNumericValuesCompatible(left: CaseDoc, right: CaseDoc) {
+  return [...MULTI_INVOICE_AGGREGATE_FIELDS].every((field) => {
+    const leftValue = getNumericDocumentFieldValue(left, field);
+    const rightValue = getNumericDocumentFieldValue(right, field);
+    return leftValue === null || rightValue === null || nearlyEqual(leftValue, rightValue);
+  });
+}
+
+function areInvoiceCopiesForAggregation(left: CaseDoc, right: CaseDoc, comparisonOptions: ComparisonOptions) {
+  const leftInvoiceNumber = normalizeDocReference(left, "invoiceNumber", comparisonOptions);
+  const rightInvoiceNumber = normalizeDocReference(right, "invoiceNumber", comparisonOptions);
+  return Boolean(
+    leftInvoiceNumber &&
+      rightInvoiceNumber &&
+      leftInvoiceNumber === rightInvoiceNumber &&
+      invoicePartyValuesCompatible(left, right, comparisonOptions) &&
+      invoiceNumericValuesCompatible(left, right)
+  );
+}
+
+function uniqueInvoiceDocumentsForAggregation(docs: CaseDoc[], comparisonOptions: ComparisonOptions) {
+  const uniqueInvoices: CaseDoc[] = [];
+
+  for (const doc of docs) {
+    if (!INVOICE_DOC_TYPES.has(doc.type)) continue;
+    if (uniqueInvoices.some((invoice) => areInvoiceCopiesForAggregation(invoice, doc, comparisonOptions))) continue;
+    uniqueInvoices.push(doc);
+  }
+
+  return uniqueInvoices;
+}
+
+function purchaseOrderReferences(docs: CaseDoc[], comparisonOptions: ComparisonOptions) {
+  return new Set(
+    docs
+      .filter((doc) => PURCHASE_DOC_TYPES.has(doc.type))
+      .map((doc) => normalizeDocReference(doc, "poNumber", comparisonOptions))
+      .filter((value): value is string => Boolean(value))
+  );
+}
+
+function invoicesBelongToPurchaseOrder(
+  invoices: CaseDoc[],
+  purchaseRefs: Set<string>,
+  comparisonOptions: ComparisonOptions
+) {
+  if (!purchaseRefs.size) return false;
+
+  let matchedInvoiceCount = 0;
+  for (const invoice of invoices) {
+    const invoicePo = normalizeDocReference(invoice, "poNumber", comparisonOptions);
+    if (!invoicePo) continue;
+    if (!purchaseRefs.has(invoicePo)) return false;
+    matchedInvoiceCount += 1;
+  }
+
+  return matchedInvoiceCount > 0;
+}
+
+function invoiceAggregateMatchesPurchaseOrder(
+  field: FieldKey,
+  invoices: CaseDoc[],
+  purchaseDocs: CaseDoc[]
+) {
+  if (!MULTI_INVOICE_AGGREGATE_FIELDS.has(field)) return false;
+
+  let invoiceTotal = 0;
+  let invoiceCount = 0;
+  for (const invoice of invoices) {
+    const value = getNumericDocumentFieldValue(invoice, field);
+    if (value === null) continue;
+    invoiceTotal += value;
+    invoiceCount += 1;
+  }
+
+  if (invoiceCount < 2) return false;
+
+  return purchaseDocs.some((purchaseDoc) => {
+    const purchaseValue = getNumericDocumentFieldValue(purchaseDoc, field);
+    return purchaseValue !== null && nearlyEqual(invoiceTotal, purchaseValue);
+  });
+}
+
+function getInvoiceBranchReference(doc: CaseDoc, comparisonOptions: ComparisonOptions) {
+  return normalizeGroupValue(doc.fields.referenceInvoiceNumber, comparisonOptions, "referenceInvoiceNumber") ??
+    normalizeDocReference(doc, "invoiceNumber", comparisonOptions);
+}
+
+function eWayBillsReferenceKnownInvoices(
+  eWayBills: CaseDoc[],
+  invoiceRefs: Set<string>,
+  comparisonOptions: ComparisonOptions
+) {
+  if (!eWayBills.length) return true;
+
+  let referencedCount = 0;
+  for (const eWayBill of eWayBills) {
+    const reference = getInvoiceBranchReference(eWayBill, comparisonOptions);
+    if (!reference) continue;
+    if (!invoiceRefs.has(reference)) return false;
+    referencedCount += 1;
+  }
+
+  return referencedCount > 0;
+}
+
+function branchValuesConsistentWithInvoice(
+  field: FieldKey,
+  invoices: CaseDoc[],
+  branchDocs: CaseDoc[],
+  comparisonOptions: ComparisonOptions
+) {
+  const invoicesByReference = new Map<string, CaseDoc[]>();
+  for (const invoice of invoices) {
+    const reference = normalizeDocReference(invoice, "invoiceNumber", comparisonOptions);
+    if (!reference) continue;
+    invoicesByReference.set(reference, [...(invoicesByReference.get(reference) ?? []), invoice]);
+  }
+
+  for (const branchDoc of branchDocs) {
+    const reference = getInvoiceBranchReference(branchDoc, comparisonOptions);
+    if (!reference) continue;
+
+    const matchingInvoices = invoicesByReference.get(reference) ?? [];
+    if (!matchingInvoices.length) return false;
+
+    if (MULTI_INVOICE_AGGREGATE_FIELDS.has(field)) {
+      const branchValue = getNumericDocumentFieldValue(branchDoc, field);
+      if (branchValue === null) continue;
+
+      const hasMatchingInvoiceValue = matchingInvoices.some((invoice) => {
+        const invoiceValue = getNumericDocumentFieldValue(invoice, field);
+        return invoiceValue !== null && nearlyEqual(branchValue, invoiceValue);
+      });
+      if (!hasMatchingInvoiceValue) return false;
+    }
+
+    if (field === "vehicleNumber") {
+      const branchVehicle = normalizeDocReference(branchDoc, "vehicleNumber", comparisonOptions);
+      if (!branchVehicle) continue;
+
+      const invoiceVehicles = matchingInvoices
+        .map((invoice) => normalizeDocReference(invoice, "vehicleNumber", comparisonOptions))
+        .filter((value): value is string => Boolean(value));
+      if (invoiceVehicles.length && !invoiceVehicles.includes(branchVehicle)) return false;
+    }
+  }
+
+  return true;
+}
+
+function shouldSuppressMultiInvoicePartialMismatch(
+  field: FieldKey,
+  docs: CaseDoc[],
+  entries: Array<{ doc: CaseDoc; docId: string; value: string | number | null | undefined }>,
+  comparisonOptions: ComparisonOptions
+) {
+  if (!MULTI_INVOICE_PARTIAL_FIELDS.has(field)) return false;
+
+  const populated = entries.filter((entry) => isComparableFieldValue(field, entry.value, comparisonOptions));
+  if (populated.length < 2) return false;
+
+  const purchaseDocs = docs.filter((doc) => PURCHASE_DOC_TYPES.has(doc.type));
+  if (!purchaseDocs.length) return false;
+
+  const uniqueInvoices = uniqueInvoiceDocumentsForAggregation(docs, comparisonOptions);
+  if (uniqueInvoices.length < 2) return false;
+
+  const purchaseRefs = purchaseOrderReferences(docs, comparisonOptions);
+  if (!invoicesBelongToPurchaseOrder(uniqueInvoices, purchaseRefs, comparisonOptions)) return false;
+
+  const aggregateMatches = [...MULTI_INVOICE_AGGREGATE_FIELDS].some((aggregateField) =>
+    invoiceAggregateMatchesPurchaseOrder(aggregateField, uniqueInvoices, purchaseDocs)
+  );
+  if (!aggregateMatches) return false;
+
+  const invoiceRefs = new Set(
+    uniqueInvoices
+      .map((invoice) => normalizeDocReference(invoice, "invoiceNumber", comparisonOptions))
+      .filter((value): value is string => Boolean(value))
+  );
+  const eWayBills = docs.filter((doc) => doc.type === "E-Way Bill");
+  if (!eWayBillsReferenceKnownInvoices(eWayBills, invoiceRefs, comparisonOptions)) return false;
+
+  return branchValuesConsistentWithInvoice(field, uniqueInvoices, eWayBills, comparisonOptions);
 }
 
 function normalizePartyName(value: string | number | null | undefined) {
@@ -558,6 +849,10 @@ function buildMismatch(
   }
 
   if (shouldSuppressSplitWeighmentMismatch(field, docs, comparableEntries, comparisonOptions)) {
+    return null;
+  }
+
+  if (shouldSuppressMultiInvoicePartialMismatch(field, docs, comparableEntries, comparisonOptions)) {
     return null;
   }
 

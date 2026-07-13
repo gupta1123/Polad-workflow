@@ -1,6 +1,8 @@
 import { createServerClient } from "@supabase/ssr";
 import { cookies } from "next/headers";
 
+import { createSupabaseFetch } from "./fetch";
+
 function requireEnv(name: string, value?: string) {
   if (!value) {
     throw new Error(`Missing required environment variable: ${name}`);
@@ -18,6 +20,9 @@ export async function createSupabaseServerClient() {
       process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY
     ),
     {
+      global: {
+        fetch: createSupabaseFetch(),
+      },
       cookies: {
         getAll() {
           return cookieStore.getAll();
