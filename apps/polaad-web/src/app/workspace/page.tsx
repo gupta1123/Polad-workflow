@@ -1,11 +1,5 @@
-import { RuntimeFieldSettingsBootstrap } from "@/components/settings/RuntimeFieldSettingsBootstrap";
-import { WorkspacePage } from "@/components/workspace/WorkspacePage";
+import { redirect } from "next/navigation";
 
 export default function PacketWorkspacePage() {
-  return (
-    <>
-      <RuntimeFieldSettingsBootstrap />
-      <WorkspacePage />
-    </>
-  );
+  redirect("/bank-statements");
 }

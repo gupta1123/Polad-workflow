@@ -1,5 +1,5 @@
-import { RecycleBinPage } from "@/components/cases/RecycleBinPage";
+import { redirect } from "next/navigation";
 
 export default function RecycleBinRoute() {
-  return <RecycleBinPage />;
+  redirect("/bank-statements");
 }

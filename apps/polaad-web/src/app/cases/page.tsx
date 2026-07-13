@@ -1,5 +1,5 @@
-import { CasesPage } from "@/components/cases/CasesPage";
+import { redirect } from "next/navigation";
 
 export default function SavedCasesPage() {
-  return <CasesPage />;
+  redirect("/bank-statements");
 }
