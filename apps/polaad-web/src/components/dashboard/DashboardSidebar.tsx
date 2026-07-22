@@ -7,8 +7,8 @@ import {
   Landmark,
   LogOut,
   ChevronsUpDown,
+  Settings,
   ChevronLeft,
-  Receipt,
 } from "lucide-react";
 
 import styles from "./DashboardSidebar.module.css";
@@ -19,8 +19,7 @@ const SIDEBAR_SECTIONS = [
     id: "reconciliation",
     title: "Reconciliation",
     items: [
-      { href: "/bank-statements", label: "Bank Statements", icon: Landmark },
-      { href: "/cash-deposits", label: "Cash Deposit", icon: Receipt },
+      { href: "/tally-prime", label: "Bank Statements", icon: Landmark },
     ],
   },
 ];
@@ -124,16 +123,6 @@ export function DashboardSidebar({ user }: DashboardSidebarProps) {
               </li>
             );
           })}
-          <li className={styles.mobileLogoutItem}>
-            <form action="/auth/signout" method="post">
-              <button type="submit" className={`${styles.navItem} ${styles.mobileLogoutButton}`}>
-                <div className={styles.navItemLeft}>
-                  <LogOut className={styles.navIcon} />
-                  <span className={styles.navTitle}>Logout</span>
-                </div>
-              </button>
-            </form>
-          </li>
         </ul>
       </nav>
 
@@ -157,6 +146,14 @@ export function DashboardSidebar({ user }: DashboardSidebarProps) {
                   <div className={styles.popoverUserEmail}>{displayUser.email}</div>
                 </div>
               </div>
+              
+              <div className={styles.popoverMenu}>
+                <Link href="/settings" className={styles.popoverMenuItem} onClick={() => setPopoverOpen(false)}>
+                  <Settings size={14} className={styles.popoverMenuIcon} />
+                  <span>Settings</span>
+                </Link>
+              </div>
+
               <div className={styles.popoverFooter}>
                 <form action="/auth/signout" method="post" className="w-full">
                   <button type="submit" className={styles.popoverLogoutBtn}>
