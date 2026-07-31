@@ -1,31 +1,22 @@
 {
-  "name": "autodealer-workspace",
+  "name": "polaad-frontend",
   "version": "1.0.0",
   "private": true,
   "workspaces": [
-    "apps/*",
-    "packages/*"
+    "apps/polaad-web"
   ],
   "engines": {
     "node": "24.x",
     "npm": "11.x"
   },
   "scripts": {
-    "dev:web": "npm run dev --workspace @autodealer/web",
-    "dev:api": "npm run dev --workspace @autodealer/api",
-    "build:web": "npm run build --workspace @autodealer/web",
-    "build:api": "npm run build --workspace @autodealer/api",
-    "heroku-postbuild": "npm run build:api",
-    "build": "npm run build:web && npm run build:api",
-    "lint:web": "npm run lint --workspace @autodealer/web",
-    "lint:api": "npm run lint --workspace @autodealer/api",
-    "lint": "npm run lint:web && npm run lint:api",
-    "typecheck:web": "npm run typecheck --workspace @autodealer/web",
-    "typecheck:api": "npm run typecheck --workspace @autodealer/api",
-    "typecheck": "npm run typecheck:web && npm run typecheck:api",
-    "quality:packet-regressions": "node scripts/packet-quality-regressions.mjs",
-    "worker": "npm run worker --workspace @autodealer/api",
-    "worker:local": "npm run worker:local --workspace @autodealer/api"
+    "dev:web": "npm run dev --workspace @autodealer/polaad-web",
+    "build:web": "npm run build --workspace @autodealer/polaad-web",
+    "build": "npm run build:web",
+    "lint:web": "npm run lint --workspace @autodealer/polaad-web",
+    "lint": "npm run lint:web",
+    "typecheck:web": "npm run typecheck --workspace @autodealer/polaad-web",
+    "typecheck": "npm run typecheck:web"
   },
   "dependencies": {
     "@google/genai": "^0.5.0",
