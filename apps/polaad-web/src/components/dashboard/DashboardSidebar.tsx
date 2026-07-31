@@ -7,7 +7,6 @@ import {
   Landmark,
   LogOut,
   ChevronsUpDown,
-  Settings,
   ChevronLeft,
   PlugZap,
 } from "lucide-react";
@@ -156,13 +155,6 @@ export function DashboardSidebar({ user }: DashboardSidebarProps) {
                 </div>
               </div>
               
-              <div className={styles.popoverMenu}>
-                <Link href="/settings" className={styles.popoverMenuItem} onClick={() => setPopoverOpen(false)}>
-                  <Settings size={14} className={styles.popoverMenuIcon} />
-                  <span>Settings</span>
-                </Link>
-              </div>
-
               <div className={styles.popoverFooter}>
                 <form action="/auth/signout" method="post" className="w-full">
                   <button type="submit" className={styles.popoverLogoutBtn}>
