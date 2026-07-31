@@ -13,6 +13,8 @@
     "dev:web": "npm run dev --workspace @autodealer/polaad-web",
     "build:web": "npm run build --workspace @autodealer/polaad-web",
     "build": "npm run build:web",
+    "installer:tally-bridge": "node scripts/build-tally-connector-installer.mjs",
+    "installer:tally-bridge:validate": "node scripts/build-tally-connector-installer.mjs --validate",
     "lint:web": "npm run lint --workspace @autodealer/polaad-web",
     "lint": "npm run lint:web",
     "typecheck:web": "npm run typecheck --workspace @autodealer/polaad-web",

@@ -3,6 +3,11 @@ node_modules/
 dist/
 coverage/
 *.tsbuildinfo
+installer/**/output/
+installer/**/payload/
+installer/**/payload-clean/
+installer/**/release/
+installer/**/.cache/
 
 .env
 .env.*
