@@ -19,7 +19,7 @@ const SIDEBAR_SECTIONS = [
     id: "reconciliation",
     title: "Reconciliation",
     items: [
-      { href: "/tally-prime", label: "Bank Statements", icon: Landmark },
+      { href: "/bank-statements", label: "Bank Statements", icon: Landmark },
     ],
   },
 ];
