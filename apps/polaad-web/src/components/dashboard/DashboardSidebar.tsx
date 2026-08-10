@@ -7,7 +7,6 @@ import {
   Landmark,
   LogOut,
   ChevronsUpDown,
-  Settings,
   ChevronLeft,
   PlugZap,
 } from "lucide-react";
@@ -17,10 +16,10 @@ import styles from "./DashboardSidebar.module.css";
 /* ── Sectioned nav ───────────────────────────── */
 const SIDEBAR_SECTIONS = [
   {
-    id: "reconciliation",
-    title: "Reconciliation",
+    id: "bank-statement",
+    title: "Bank Statement",
     items: [
-      { href: "/bank-statements", label: "Bank Statements", icon: Landmark },
+      { href: "/bank-statements", label: "Bank Statement", icon: Landmark },
     ],
   },
   {
@@ -161,14 +160,6 @@ export function DashboardSidebar({ user, defaultCollapsed = false }: DashboardSi
                   <div className={styles.popoverUserEmail}>{displayUser.email}</div>
                 </div>
               </div>
-              
-              <div className={styles.popoverMenu}>
-                <Link href="/settings" className={styles.popoverMenuItem} onClick={() => setPopoverOpen(false)}>
-                  <Settings size={14} className={styles.popoverMenuIcon} />
-                  <span>Settings</span>
-                </Link>
-              </div>
-
               <div className={styles.popoverFooter}>
                 <form action="/auth/signout" method="post" className="w-full">
                   <button type="submit" className={styles.popoverLogoutBtn}>
