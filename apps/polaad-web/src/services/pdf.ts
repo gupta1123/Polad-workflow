@@ -97,7 +97,14 @@ async function imageFileToImagePage(file: File): Promise<string> {
   });
 }
 
-export async function fileToImagePages(file: File): Promise<string[]> {
+type PdfImagePageOptions = {
+  scale?: number;
+  quality?: number;
+  shouldCancel?: () => boolean;
+  onPage?: (page: string, pageNumber: number, totalPages: number) => void;
+};
+
+export async function fileToImagePages(file: File, options: PdfImagePageOptions = {}): Promise<string[]> {
   if (isImageFile(file)) {
     return [await imageFileToImagePage(file)];
   }
@@ -109,8 +116,9 @@ export async function fileToImagePages(file: File): Promise<string[]> {
     const images: string[] = [];
 
     for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
+      if (options.shouldCancel?.()) break;
       const page = await pdf.getPage(pageNumber);
-      const viewport = page.getViewport({ scale: 1.5 });
+      const viewport = page.getViewport({ scale: options.scale ?? 1.5 });
       const canvas = document.createElement("canvas");
       const context = canvas.getContext("2d");
 
@@ -122,7 +130,12 @@ export async function fileToImagePages(file: File): Promise<string[]> {
       canvas.height = viewport.height;
 
       await page.render({ canvasContext: context, viewport }).promise;
-      images.push(canvas.toDataURL("image/jpeg", 0.9));
+      if (options.shouldCancel?.()) break;
+      const renderedPage = canvas.toDataURL("image/jpeg", options.quality ?? 0.9);
+      images.push(renderedPage);
+      options.onPage?.(renderedPage, pageNumber, pdf.numPages);
+      canvas.width = 1;
+      canvas.height = 1;
     }
 
     return images;
