@@ -4,18 +4,18 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const connector = {
-  brandName: "Polad",
-  connectorName: "Polad Tally Connector",
-  executableName: "Polad Tally Connector.exe",
-  executableProcessName: "Polad Tally Connector",
-  setupName: "PoladTallyConnectorSetup.exe",
+  brandName: "Polaad",
+  connectorName: "Polaad Tally Connector",
+  executableName: "Polaad Tally Connector.exe",
+  executableProcessName: "Polaad Tally Connector",
+  setupName: "PolaadTallyConnectorSetup.exe",
   protocolName: "polaad-tally",
   configFolderName: ".polaad-tally-bridge",
-  installDir: "C:\\Polad\\tally-bridge",
-  runtimeEnvironmentVariable: "POLAD_CONNECTOR_RUNTIME",
+  installDir: "C:\\Polaad\\tally-bridge",
+  runtimeEnvironmentVariable: "POLAAD_CONNECTOR_RUNTIME",
   tdlFileName: "polaad-native-debit-note-export.tdl",
   runtimePackageName: "@polaad/tally-bridge-runtime",
-  tempFolderName: "polad-tally-connector-installer",
+  tempFolderName: "polaad-tally-connector-installer",
 };
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -39,7 +39,7 @@ const dashboardSource = path.join(
   "tally",
   "TallyPrimeDashboard.tsx"
 );
-const innoDefinition = path.join(installerRoot, "polad-tally-bridge.iss");
+const innoDefinition = path.join(installerRoot, "polaad-tally-bridge.iss");
 const tempBuildRoot = `C:\\tmp\\${connector.tempFolderName}`;
 const stagingDir = path.join(tempBuildRoot, "staging");
 const tempOutputDir = path.join(tempBuildRoot, "output");
@@ -111,6 +111,38 @@ function findRuntimeExecutable(runtimeSource) {
     .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".exe"))
     .filter((entry) => !/(setup|unins|update|squirrel)/i.test(entry.name));
   return candidates.length === 1 ? path.join(runtimeSource, candidates[0].name) : null;
+}
+
+function findRuntime() {
+  const candidates = [
+    process.env[connector.runtimeEnvironmentVariable],
+    connector.installDir,
+    process.env.KALIKA_CONNECTOR_RUNTIME,
+    "C:\\Autodealer\\tally-bridge",
+  ].filter(Boolean);
+
+  for (const runtimeSource of candidates) {
+    const executable = findRuntimeExecutable(runtimeSource);
+    if (executable) return { runtimeSource, executable };
+  }
+
+  throw new Error(
+    `Missing Electron runtime. Set ${connector.runtimeEnvironmentVariable} to an Electron runtime directory.`
+  );
+}
+
+function findInnoCompiler() {
+  const candidates = [
+    process.env.INNO_SETUP_COMPILER,
+    path.join(process.env.LOCALAPPDATA || "", "Programs", "Inno Setup 6", "ISCC.exe"),
+    "C:\\Program Files (x86)\\Inno Setup 6\\ISCC.exe",
+    "C:\\Program Files\\Inno Setup 6\\ISCC.exe",
+  ].filter(Boolean);
+  const compiler = candidates.find((candidate) => fs.existsSync(candidate));
+  if (!compiler) {
+    throw new Error("Inno Setup 6 compiler was not found. Install JRSoftware.InnoSetup or set INNO_SETUP_COMPILER.");
+  }
+  return compiler;
 }
 
 function copyOptionalRuntimeFile(runtimeSource, name) {
@@ -189,17 +221,11 @@ function writeSedFile() {
 validateSources();
 if (process.argv.includes("--validate")) process.exit(0);
 if (process.platform !== "win32") {
-  throw new Error("The setup executable must be built on Windows because it uses PowerShell and IExpress.");
+  throw new Error("The setup executable must be built on Windows because it uses Inno Setup.");
 }
 
-const runtimeSource =
-  process.env[connector.runtimeEnvironmentVariable] || connector.installDir;
-const runtimeExecutable = findRuntimeExecutable(runtimeSource);
-if (!runtimeExecutable) {
-  throw new Error(
-    `Missing Electron runtime in ${runtimeSource}. Set ${connector.runtimeEnvironmentVariable} to a Windows Electron runtime directory.`
-  );
-}
+const { runtimeSource, executable: runtimeExecutable } = findRuntime();
+const innoCompiler = findInnoCompiler();
 
 resetDir(payloadDir);
 resetDir(stagingDir);
@@ -242,7 +268,7 @@ fs.writeFileSync(
   `${JSON.stringify(
     {
       name: connector.runtimePackageName,
-      version: "0.1.32",
+      version: "0.1.41",
       private: true,
       type: "module",
     },
@@ -251,26 +277,10 @@ fs.writeFileSync(
   )}\n`
 );
 
-writeInstallFiles();
-if (fs.existsSync(payloadZip)) fs.rmSync(payloadZip, { force: true });
-execFileSync(
-  "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
-  [
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-Command",
-    `Compress-Archive -Path '${payloadDir}\\*' -DestinationPath '${payloadZip}' -Force`,
-  ],
-  { stdio: "inherit" }
-);
-
-const sedPath = writeSedFile();
 if (fs.existsSync(outputExe)) fs.rmSync(outputExe, { force: true });
-if (fs.existsSync(tempOutputExe)) fs.rmSync(tempOutputExe, { force: true });
-execFileSync("C:\\Windows\\System32\\iexpress.exe", ["/N", sedPath], {
+execFileSync(innoCompiler, [innoDefinition], {
+  cwd: installerRoot,
   stdio: "inherit",
 });
-if (!fs.existsSync(tempOutputExe)) throw new Error("IExpress did not create the setup executable.");
-fs.copyFileSync(tempOutputExe, outputExe);
+if (!fs.existsSync(outputExe)) throw new Error("Inno Setup did not create the setup executable.");
 console.log(`Installer created: ${outputExe}`);

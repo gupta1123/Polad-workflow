@@ -1,6 +1,6 @@
 {
   "name": "@polaad/tally-bridge",
-  "version": "0.1.32",
+  "version": "0.1.41",
   "private": true,
   "type": "module",
   "exports": {
@@ -13,5 +13,8 @@
     "disconnect": "node src/bridge.mjs disconnect",
     "test": "node src/bridge.mjs test",
     "sync": "node src/bridge.mjs sync-masters"
+  },
+  "dependencies": {
+    "ws": "8.21.1"
   }
 }
