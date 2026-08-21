@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog } from "electron";
+import { app, BrowserWindow, dialog, net } from "electron";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +14,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const installDir = path.resolve(__dirname, "..", "..");
 const logPath = path.join(installDir, "bridge.log");
 const errPath = path.join(installDir, "bridge.err.log");
+const nodeFetch = globalThis.fetch.bind(globalThis);
 
 let mainWindow = null;
 let runner = null;
@@ -24,6 +25,32 @@ let lastStatus = {
   detail: `Open ${BRAND_NAME} and click Connect.`,
   state: "idle",
 };
+
+function installSystemNetworkFetch() {
+  // Prefer Chromium's Windows-aware proxy and certificate handling, then
+  // retry through Node HTTPS when Chromium returns an opaque net::ERR_FAILED.
+  globalThis.fetch = async (input, init) => {
+    try {
+      return await net.fetch(input instanceof URL ? input.toString() : input, init);
+    } catch (error) {
+      appendLog(
+        errPath,
+        `Electron network request failed (${formatConnectorError(error)}); retrying with Node HTTPS.`
+      );
+      return nodeFetch(input, init);
+    }
+  };
+}
+
+function formatConnectorError(error) {
+  if (!(error instanceof Error)) return String(error);
+  const cause = error.cause;
+  if (cause instanceof Error) {
+    const code = typeof cause.code === "string" ? ` (${cause.code})` : "";
+    return `${error.message}: ${cause.message}${code}`;
+  }
+  return error.message;
+}
 
 function appendLog(filePath, message) {
   const line = `[${new Date().toISOString()}] ${message}\n`;
@@ -269,6 +296,7 @@ if (!gotLock) {
     else pendingProtocolUrl = url;
   });
   app.whenReady().then(() => {
+    installSystemNetworkFetch();
     createWindow();
     const protocolArg =
       process.argv.find((entry) => entry.startsWith(`${PROTOCOL_NAME}://`)) || pendingProtocolUrl;
