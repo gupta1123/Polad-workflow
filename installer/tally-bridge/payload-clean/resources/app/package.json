@@ -1,0 +1,7 @@
+{
+  "name": "polaad-tally-connector-wrapper",
+  "version": "0.1.42",
+  "private": true,
+  "type": "module",
+  "main": "main.mjs"
+}
