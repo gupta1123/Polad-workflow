@@ -9,7 +9,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.54";
+const BRIDGE_VERSION = "0.1.55";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -5013,6 +5013,7 @@ function tallyLiveGatewayUrl(config) {
 function startTallyLiveChannel(config, executeExclusive, options = {}) {
   let socket = null;
   let reconnectTimer = null;
+  let keepaliveTimer = null;
   let stopped = false;
 
   const log = (level, message) => emitLog(options, level, message);
@@ -5020,6 +5021,8 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
     if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload));
   };
   const scheduleReconnect = () => {
+    if (keepaliveTimer) clearInterval(keepaliveTimer);
+    keepaliveTimer = null;
     if (stopped || reconnectTimer) return;
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
@@ -5156,6 +5159,13 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
           connectionId: config.connectionId,
           token: config.bridgeToken,
         });
+        // Send application data as well as relying on WebSocket pong frames.
+        // This keeps the cloud route active and prevents a healthy live
+        // connector from being dropped on the platform's idle boundary.
+        keepaliveTimer = setInterval(() => {
+          send({ type: "keepalive", timestamp: Date.now() });
+        }, 15_000);
+        keepaliveTimer.unref?.();
       });
       socket.addEventListener("message", (event) => {
         try {
@@ -5192,6 +5202,8 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
   connect();
   return () => {
     stopped = true;
+    if (keepaliveTimer) clearInterval(keepaliveTimer);
+    keepaliveTimer = null;
     if (reconnectTimer) clearTimeout(reconnectTimer);
     socket?.close();
   };
