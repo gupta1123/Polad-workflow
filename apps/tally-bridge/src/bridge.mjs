@@ -1,16 +1,20 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomUUID, X509Certificate } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { rootCertificates } from "node:tls";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.42";
+const BRIDGE_VERSION = "0.1.53";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
-const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
+const MAX_COMMANDS_PER_CYCLE = 50;
 const TALLY_IMPORT_TIMEOUT_MS = 30_000;
+const BACKEND_REQUEST_TIMEOUT_MS = 10_000;
 // Exports can be larger than imports, but they must still release the bridge
 // cycle if Tally is busy or has stopped responding.
 const TALLY_EXPORT_TIMEOUT_MS = 60_000;
@@ -28,6 +32,49 @@ const PURCHASE_DOCUMENT_UDFS = {
 };
 const DEFAULT_TALLY_DATA_ROOT = path.join(process.env.PUBLIC || "C:\\Users\\Public", "TallyPrime", "data");
 const CURRENT_FILE = fileURLToPath(import.meta.url);
+let cachedWindowsTlsCertificates;
+
+function windowsTlsCertificates() {
+  if (cachedWindowsTlsCertificates) return cachedWindowsTlsCertificates;
+  cachedWindowsTlsCertificates = [...rootCertificates];
+  if (process.platform !== "win32") return cachedWindowsTlsCertificates;
+
+  try {
+    const powershell = path.join(
+      process.env.SystemRoot || "C:\\Windows",
+      "System32",
+      "WindowsPowerShell",
+      "v1.0",
+      "powershell.exe"
+    );
+    const output = execFileSync(
+      powershell,
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "$locations = [System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine,[System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser; foreach ($location in $locations) { foreach ($name in 'Root','CA') { $store = [System.Security.Cryptography.X509Certificates.X509Store]::new($name,$location); try { $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly); foreach ($certificate in $store.Certificates) { [Convert]::ToBase64String($certificate.RawData) } } finally { $store.Close() } } }",
+      ],
+      { encoding: "utf8", windowsHide: true, timeout: 15_000, maxBuffer: 8 * 1024 * 1024 }
+    );
+    const windowsRoots = output
+      .split(/\r?\n/)
+      .map((value) => value.trim())
+      .filter(Boolean)
+      .flatMap((value) => {
+        try {
+          return [new X509Certificate(Buffer.from(value, "base64")).toString()];
+        } catch {
+          return [];
+        }
+      });
+    cachedWindowsTlsCertificates.push(...windowsRoots);
+  } catch {
+    // The standard Node root set remains available if Windows certificate
+    // discovery is blocked by local policy.
+  }
+  return cachedWindowsTlsCertificates;
+}
 
 function parseArgs(argv) {
   const args = {};
@@ -957,6 +1004,7 @@ export function buildBankVoucherXml(payload, fallbackCompanyName, options = {}) 
     companyName,
     voucherDate,
     legacyHeader: options.legacyHeader === true,
+    legacyEnvelope: options.legacyEnvelope === true,
     messages: [
       buildVoucherMessageXml({
         voucherDate,
@@ -967,6 +1015,33 @@ export function buildBankVoucherXml(payload, fallbackCompanyName, options = {}) 
         partyLedgerName: voucherType === "Journal" ? null : partyLedgerName,
       }),
     ],
+  });
+}
+
+export function buildBankVoucherBatchXml(payloads, fallbackCompanyName) {
+  if (!Array.isArray(payloads) || payloads.length === 0) {
+    throw new Error("Bank voucher batch requires at least one voucher.");
+  }
+
+  const companyName = payloads[0]?.companyName || fallbackCompanyName;
+  const voucherDate = toIsoLikeDate(payloads[0]?.voucherDate);
+  const messages = payloads.map((payload) => {
+    const voucherXml = buildBankVoucherXml(payload, companyName);
+    const message = voucherXml.match(/<TALLYMESSAGE\b[\s\S]*?<\/TALLYMESSAGE>/i)?.[0];
+    if (!message) {
+      throw new Error("Could not build a Tally message for a bank voucher batch.");
+    }
+    return message;
+  });
+
+  // This is Tally's documented Data import protocol. It is intentionally
+  // different from the Import Data / IMPORTDATA protocol used by other
+  // request shapes; mixing the two makes Tally return `DESC not found`.
+  return wrapVoucherMessagesXml({
+    companyName,
+    voucherDate,
+    messages,
+    legacyEnvelope: true,
   });
 }
 
@@ -1821,13 +1896,234 @@ async function postBankVoucher(tallyUrl, payload, companyName) {
     }
   }
 
-  const primaryXml = buildBankVoucherXml(payload, companyName);
+  const primaryXml = buildBankVoucherXml(payload, companyName, { legacyEnvelope: true });
   const primaryOutcome = explainBankVoucherTallyError(
     requireCreatedVoucher(await invokeTallyXml(tallyUrl, primaryXml)),
     payload
   );
 
   return { outcome: primaryOutcome, xml: primaryXml, retriedWithLegacyHeader: false };
+}
+
+export function getBankVoucherCommandBatchKey(payload = {}, fallbackCompanyName = null) {
+  return [
+    normalizeLooseName(payload.companyName || fallbackCompanyName),
+    normalizeLooseName(payload.bankLedgerName),
+  ].join("::");
+}
+
+async function runBankVoucherCommandBatch(config, commands, options = {}) {
+  const groups = new Map();
+  for (const command of commands) {
+    const payload = command?.payload || {};
+    // Tally accepts mixed voucher types and bill-allocation modes as separate
+    // TALLYMESSAGE entries in the same import envelope. Keep the grouping key
+    // limited to the shared duplicate-check context so a statement can post up
+    // to 50 vouchers in one request while retaining per-command isolation.
+    const key = getBankVoucherCommandBatchKey(payload, config.companyName);
+    const group = groups.get(key) || [];
+    group.push(command);
+    groups.set(key, group);
+  }
+
+  for (const group of groups.values()) {
+    let preflightByTransactionId = null;
+    try {
+      const firstPayload = group[0]?.payload || {};
+      const batchPreflight = await reconcileBankTransactionsInTally(config, {
+        companyName: firstPayload.companyName || config.companyName || null,
+        bankLedgerName: firstPayload.bankLedgerName,
+        // Duplicate detection only needs the voucher collection. Fetching the
+        // bank closing balance here added another unrelated Tally request to
+        // every post and could consume the full export timeout.
+        includeBalanceProof: false,
+        transactions: group.map((command) => ({
+          ...command.payload,
+          expectedDirection:
+            command.payload?.expectedDirection ||
+            (/receipt/i.test(String(command.payload?.voucherType || "")) ? "incoming" : "outgoing"),
+        })),
+      });
+      preflightByTransactionId = new Map(
+        (batchPreflight.result?.transactions || []).map((row) => [String(row.transactionId || ""), row])
+      );
+    } catch (error) {
+      console.warn(
+        `Batch duplicate preflight was unavailable; falling back to independent checks: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+
+    const pendingCommands = [];
+    for (const command of group) {
+      try {
+        const transactionId = String(command.payload?.transactionId || "");
+        const preflight = preflightByTransactionId?.get(transactionId) || null;
+        if (preflight?.verificationStatus === "found") {
+          await sendCommandResult(config, command, {
+            success: true,
+            result: {
+              alreadyInTally: true,
+              created: 0,
+              altered: 0,
+              voucherId: preflight.voucherId,
+              voucherNumber: preflight.voucherNumber,
+              voucherDate: preflight.voucherDate,
+              duplicateCheck: preflight,
+              transactionId,
+            },
+          });
+          console.log(`Command ${command.id} completed: bank transaction already existed in Tally.`);
+          continue;
+        }
+        if (preflight?.verificationStatus === "ambiguous") {
+          await sendCommandResult(config, command, {
+            success: false,
+            error: "Possible existing bank transaction found in Tally. Review before posting to avoid a duplicate.",
+            result: {
+              possibleDuplicateInTally: true,
+              duplicateCheck: preflight,
+              transactionId,
+            },
+          });
+          console.log(`Command ${command.id} needs review: possible duplicate bank transaction.`);
+          continue;
+        }
+
+        pendingCommands.push(command);
+      } catch (error) {
+        console.error(
+          `Command ${command.id} failed without blocking the remaining vouchers: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
+    }
+
+    if (pendingCommands.length === 0) continue;
+
+    const firstPayload = pendingCommands[0].payload || {};
+    const companyName = firstPayload.companyName || config.companyName || null;
+    let batchXml = null;
+    let batchOutcome = null;
+    const batchStartedAt = Date.now();
+    try {
+      batchXml = buildBankVoucherBatchXml(
+        pendingCommands.map((command) => command.payload),
+        companyName
+      );
+      batchOutcome = await invokeTallyXml(config.tallyUrl, batchXml);
+    } catch (error) {
+      batchOutcome = {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+        result: {},
+      };
+    }
+
+    const batchElapsedMs = Date.now() - batchStartedAt;
+    const importedCount =
+      Number(batchOutcome.result?.created || 0) + Number(batchOutcome.result?.altered || 0);
+    if (batchOutcome.success && importedCount >= pendingCommands.length) {
+      await sendCommandResults(
+        config,
+        pendingCommands.map((command) => ({
+          command,
+          outcome: {
+            success: true,
+            result: {
+              created: 1,
+              altered: 0,
+              transactionId: command.payload?.transactionId,
+              sourceBankTransactionId: command.payload?.transactionId,
+              voucherId: command.payload?.referenceNumber || command.id,
+              voucherNumber: command.payload?.referenceNumber || null,
+              requestXml: previewXml(batchXml),
+              batchImport: true,
+              batchSize: pendingCommands.length,
+              batchElapsedMs,
+            },
+          },
+        }))
+      );
+      console.log(
+        `Posted ${pendingCommands.length} bank vouchers in one Tally request (${batchElapsedMs} ms).`
+      );
+      continue;
+    }
+
+    // A Tally batch may create its valid messages and report only the invalid
+    // ones as exceptions. Reconcile once after a mixed result so already-created
+    // rows are never retried as duplicates, then retry only confirmed-missing
+    // rows independently. One bad voucher therefore cannot block the others.
+    let postflightByTransactionId = null;
+    try {
+      const postflight = await reconcileBankTransactionsInTally(config, {
+        companyName,
+        bankLedgerName: firstPayload.bankLedgerName,
+        includeBalanceProof: false,
+        transactions: pendingCommands.map((command) => ({
+          ...command.payload,
+          expectedDirection:
+            command.payload?.expectedDirection ||
+            (/receipt/i.test(String(command.payload?.voucherType || "")) ? "incoming" : "outgoing"),
+        })),
+      });
+      postflightByTransactionId = new Map(
+        (postflight.result?.transactions || []).map((row) => [String(row.transactionId || ""), row])
+      );
+    } catch (error) {
+      console.warn(
+        `Batch postflight verification was unavailable: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+
+    for (const command of pendingCommands) {
+      const transactionId = String(command.payload?.transactionId || "");
+      const postflight = postflightByTransactionId?.get(transactionId) || null;
+      if (postflight?.verificationStatus === "found") {
+        await sendCommandResult(config, command, {
+          success: true,
+          result: {
+            created: 1,
+            transactionId,
+            sourceBankTransactionId: transactionId,
+            voucherId: postflight.voucherId || command.payload?.referenceNumber || command.id,
+            voucherNumber: postflight.voucherNumber || command.payload?.referenceNumber || null,
+            duplicateCheck: postflight,
+            requestXml: batchXml ? previewXml(batchXml) : null,
+            batchImport: true,
+            batchSize: pendingCommands.length,
+            batchElapsedMs,
+          },
+        });
+        continue;
+      }
+
+      try {
+        await runCommand(
+          config,
+          {
+            ...command,
+            payload: {
+              ...command.payload,
+              preflightVerifyExisting: postflightByTransactionId === null,
+            },
+          },
+          options
+        );
+      } catch (error) {
+        console.error(
+          `Command ${command.id} failed after batch isolation: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
+    }
+  }
 }
 
 async function postCustomerAdvanceAdjustment(tallyUrl, payload, companyName) {
@@ -2051,6 +2347,55 @@ function parseMasterCollection(xml, tagName) {
   return dedupeMasters(
     extractBlocks(xml, tagName)
       .map((block) => toMaster(block, tagName))
+      .filter(Boolean)
+  );
+}
+
+// Bank-statement analysis only needs identity, hierarchy and bill-wise state for
+// the complete ledger list. Avoid the generic master parser here: it scans every
+// ledger for dozens of GST, contact, address and inventory fields that are not
+// used by this workflow.
+function parseBankStatementMasterCollection(xml, tagName, { bankDetails = false } = {}) {
+  return dedupeMasters(
+    extractBlocks(xml, tagName)
+      .map((block) => {
+        const name = getAttribute(block, "NAME") || getTagText(block, "NAME");
+        if (!name) return null;
+        const closingBalance = bankDetails
+          ? parseLedgerClosingBalance(getTagText(block, "CLOSINGBALANCE"))
+          : { amount: null, type: null };
+        const bankName = bankDetails
+          ? getTagText(block, "BANKNAME") || getTagText(block, "BANK") || getTagText(block, "BANKERNAME")
+          : null;
+        const bankAccountNumber = bankDetails
+          ? getTagText(block, "BANKACCOUNTNUMBER") || getTagText(block, "ACCOUNTNUMBER") ||
+            getTagText(block, "BANKACCOUNTNO") || getTagText(block, "BANKACNO") || getTagText(block, "ACNUMBER")
+          : null;
+        const ifscCode = bankDetails
+          ? getTagText(block, "IFSCCODE") || getTagText(block, "IFSCODE") ||
+            getTagText(block, "IFSC") || getTagText(block, "BANKIFSCCODE")
+          : null;
+        const accountHolderName = bankDetails
+          ? getTagText(block, "BANKACCHOLDERNAME") || getTagText(block, "BANKACCOUNTNAME") ||
+            getTagText(block, "BANKACCOUNTHOLDERNAME") || getTagText(block, "ACCOUNTHOLDERNAME")
+          : null;
+
+        return {
+          name,
+          guid: getTagText(block, "GUID") || null,
+          parent: getTagText(block, "PARENT") || null,
+          bankName,
+          bankAccountNumber,
+          ifscCode,
+          accountHolderName,
+          closingBalance: closingBalance.amount,
+          closingBalanceType: closingBalance.type,
+          raw: {
+            tallyTag: tagName,
+            billWiseEnabled: /^yes$/i.test(getTagText(block, "ISBILLWISEON")),
+          },
+        };
+      })
       .filter(Boolean)
   );
 }
@@ -2712,22 +3057,25 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}) {
     (entry) => normalizeLooseName(entry.ledgerName) === normalizeLooseName(bankLedgerName)
   ));
   const tallyMovement = periodBankEntries.reduce((sum, entry) => sum - Number(entry.amount || 0), 0);
+  const includeBalanceProof = commandPayload.includeBalanceProof !== false;
   let tallyClosingBalance = null;
-  let balanceError = null;
-  try {
-    const rawTallyClosingBalance = await fetchLedgerClosingBalance(tallyUrl, {
-      companyName,
-      ledgerName: bankLedgerName,
-      dateFrom,
-      dateTo,
-    });
-    // Tally's internal amount sign is opposite to the bank statement view for
-    // asset bank ledgers: debit balances are negative internally.
-    tallyClosingBalance = Number.isFinite(rawTallyClosingBalance)
-      ? -Number(rawTallyClosingBalance)
-      : null;
-  } catch (error) {
-    balanceError = error instanceof Error ? error.message : String(error);
+  let balanceError = includeBalanceProof ? null : "Balance proof skipped for posting duplicate preflight.";
+  if (includeBalanceProof) {
+    try {
+      const rawTallyClosingBalance = await fetchLedgerClosingBalance(tallyUrl, {
+        companyName,
+        ledgerName: bankLedgerName,
+        dateFrom,
+        dateTo,
+      });
+      // Tally's internal amount sign is opposite to the bank statement view for
+      // asset bank ledgers: debit balances are negative internally.
+      tallyClosingBalance = Number.isFinite(rawTallyClosingBalance)
+        ? -Number(rawTallyClosingBalance)
+        : null;
+    } catch (error) {
+      balanceError = error instanceof Error ? error.message : String(error);
+    }
   }
   const derivedTallyOpeningBalance = Number.isFinite(tallyClosingBalance)
     ? Number(tallyClosingBalance) - tallyMovement
@@ -3436,6 +3784,25 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}, depe
   };
 }
 
+function toBankStatementLiveMaster(master, type) {
+  const billWiseEnabled = master?.raw?.billWiseEnabled;
+  return {
+    name: master.name,
+    guid: master.guid || null,
+    parent: master.parent || null,
+    type,
+    ...(type === "ledger" ? {
+      billWiseEnabled: typeof billWiseEnabled === "boolean" ? billWiseEnabled : null,
+      bankName: master.bankName || null,
+      bankAccountNumber: master.bankAccountNumber || null,
+      ifscCode: master.ifscCode || null,
+      accountHolderName: master.accountHolderName || null,
+      closingBalance: master.closingBalance ?? null,
+      closingBalanceType: master.closingBalanceType ?? null,
+    } : {}),
+  };
+}
+
 function taxLedgerIdentity(master) {
   const name = master.name || "";
   const raw = master.raw || {};
@@ -3593,8 +3960,10 @@ async function fetchBankLedgersFromTally(config, commandPayload = {}) {
 }
 
 async function collectTallyMasters(config, commandPayload = {}) {
+  const timings = {};
   const companyName = commandPayload.companyName || null;
   const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
+  const fieldProfile = String(commandPayload.fieldProfile || "").trim();
   const requestedMasterTypes = new Set(
     Array.isArray(commandPayload.requestedMasterTypes)
       ? commandPayload.requestedMasterTypes.map((value) => String(value || "").trim())
@@ -3609,29 +3978,41 @@ async function collectTallyMasters(config, commandPayload = {}) {
   const fetches = [];
   const fetchMaster = (key, type, collectionName, fetchFields) => {
     if (!shouldFetch(type)) return;
-    fetches.push([key, exportTallyCollection(tallyUrl, {
+    fetches.push([key, () => exportTallyCollection(tallyUrl, {
       collectionName,
       tallyType: type === "stock_item" ? "StockItem" : type === "voucher_type" ? "VoucherType" : type[0].toUpperCase() + type.slice(1),
       fetchFields,
       companyName,
     })]);
   };
-  fetchMaster("ledgerXml", "ledger", "Polaad Ledgers Sync",
-    "Name,Parent,GUID,ClosingBalance,PartyGSTIN,IsBillWiseOn,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BranchName,BankBranchName,Branch,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName,Email,EmailId,LedgerEmail,LedgerEmailId,LedgerMobile,Mobile,MobileNo,PhoneNumber,Phone,LedgerPhone,ContactPerson,Contact,AttentionTo,Address,Address1,Address2,Address3,Address4,Pincode,TaxType,GSTDutyHead,RateOfTaxCalculation");
+  const ledgerFetchFields = fieldProfile === "bank_statement"
+    ? "Name,Parent,GUID,IsBillWiseOn"
+    : "Name,Parent,GUID,ClosingBalance,PartyGSTIN,IsBillWiseOn,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BranchName,BankBranchName,Branch,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName,Email,EmailId,LedgerEmail,LedgerEmailId,LedgerMobile,Mobile,MobileNo,PhoneNumber,Phone,LedgerPhone,ContactPerson,Contact,AttentionTo,Address,Address1,Address2,Address3,Address4,Pincode,TaxType,GSTDutyHead,RateOfTaxCalculation";
+  fetchMaster("ledgerXml", "ledger", "Polaad Ledgers Sync", ledgerFetchFields);
   fetchMaster("groupXml", "group", "Polaad Groups Sync", "Name,Parent,GUID");
   fetchMaster("stockItemXml", "stock_item", "Polaad Stock Items Sync",
     "Name,Parent,GUID,BaseUnits,OriginalBaseUnits,GSTHSNCode,HSNCode,GSTTaxRate,RateOfTaxCalculation,IsGSTApplicable");
   fetchMaster("unitXml", "unit", "Polaad Units Sync", "Name,GUID,OriginalName,DecimalPlaces,IsSimpleUnit");
   fetchMaster("voucherTypeXml", "voucher_type", "Polaad Voucher Types Sync", "Name,Parent,GUID");
-  if (shouldFetch("ledger")) {
-    fetches.push(["companyXml", exportTallyCollection(tallyUrl, {
+  if (shouldFetch("ledger") && fieldProfile !== "bank_statement") {
+    fetches.push(["companyXml", () => exportTallyCollection(tallyUrl, {
       collectionName: "Polaad Company Profile Sync",
       tallyType: "Company",
       fetchFields: "Name,GUID,PartyGSTIN,GSTIN,GSTRegistrationNumber,GSTRegNumber,StateName,State,CountryName,Country,IsGSTOn,GSTRegistrationDetails.*",
       companyName,
     }).catch(() => "")]);
   }
-  const resolved = Object.fromEntries(await Promise.all(fetches.map(async ([key, request]) => [key, await request])));
+  let resolved;
+  if (fieldProfile === "bank_statement") {
+    resolved = {};
+    for (const [key, request] of fetches) {
+      const startedAt = Date.now();
+      resolved[key] = await request();
+      timings[`${key}ExportMs`] = Date.now() - startedAt;
+    }
+  } else {
+    resolved = Object.fromEntries(await Promise.all(fetches.map(async ([key, request]) => [key, await request()])));
+  }
   const ledgerXml = resolved.ledgerXml || "";
   const groupXml = resolved.groupXml || "";
   const stockItemXml = resolved.stockItemXml || "";
@@ -3639,8 +4020,62 @@ async function collectTallyMasters(config, commandPayload = {}) {
   const voucherTypeXml = resolved.voucherTypeXml || "";
   const companyXml = resolved.companyXml || "";
 
-  const ledgers = parseMasterCollection(ledgerXml, "LEDGER");
-  const groups = parseMasterCollection(groupXml, "GROUP");
+  const parseStartedAt = Date.now();
+  let ledgers = fieldProfile === "bank_statement"
+    ? parseBankStatementMasterCollection(ledgerXml, "LEDGER")
+    : parseMasterCollection(ledgerXml, "LEDGER");
+  const groups = fieldProfile === "bank_statement"
+    ? parseBankStatementMasterCollection(groupXml, "GROUP")
+    : parseMasterCollection(groupXml, "GROUP");
+  timings.parseMs = Date.now() - parseStartedAt;
+
+  if (fieldProfile === "bank_statement" && shouldFetch("ledger")) {
+    const groupParentByName = new Map(
+      groups.map((item) => [normalizeLooseName(item.name), item.parent || null])
+    );
+    const descendsFrom = (parentName, targetGroupName) => {
+      const target = normalizeLooseName(targetGroupName);
+      const visited = new Set();
+      let current = parentName;
+      while (current) {
+        const normalized = normalizeLooseName(current);
+        if (!normalized || visited.has(normalized)) return false;
+        if (normalized === target) return true;
+        visited.add(normalized);
+        current = groupParentByName.get(normalized) || null;
+      }
+      return false;
+    };
+    const bankLedgerNames = ledgers
+      .filter((ledger) =>
+        descendsFrom(ledger.parent, "Bank Accounts") || descendsFrom(ledger.parent, "Bank OD A/c")
+      )
+      .map((ledger) => ledger.name);
+
+    if (bankLedgerNames.length > 0) {
+      const detailStartedAt = Date.now();
+      const filterName = "PolaadBankStatementLedgerFilter";
+      const bankXml = await exportTallyCollection(tallyUrl, {
+        collectionName: "Polaad Bank Statement Ledger Details",
+        tallyType: "Ledger",
+        fetchFields: "Name,Parent,GUID,ClosingBalance,IsBillWiseOn,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName",
+        companyName,
+        formulae: [{ name: filterName, formula: buildRequestedLedgerFormula(bankLedgerNames, ["$Name"]) }],
+        filterNames: [filterName],
+      });
+      timings.bankDetailExportMs = Date.now() - detailStartedAt;
+      const detailParseStartedAt = Date.now();
+      const detailsByName = new Map(
+        parseBankStatementMasterCollection(bankXml, "LEDGER", { bankDetails: true })
+          .map((master) => [normalizeLooseName(master.name), master])
+      );
+      ledgers = ledgers.map((ledger) => ({
+        ...ledger,
+        ...(detailsByName.get(normalizeLooseName(ledger.name)) || {}),
+      }));
+      timings.bankDetailParseMs = Date.now() - detailParseStartedAt;
+    }
+  }
   const stockItems = parseMasterCollection(stockItemXml, "STOCKITEM");
   const units = parseMasterCollection(unitXml, "UNIT");
   const voucherTypes = parseMasterCollection(voucherTypeXml, "VOUCHERTYPE");
@@ -3660,6 +4095,7 @@ async function collectTallyMasters(config, commandPayload = {}) {
     // to avoid sending omitted master types as empty arrays, which would retire
     // a previously-good snapshot for those types on the API.
     requestedMasterTypes: Array.from(requestedMasterTypes),
+    timings,
     ledgers,
     groups,
     stockItems,
@@ -3850,16 +4286,21 @@ async function testTally(tallyUrl) {
   }
 }
 
-async function receiveNextCommand(config) {
+async function receiveNextCommands(config, limit = MAX_COMMANDS_PER_CYCLE) {
   const url = new URL(`${config.apiBase}/api/tally/bridge/commands/next`);
   url.searchParams.set("connectionId", config.connectionId);
   url.searchParams.set("bridgeVersion", BRIDGE_VERSION);
+  url.searchParams.set("limit", String(Math.max(1, Math.min(MAX_COMMANDS_PER_CYCLE, limit))));
 
   const response = await fetch(url, {
     method: "GET",
     headers: {
       Authorization: `Bearer ${config.bridgeToken}`,
     },
+    // A sleeping/restarting cloud API must not hold the entire connector
+    // cycle indefinitely. The live channel can keep serving Tally work while
+    // the next heartbeat retries this lightweight command poll.
+    signal: AbortSignal.timeout(BACKEND_REQUEST_TIMEOUT_MS),
   });
   const payload = await readJsonResponse(response);
 
@@ -3867,7 +4308,18 @@ async function receiveNextCommand(config) {
     throw new Error(payload.error || `Command poll failed with HTTP ${response.status}.`);
   }
 
-  return payload.command ?? null;
+  if (Array.isArray(payload.commands)) return payload.commands;
+  return payload.command ? [payload.command] : [];
+}
+
+async function sendCommandResults(config, entries, concurrency = 10) {
+  for (let index = 0; index < entries.length; index += concurrency) {
+    await Promise.all(
+      entries
+        .slice(index, index + concurrency)
+        .map(({ command, outcome }) => sendCommandResult(config, command, outcome))
+    );
+  }
 }
 
 async function sendCommandResult(config, command, outcome) {
@@ -4445,6 +4897,7 @@ async function sendHeartbeat(config, testResult, availableCompanies = []) {
       companyName: testResult.companyName ?? null,
       companies: availableCompanies,
     }),
+    signal: AbortSignal.timeout(BACKEND_REQUEST_TIMEOUT_MS),
   });
   const payload = await readJsonResponse(response);
 
@@ -4462,26 +4915,39 @@ async function runOnce(config, options = {}) {
   // and the local PDF renderer, not a fresh Tally HTTP call. Claim and finish
   // it before a slow/unreachable Tally heartbeat can hold the customer send
   // flow hostage for a minute.
-  let deferredCommand = null;
+  const deferredCommands = [];
   try {
-    const command = await receiveNextCommand(config);
-    const isVerifiedDebitNotePdf =
-      command &&
-      (command.commandType === "export_debit_note_pdf" ||
-        (command.commandType === "create_debit_note" && command.payload?.operation === "export_native_pdf"));
-    if (isVerifiedDebitNotePdf) {
-      await runCommand(config, command, options);
-    } else {
-      deferredCommand = command;
+    const claimedCommands = await receiveNextCommands(config);
+    for (const command of claimedCommands) {
+      const isVerifiedDebitNotePdf =
+        command.commandType === "export_debit_note_pdf" ||
+        (command.commandType === "create_debit_note" && command.payload?.operation === "export_native_pdf");
+      if (isVerifiedDebitNotePdf) {
+        await runCommand(config, command, options);
+      } else {
+        deferredCommands.push(command);
+      }
     }
   } catch (commandError) {
-    console.error(commandError instanceof Error ? commandError.message : commandError);
+    emitLog(options, "error", commandError instanceof Error ? commandError.message : String(commandError));
   }
 
   const result = await testTally(config.tallyUrl);
+  const companyCache = options.companyHeartbeatCache || null;
+  const cacheIsFresh =
+    companyCache &&
+    companyCache.activeCompanyName === (result.companyName || null) &&
+    Date.now() - Number(companyCache.fetchedAt || 0) < 60_000;
   const availableCompanies = result.tallyReachable
-    ? await fetchAvailableCompanies(config.tallyUrl, result.companyName)
+    ? cacheIsFresh
+      ? companyCache.companies
+      : await fetchAvailableCompanies(config.tallyUrl, result.companyName)
     : [];
+  if (companyCache && result.tallyReachable && !cacheIsFresh) {
+    companyCache.activeCompanyName = result.companyName || null;
+    companyCache.companies = availableCompanies;
+    companyCache.fetchedAt = Date.now();
+  }
   const heartbeat = await sendHeartbeat(config, result, availableCompanies);
   const company = result.companyName ? ` Company: ${result.companyName}.` : "";
   const companyList =
@@ -4494,8 +4960,24 @@ async function runOnce(config, options = {}) {
   );
 
   try {
-    if (deferredCommand) {
-      await runCommand(config, deferredCommand, options);
+    const bankVoucherCommands = deferredCommands.filter(
+      (command) => command.commandType === "post_bank_voucher"
+    );
+    for (const command of deferredCommands) {
+      if (command.commandType !== "post_bank_voucher") {
+        try {
+          await runCommand(config, command, options);
+        } catch (error) {
+          console.error(
+            `Command ${command.id} failed without blocking the remaining queue: ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          );
+        }
+      }
+    }
+    if (bankVoucherCommands.length > 0) {
+      await runBankVoucherCommandBatch(config, bankVoucherCommands, options);
     }
   } catch (commandError) {
     console.error(commandError instanceof Error ? commandError.message : commandError);
@@ -4548,7 +5030,9 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
     const operation = String(message.operation || "");
     if (!requestId) return;
     try {
+      const lockRequestedAt = Date.now();
       const data = await executeExclusive(async () => {
+        const lockWaitMs = Date.now() - lockRequestedAt;
         if (operation === "company_check") return collectTallyCompanyCheck(config);
         if (operation === "bank_ledgers") {
           const outcome = await fetchBankLedgersFromTally(config, {
@@ -4558,13 +5042,20 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
           return outcome.result || outcome;
         }
         if (operation === "ledger_masters") {
+          const operationStartedAt = Date.now();
           const requestedMasterTypes =
             Array.isArray(message.payload?.requestedMasterTypes) && message.payload.requestedMasterTypes.length > 0
               ? message.payload.requestedMasterTypes
               : ["ledger", "group"];
+          const isBankStatementMasterRead =
+            requestedMasterTypes.length === 2 &&
+            requestedMasterTypes.includes("ledger") &&
+            requestedMasterTypes.includes("group") &&
+            message.payload?.persistSnapshot !== true;
           const masters = await collectTallyMasters(config, {
             companyName: message.companyName,
             requestedMasterTypes,
+            fieldProfile: message.payload?.fieldProfile || (isBankStatementMasterRead ? "bank_statement" : ""),
           });
           const requestedTypes = new Set(requestedMasterTypes);
           const masterPayload = {};
@@ -4575,32 +5066,57 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
           if (requestedTypes.has("voucher_type")) masterPayload.voucherTypes = masters.voucherTypes;
           if (requestedTypes.has("gst_ledger")) masterPayload.gstLedgers = masters.gstLedgers;
           if (requestedTypes.has("tax_ledger")) masterPayload.taxLedgers = masters.taxLedgers;
-          const syncPayload = {
-            connectionId: config.connectionId,
-            companyName: message.companyName || config.companyName || null,
-            bridgeVersion: BRIDGE_VERSION,
-            masters: masterPayload,
-            companyProfile: masters.companyProfile,
-            requestedMasterTypes: masters.requestedMasterTypes,
-          };
-          const syncResult = await postMastersToBackend(config, syncPayload);
-          return {
+          // Interactive ledger reads must remain local and fast. Persisting a
+          // 12k+ master snapshot here blocked the browser for about a minute
+          // and could disconnect the live socket. Explicit sync_masters
+          // commands still use syncMastersFromTally and persist the snapshot.
+          let syncRunId = null;
+          if (message.payload?.persistSnapshot === true) {
+            const syncResult = await postMastersToBackend(config, {
+              connectionId: config.connectionId,
+              companyName: message.companyName || config.companyName || null,
+              bridgeVersion: BRIDGE_VERSION,
+              masters: masterPayload,
+              companyProfile: masters.companyProfile,
+              requestedMasterTypes: masters.requestedMasterTypes,
+            });
+            syncRunId = syncResult.syncRunId || null;
+          }
+          log(
+            "info",
+            `Live ledger fetch completed in ${Date.now() - operationStartedAt} ms (${masters.ledgers.length} ledgers, ${masters.groups.length} groups, lock ${lockWaitMs} ms, phases ${JSON.stringify(masters.timings || {})}, persistence ${message.payload?.persistSnapshot === true ? "enabled" : "skipped"}).`
+          );
+          const responseLedgers = isBankStatementMasterRead
+            ? masters.ledgers.map((master) => toBankStatementLiveMaster(master, "ledger"))
+            : masters.ledgers;
+          const responseGroups = isBankStatementMasterRead
+            ? masters.groups.map((master) => toBankStatementLiveMaster(master, "group"))
+            : masters.groups;
+          const response = {
             source: "live_tally",
             companyName: message.companyName,
             fetchedAt: new Date().toISOString(),
-            syncRunId: syncResult.syncRunId,
-            ledgers: masters.ledgers,
-            groups: masters.groups,
+            syncRunId,
+            timings: { lockWaitMs, ...(masters.timings || {}), totalMs: Date.now() - lockRequestedAt },
+            ledgers: responseLedgers,
+            groups: responseGroups,
             stockItems: masters.stockItems,
             units: masters.units,
             companyProfile: masters.companyProfile,
-            masters: {
-              ledgers: masters.ledgers,
-              groups: masters.groups,
+          };
+          // Bank Statements consumes the top-level ledgers/groups. Do not add
+          // the legacy nested copy here: it doubled an already-large 12k row
+          // WebSocket message and caused Heroku to terminate the live socket.
+          if (!isBankStatementMasterRead) {
+            response.masters = {
+              ledgers: responseLedgers,
+              groups: responseGroups,
               stockItems: masters.stockItems,
               units: masters.units,
-            },
-          };
+            };
+          }
+          log("info", `Live ledger response size: ${Buffer.byteLength(JSON.stringify(response))} bytes.`);
+          return response;
         }
         if (operation === "verify_bank_transaction") {
           const outcome = await reconcileBankTransactionsInTally(config, message.payload || {});
@@ -4627,7 +5143,9 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
   const connect = () => {
     if (stopped) return;
     try {
-      socket = new WebSocket(tallyLiveGatewayUrl(config));
+      socket = new WebSocket(tallyLiveGatewayUrl(config), {
+        ca: windowsTlsCertificates(),
+      });
       socket.addEventListener("open", () => {
         send({
           type: "authenticate",
@@ -4650,8 +5168,18 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
           log("error", error instanceof Error ? error.message : "Invalid live Tally message.");
         }
       });
-      socket.addEventListener("error", () => log("error", "Live Tally channel is unavailable; retrying."));
-      socket.addEventListener("close", scheduleReconnect);
+      socket.addEventListener("error", (event) => {
+        const detail = String(event?.message || event?.error?.message || "").trim();
+        log("error", `Live Tally channel is unavailable${detail ? `: ${detail}` : ""}; retrying.`);
+      });
+      socket.addEventListener("close", (event) => {
+        const code = Number(event?.code || 0);
+        const reason = String(event?.reason || "").trim();
+        if (!stopped && (code !== 1000 || reason)) {
+          log("error", `Live Tally channel closed (code ${code || "unknown"}${reason ? `: ${reason}` : ""}); retrying.`);
+        }
+        scheduleReconnect();
+      });
     } catch (error) {
       log("error", error instanceof Error ? error.message : "Could not start the live Tally channel.");
       scheduleReconnect();
@@ -4662,6 +5190,180 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
   return () => {
     stopped = true;
     if (reconnectTimer) clearTimeout(reconnectTimer);
+    socket?.close();
+  };
+}
+
+async function fetchCommandRealtimeConfig(config) {
+  const url = new URL(`${config.apiBase}/api/tally/bridge/realtime-config`);
+  url.searchParams.set("connectionId", config.connectionId);
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${config.bridgeToken}` },
+  });
+  const payload = await readJsonResponse(response);
+  if (!response.ok) {
+    const error = new Error(payload.error || `Realtime configuration failed with HTTP ${response.status}.`);
+    error.status = response.status;
+    throw error;
+  }
+  return payload.realtime ?? null;
+}
+
+async function processClaimedCommands(config, commands, options = {}) {
+  const bankVoucherCommands = commands.filter((command) => command.commandType === "post_bank_voucher");
+  for (const command of commands) {
+    if (command.commandType === "post_bank_voucher") continue;
+    try {
+      await runCommand(config, command, options);
+    } catch (error) {
+      console.error(
+        `Command ${command.id} failed without blocking the remaining queue: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+  }
+  if (bankVoucherCommands.length > 0) {
+    await runBankVoucherCommandBatch(config, bankVoucherCommands, options);
+  }
+}
+
+async function drainPendingCommands(config, options = {}) {
+  let processed = 0;
+  while (processed < MAX_COMMANDS_PER_CYCLE) {
+    const commands = await receiveNextCommands(
+      config,
+      Math.min(MAX_COMMANDS_PER_CYCLE - processed, MAX_COMMANDS_PER_CYCLE)
+    );
+    if (commands.length === 0) break;
+    // Preserve the bank-voucher batch path even when Realtime wakes the bridge.
+    // Processing each notification independently would re-run duplicate
+    // preflight once per voucher and be slower than the polling path.
+    await processClaimedCommands(config, commands, options);
+    processed += commands.length;
+  }
+  return processed;
+}
+
+function decodeRealtimeFrame(data) {
+  if (typeof data === "string") return JSON.parse(data);
+  const bytes = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  if (bytes.length >= 5 && bytes[0] === 4) {
+    const topicSize = bytes[1];
+    const eventSize = bytes[2];
+    const metadataSize = bytes[3];
+    const payloadEncoding = bytes[4];
+    let offset = 5;
+    const frameTopic = bytes.subarray(offset, offset + topicSize).toString("utf8");
+    offset += topicSize;
+    const userEvent = bytes.subarray(offset, offset + eventSize).toString("utf8");
+    offset += eventSize + metadataSize;
+    const rawPayload = bytes.subarray(offset);
+    const broadcastPayload = payloadEncoding === 1
+      ? JSON.parse(rawPayload.toString("utf8"))
+      : rawPayload;
+    return [null, null, frameTopic, "broadcast", { event: userEvent, payload: broadcastPayload }];
+  }
+  return JSON.parse(bytes.toString("utf8"));
+}
+
+function startCommandWakeChannel(config, executeExclusive, options = {}) {
+  let socket = null;
+  let reconnectTimer = null;
+  let heartbeatTimer = null;
+  let stopped = false;
+  let messageRef = 1;
+  let realtimeConfig = null;
+
+  const log = (level, message) => emitLog(options, level, message);
+  const clearSocketTimers = () => {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  };
+  const sendFrame = (topic, event, payload, joinRef = null) => {
+    if (socket?.readyState !== WebSocket.OPEN) return;
+    const ref = String(messageRef++);
+    socket.send(JSON.stringify([joinRef, ref, topic, event, payload]));
+    return ref;
+  };
+  const runWake = async (reason) => {
+    try {
+      const processed = await executeExclusive(() => drainPendingCommands(config, options));
+      if (processed > 0) {
+        log("info", `Processed ${processed} queued Tally command${processed === 1 ? "" : "s"} after ${reason}.`);
+      }
+    } catch (error) {
+      log("error", error instanceof Error ? error.message : "Immediate Tally command check failed.");
+    }
+  };
+  const scheduleReconnect = () => {
+    clearSocketTimers();
+    if (stopped || reconnectTimer) return;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      void connect();
+    }, 3000);
+    reconnectTimer.unref?.();
+  };
+
+  const connect = async () => {
+    if (stopped) return;
+    try {
+      realtimeConfig = await fetchCommandRealtimeConfig(config);
+      if (!realtimeConfig?.websocketUrl || !realtimeConfig?.publishableKey || !realtimeConfig?.topic) {
+        throw new Error("Realtime command notifications are not configured.");
+      }
+      const url = new URL(realtimeConfig.websocketUrl);
+      url.searchParams.set("apikey", realtimeConfig.publishableKey);
+      url.searchParams.set("vsn", "2.0.0");
+      const topic = `realtime:${realtimeConfig.topic}`;
+      socket = new WebSocket(url.toString(), { ca: windowsTlsCertificates() });
+      socket.addEventListener("open", () => {
+        sendFrame(topic, "phx_join", {
+          config: {
+            broadcast: { ack: false, self: false },
+            presence: { enabled: false },
+            postgres_changes: [],
+          },
+        }, "1");
+        heartbeatTimer = setInterval(() => sendFrame("phoenix", "heartbeat", {}), 25_000);
+        heartbeatTimer.unref?.();
+      });
+      socket.addEventListener("message", (event) => {
+        try {
+          const frame = decodeRealtimeFrame(event.data);
+          if (!Array.isArray(frame) || frame.length < 5) return;
+          const [, , frameTopic, eventName, payload] = frame;
+          if (frameTopic !== topic) return;
+          if (eventName === "phx_reply" && payload?.status === "ok") {
+            log("info", "Immediate Tally command notifications connected; polling remains as fallback.");
+            void runWake("notification-channel startup");
+            return;
+          }
+          if (eventName === "broadcast" && payload?.event === (realtimeConfig.event || "command_queued")) {
+            void runWake("realtime notification");
+          }
+        } catch (error) {
+          log("error", error instanceof Error ? error.message : "Invalid realtime command notification.");
+        }
+      });
+      socket.addEventListener("error", (event) => {
+        const detail = event?.error?.message || event?.message || "WebSocket connection failed";
+        log("error", `Immediate command notifications are unavailable (${detail}); polling fallback remains active.`);
+      });
+      socket.addEventListener("close", scheduleReconnect);
+    } catch (error) {
+      log("error", `${error instanceof Error ? error.message : "Could not connect command notifications"} Polling fallback remains active.`);
+      scheduleReconnect();
+    }
+  };
+
+  void connect();
+  return () => {
+    stopped = true;
+    clearSocketTimers();
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = null;
     socket?.close();
   };
 }
@@ -4682,8 +5384,11 @@ async function startBridge(args) {
   console.log(`Sending heartbeat every ${intervalMs} ms.`);
 
   let running = false;
+  let pendingExclusive = 0;
   const executeExclusive = async (task) => {
-    while (running) await new Promise((resolve) => setTimeout(resolve, 100));
+    pendingExclusive += 1;
+    while (running) await new Promise((resolve) => setTimeout(resolve, 25));
+    pendingExclusive -= 1;
     running = true;
     try {
       return await task();
@@ -4691,21 +5396,23 @@ async function startBridge(args) {
       running = false;
     }
   };
+  const runnerOptions = { companyHeartbeatCache: {} };
   const runSerially = async () => {
-    if (running) {
+    if (running || pendingExclusive > 0) {
       console.log("Previous bridge cycle is still running; skipping this heartbeat.");
       return;
     }
 
     running = true;
     try {
-      await runOnce(config);
+      await runOnce(config, runnerOptions);
     } finally {
       running = false;
     }
   };
 
-  await runOnce(config);
+  await runOnce(config, runnerOptions);
+  startCommandWakeChannel(config, executeExclusive, runnerOptions);
   startTallyLiveChannel(config, executeExclusive);
   setInterval(() => {
     runSerially().catch((error) => {
@@ -4749,11 +5456,16 @@ function createBridgeRunner(options = {}) {
   const intervalMs = Number(options.intervalMs || DEFAULT_HEARTBEAT_INTERVAL_MS);
   let timer = null;
   let running = false;
+  let pendingExclusive = 0;
   let stopped = false;
   let stopTallyLiveChannel = null;
+  let stopCommandWakeChannel = null;
+  const companyHeartbeatCache = {};
 
   const executeExclusive = async (task) => {
-    while (running && !stopped) await new Promise((resolve) => setTimeout(resolve, 100));
+    pendingExclusive += 1;
+    while (running && !stopped) await new Promise((resolve) => setTimeout(resolve, 25));
+    pendingExclusive -= 1;
     if (stopped) throw new Error("The connector has stopped.");
     running = true;
     try {
@@ -4772,6 +5484,8 @@ function createBridgeRunner(options = {}) {
     }
     stopTallyLiveChannel?.();
     stopTallyLiveChannel = null;
+    stopCommandWakeChannel?.();
+    stopCommandWakeChannel = null;
     if (typeof options.onStop === "function") {
       options.onStop({ reason, error, timestamp: new Date().toISOString() });
     }
@@ -4779,14 +5493,14 @@ function createBridgeRunner(options = {}) {
 
   const runSerially = async () => {
     if (stopped) return;
-    if (running) {
+    if (running || pendingExclusive > 0) {
       emitLog(options, "info", "Previous bridge cycle is still running; skipping this heartbeat.");
       return;
     }
 
     running = true;
     try {
-      const cycle = await runOnce(config, options);
+      const cycle = await runOnce(config, { ...options, companyHeartbeatCache });
       if (typeof options.onStatus === "function") {
         options.onStatus(cycle);
       }
@@ -4817,6 +5531,7 @@ function createBridgeRunner(options = {}) {
     async start() {
       emitLog(options, "info", `Starting Tally bridge for ${config.tallyUrl}`);
       emitLog(options, "info", `Sending heartbeat every ${intervalMs} ms.`);
+      stopCommandWakeChannel = startCommandWakeChannel(config, executeExclusive, options);
       stopTallyLiveChannel = startTallyLiveChannel(config, executeExclusive, options);
       await runSerially();
       if (!stopped) {
@@ -5346,6 +6061,7 @@ export {
   normalizeTallyUrl,
   openBillBlockRequiresVoucherFallback,
   pairBridge,
+  parseBankStatementMasterCollection,
   parseTallyImportResult,
   purchaseVoucherReadbackComparison,
   readConfig,
