@@ -1,5 +1,5 @@
 #define AppName "Polaad Tally Connector"
-#define AppVersion "0.1.55"
+#define AppVersion "0.1.56"
 #define AppPublisher "Polaad"
 #define AppInstallDir "C:\Polaad\tally-bridge"
 #define AppExeName "Polaad Tally Connector.exe"
