@@ -9,9 +9,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.56";
+const BRIDGE_VERSION = "0.1.57";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
-const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
+// Realtime wakes the connector as soon as work is queued. The periodic cycle
+// is now only a health/fallback path, so keep it out of the exclusive Tally
+// lock used by interactive browser reads as much as possible.
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 10_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
 const TALLY_IMPORT_TIMEOUT_MS = 30_000;
 const BACKEND_REQUEST_TIMEOUT_MS = 10_000;

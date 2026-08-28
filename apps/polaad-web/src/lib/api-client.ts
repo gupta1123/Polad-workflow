@@ -3,9 +3,20 @@
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 
 const API_BASE_URL = (process.env.NEXT_PUBLIC_API_BASE_URL || "").replace(/\/+$/, "");
-const USE_CROSS_ORIGIN_API =
-  process.env.NEXT_PUBLIC_USE_DIRECT_API_BASE_URL === "true" && API_BASE_URL.length > 0;
+const PRODUCTION_API_BASE_URL = "https://polaad-workflow-6127a3ee98e5.herokuapp.com";
 const ACCESS_TOKEN_EXPIRY_SAFETY_MS = 30_000;
+
+function directApiBaseUrl() {
+  if (process.env.NEXT_PUBLIC_USE_DIRECT_API_BASE_URL === "false") return "";
+  if (API_BASE_URL) return API_BASE_URL;
+  if (
+    typeof window !== "undefined" &&
+    !["localhost", "127.0.0.1"].includes(window.location.hostname)
+  ) {
+    return PRODUCTION_API_BASE_URL;
+  }
+  return "";
+}
 
 function isLocalDbMode() {
   return process.env.NEXT_PUBLIC_LOCAL_DB_MODE === "true";
@@ -90,12 +101,13 @@ async function refreshAccessToken() {
 
 export function buildApiUrl(path: string) {
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  const baseUrl = directApiBaseUrl();
 
-  if (!USE_CROSS_ORIGIN_API) {
+  if (!baseUrl) {
     return normalizedPath;
   }
 
-  return `${API_BASE_URL}${normalizedPath}`;
+  return `${baseUrl}${normalizedPath}`;
 }
 
 export async function getApiAccessToken() {
@@ -105,6 +117,7 @@ export async function getApiAccessToken() {
 export async function apiFetch(path: string, init?: RequestInit) {
   const accessToken = await readAccessToken();
   const apiUrl = buildApiUrl(path);
+  const crossOrigin = Boolean(directApiBaseUrl());
 
   async function sendRequest(token: string | null) {
     const headers = new Headers(init?.headers);
@@ -115,7 +128,7 @@ export async function apiFetch(path: string, init?: RequestInit) {
     return fetch(apiUrl, {
       ...init,
       headers,
-      credentials: USE_CROSS_ORIGIN_API ? "omit" : (init?.credentials ?? "same-origin"),
+      credentials: crossOrigin ? "omit" : (init?.credentials ?? "same-origin"),
     });
   }
 

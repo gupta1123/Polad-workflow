@@ -3218,6 +3218,7 @@ export function BankStatementsPage() {
   const reviewSearchInputRef = useRef<HTMLInputElement>(null);
   const reviewPeriodInputRef = useRef<HTMLInputElement>(null);
   const ledgerLoadSeqRef = useRef(0);
+  const ledgerLoadPromiseRef = useRef<{ key: string; promise: Promise<TallyMaster[]> } | null>(null);
   const bankLedgerLoadKeyRef = useRef("");
   const initialSummaryLoadStartedRef = useRef(false);
   const tallyStatusStartedAtRef = useRef(Date.now());
@@ -4164,6 +4165,13 @@ export function BankStatementsPage() {
   }, [selectedCompanyId, tallyConnectionId]);
 
   const loadLedgerMasters = useCallback(async (connectionId: string) => {
+    const connectionCompany = companyOptions.find((option) => option.connectionId === connectionId);
+    const companyName = selectedCompanyName || connectionCompany?.companyName || "";
+    const requestKey = `${connectionId}|${companyName}`;
+    if (ledgerLoadPromiseRef.current?.key === requestKey) {
+      return ledgerLoadPromiseRef.current.promise;
+    }
+
     const loadSeq = ledgerLoadSeqRef.current + 1;
     ledgerLoadSeqRef.current = loadSeq;
 
@@ -4174,24 +4182,32 @@ export function BankStatementsPage() {
       return [];
     }
 
-    const connectionCompany = companyOptions.find((option) => option.connectionId === connectionId);
-    const payload = await runCashDiscountLiveRequest<{
-      ledgers?: TallyMaster[];
-      groups?: TallyMaster[];
-    }>({
-      connectionId,
-      companyName: selectedCompanyName || connectionCompany?.companyName || "",
-      operation: "ledger_masters",
-      payload: {
-        requestedMasterTypes: ["ledger", "group"],
-        fieldProfile: "bank_statement",
-      },
-    });
-    const masters = normalizeLiveLedgerMasters(payload.ledgers ?? [], payload.groups ?? []);
-    if (loadSeq === ledgerLoadSeqRef.current) {
-      setLedgerMasters(masters);
-    }
-    return masters;
+    const promise = runCashDiscountLiveRequest<{
+        ledgers?: TallyMaster[];
+        groups?: TallyMaster[];
+      }>({
+        connectionId,
+        companyName,
+        operation: "ledger_masters",
+        payload: {
+          requestedMasterTypes: ["ledger", "group"],
+          fieldProfile: "bank_statement",
+        },
+      })
+      .then((payload) => {
+        const masters = normalizeLiveLedgerMasters(payload.ledgers ?? [], payload.groups ?? []);
+        if (loadSeq === ledgerLoadSeqRef.current) {
+          setLedgerMasters(masters);
+        }
+        return masters;
+      })
+      .finally(() => {
+        if (ledgerLoadPromiseRef.current?.key === requestKey) {
+          ledgerLoadPromiseRef.current = null;
+        }
+      });
+    ledgerLoadPromiseRef.current = { key: requestKey, promise };
+    return promise;
   }, [companyOptions, selectedCompanyName]);
 
   useEffect(() => {
@@ -4532,6 +4548,33 @@ export function BankStatementsPage() {
       cancelled = true;
     };
   }, [ledgerMasters.length, loadLedgerMasters, tallyConnectionId, transactions.length]);
+
+  // Start the fresh Tally catalogue read while the user reviews the selected
+  // statement. Analyze can then reuse the same in-flight request instead of
+  // leaving the browser idle before the upload begins.
+  useEffect(() => {
+    if (
+      !file ||
+      !tallyConnectionId ||
+      !tallyConnected ||
+      !tallyCompanyContextVerified ||
+      ledgerMasters.length > 0 ||
+      transactions.length > 0
+    ) {
+      return;
+    }
+    void loadLedgerMasters(tallyConnectionId).catch(() => {
+      // Analyze will surface a useful retry error if the prefetch failed.
+    });
+  }, [
+    file,
+    ledgerMasters.length,
+    loadLedgerMasters,
+    tallyCompanyContextVerified,
+    tallyConnected,
+    tallyConnectionId,
+    transactions.length,
+  ]);
 
   useEffect(() => {
     if ((loading || sending || matchingBills || syncingMasters || postUploadSyncImportId) && selectedCompanyId) {
@@ -5280,7 +5323,9 @@ export function BankStatementsPage() {
       setPostUploadSyncImportId(null);
       setPostUploadSyncError(null);
       setFile(nextFile);
-      const syncedMasters = await loadLedgerMasters(tallyConnectionId);
+      const syncedMasters = ledgerMasters.length > 0
+        ? ledgerMasters
+        : await loadLedgerMasters(tallyConnectionId);
       if (!syncedMasters || syncedMasters.length === 0) {
         throw new Error(
           "Could not fetch the latest ledgers from Tally. Keep Tally Prime and the connector open, then retry analysis."

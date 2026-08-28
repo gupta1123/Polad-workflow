@@ -4,11 +4,17 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { pairBridge, createBridgeRunner, disconnectBridge } from "./src/bridge.mjs";
 
-const BRAND_NAME = "Polad";
-const CONNECTOR_NAME = "Polad Tally Connector";
+const BRAND_NAME = "Polaad";
+const CONNECTOR_NAME = "Polaad Tally Connector";
 const PROTOCOL_NAME = "polaad-tally";
-const APP_USER_MODEL_ID = "com.polad.tally-connector";
+const APP_USER_MODEL_ID = "com.polaad.tally-connector";
 const BRAND_MARK = "P";
+
+// The connector UI is lightweight and does not need GPU acceleration. Some
+// Windows machines cannot start Electron's GPU subprocess, which otherwise
+// terminates the whole connector before its window appears.
+app.disableHardwareAcceleration();
+app.commandLine.appendSwitch("disable-gpu");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const installDir = path.resolve(__dirname, "..", "..");
