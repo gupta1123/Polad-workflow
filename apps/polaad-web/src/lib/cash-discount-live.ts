@@ -206,7 +206,7 @@ async function getLiveSession(request: LiveRequest) {
   return cachedSession;
 }
 
-export async function runCashDiscountLiveRequest<T>(request: LiveRequest) {
+async function runCashDiscountLiveRequestOnce<T>(request: LiveRequest) {
   const session = await getLiveSession(request);
   await session.ready;
   return new Promise<T>((resolve, reject) => {
@@ -236,4 +236,22 @@ export async function runCashDiscountLiveRequest<T>(request: LiveRequest) {
       customerScope: request.customerScope,
     }));
   });
+}
+
+export async function runCashDiscountLiveRequest<T>(request: LiveRequest) {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return await runCashDiscountLiveRequestOnce<T>(request);
+    } catch (error) {
+      lastError = error;
+      const reconnecting = /not on the live Cash Discount channel|disconnected during the live request/i.test(
+        error instanceof Error ? error.message : String(error)
+      );
+      if (!reconnecting || attempt > 0) throw error;
+      request.onProgress?.("Tally connector is reconnecting. Retrying automatically...");
+      await new Promise((resolve) => window.setTimeout(resolve, 1_500));
+    }
+  }
+  throw lastError;
 }

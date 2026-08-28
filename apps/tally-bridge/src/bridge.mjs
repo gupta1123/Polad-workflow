@@ -9,7 +9,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.53";
+const BRIDGE_VERSION = "0.1.54";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -193,7 +193,8 @@ async function readJsonResponse(response) {
   try {
     return text ? JSON.parse(text) : {};
   } catch {
-    return { error: text || `HTTP ${response.status}` };
+    const compact = text.replace(/\s+/g, " ").trim();
+    return { error: compact ? compact.slice(0, 500) : `HTTP ${response.status}` };
   }
 }
 
@@ -4122,6 +4123,7 @@ async function postMastersToBackend(config, payload) {
       Authorization: `Bearer ${config.bridgeToken}`,
     },
     body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(60_000),
   });
   const result = await readJsonResponse(response);
 
@@ -4340,6 +4342,7 @@ async function sendCommandResult(config, command, outcome) {
       result: outcome.result ?? {},
       error,
     }),
+    signal: AbortSignal.timeout(BACKEND_REQUEST_TIMEOUT_MS),
   });
   const payload = await readJsonResponse(response);
 
@@ -5199,6 +5202,7 @@ async function fetchCommandRealtimeConfig(config) {
   url.searchParams.set("connectionId", config.connectionId);
   const response = await fetch(url, {
     headers: { Authorization: `Bearer ${config.bridgeToken}` },
+    signal: AbortSignal.timeout(BACKEND_REQUEST_TIMEOUT_MS),
   });
   const payload = await readJsonResponse(response);
   if (!response.ok) {
@@ -5274,6 +5278,8 @@ function startCommandWakeChannel(config, executeExclusive, options = {}) {
   let stopped = false;
   let messageRef = 1;
   let realtimeConfig = null;
+  let wakeRunning = false;
+  let wakeQueued = false;
 
   const log = (level, message) => emitLog(options, level, message);
   const clearSocketTimers = () => {
@@ -5287,13 +5293,25 @@ function startCommandWakeChannel(config, executeExclusive, options = {}) {
     return ref;
   };
   const runWake = async (reason) => {
+    // Broadcasts can arrive faster than a backend/Tally pass completes. Keep
+    // at most one follow-up wake instead of adding an unbounded mutex queue.
+    if (wakeRunning) {
+      wakeQueued = true;
+      return;
+    }
+    wakeRunning = true;
     try {
-      const processed = await executeExclusive(() => drainPendingCommands(config, options));
-      if (processed > 0) {
-        log("info", `Processed ${processed} queued Tally command${processed === 1 ? "" : "s"} after ${reason}.`);
-      }
+      do {
+        wakeQueued = false;
+        const processed = await executeExclusive(() => drainPendingCommands(config, options));
+        if (processed > 0) {
+          log("info", `Processed ${processed} queued Tally command${processed === 1 ? "" : "s"} after ${reason}.`);
+        }
+      } while (wakeQueued && !stopped);
     } catch (error) {
       log("error", error instanceof Error ? error.message : "Immediate Tally command check failed.");
+    } finally {
+      wakeRunning = false;
     }
   };
   const scheduleReconnect = () => {
