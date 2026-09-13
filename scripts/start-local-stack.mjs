@@ -1,0 +1,91 @@
+import { spawn, spawnSync } from "node:child_process";
+import net from "node:net";
+
+// This launcher is specifically for the local production-like stack. Next's
+// production server otherwise falls back to the remote worker pool when the
+// shell did not export APP_BASE_URL, allowing an older deployed worker to
+// claim a job created from localhost.
+const localStackEnv = {
+  ...process.env,
+  APP_BASE_URL: process.env.APP_BASE_URL || "http://localhost:3001",
+  BANK_STATEMENT_WORKER_POOL: "local",
+};
+
+const serviceDefinitions = [
+  ["frontend", "npm run start --workspace @polaad/web -- -p 3000", 3000],
+  ["api", "npm run start --workspace @polaad/api", 3001],
+  ["worker", "npm run worker:local --workspace @polaad/api"],
+  ["tally-live-gateway", "npm run start --workspace @polaad/tally-live-gateway", 3002],
+];
+
+function portIsListening(port) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    const finish = (listening) => {
+      socket.removeAllListeners();
+      socket.destroy();
+      resolve(listening);
+    };
+    socket.setTimeout(500);
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+    socket.once("timeout", () => finish(false));
+  });
+}
+
+const services = [];
+for (const [name, command, port] of serviceDefinitions) {
+  if (port && await portIsListening(port)) {
+    console.log(`[${name}] already listening on :${port}; reusing it.`);
+    continue;
+  }
+  services.push([name, command]);
+}
+
+const children = new Map();
+let shuttingDown = false;
+
+function stopProcessTree(child) {
+  if (!child?.pid || child.exitCode !== null) return;
+  if (process.platform === "win32") {
+    spawnSync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    return;
+  }
+  child.kill("SIGTERM");
+}
+
+function shutdown(exitCode = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  for (const child of children.values()) stopProcessTree(child);
+  process.exit(exitCode);
+}
+
+for (const [name, command] of services) {
+  const child = process.platform === "win32"
+    ? spawn("cmd.exe", ["/d", "/s", "/c", command], {
+        cwd: process.cwd(),
+        env: localStackEnv,
+        stdio: "inherit",
+      })
+    : spawn("sh", ["-c", command], {
+        cwd: process.cwd(),
+        env: localStackEnv,
+        stdio: "inherit",
+      });
+
+  children.set(name, child);
+  child.once("exit", (code, signal) => {
+    if (shuttingDown) return;
+    console.error(`[${name}] stopped${signal ? ` (${signal})` : ` with code ${code ?? 1}`}.`);
+    shutdown(code || 1);
+  });
+}
+
+console.log("Polaad production stack starting: frontend :3000, API :3001, Tally live gateway :3002, and worker.");
+
+process.once("SIGINT", () => shutdown());
+process.once("SIGTERM", () => shutdown());

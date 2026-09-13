@@ -1,7 +1,14 @@
 {
   "name": "polaad-tally-connector-wrapper",
-  "version": "0.1.56",
+  "version": "0.1.71",
   "private": true,
   "type": "module",
-  "main": "main.mjs"
+  "main": "main.mjs",
+  "dependencies": {
+    "@firecrawl/anydoc": "0.2.4",
+    "@zvec/zvec": "^0.7.1"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^3.7.0"
+  }
 }

@@ -23,10 +23,21 @@ const installerRoot = path.join(repoRoot, "installer", "tally-bridge");
 const electronAppSource = path.join(installerRoot, "electron-app");
 const payloadDir = path.join(installerRoot, "payload-clean");
 const outputDir = path.join(installerRoot, "output");
-const outputExe = path.join(outputDir, connector.setupName);
+const setupName = process.env.POLAAD_INSTALLER_OUTPUT_NAME || connector.setupName;
+const outputExe = path.join(outputDir, setupName);
 const bridgeRoot = path.join(repoRoot, "apps", "tally-bridge");
 const bridgeSource = path.join(bridgeRoot, "src", "bridge.mjs");
+const localMatchingSource = path.join(bridgeRoot, "src", "local-matching");
+const documentParsingSource = path.join(bridgeRoot, "src", "document-parsing");
+const bankStatementWorkerSource = path.join(repoRoot, "apps", "api", "worker");
 const webSocketPackageSource = path.join(repoRoot, "node_modules", "ws");
+const zvecPackageSource = path.join(repoRoot, "node_modules", "@zvec", "zvec");
+const zvecBindingsSource = path.join(repoRoot, "node_modules", "@zvec");
+const anydocPackageSource = path.join(repoRoot, "node_modules", "@firecrawl", "anydoc");
+const pdfjsPackageSource = path.join(repoRoot, "node_modules", "pdfjs-dist");
+const napiCanvasSource = path.join(repoRoot, "node_modules", "@napi-rs", "canvas");
+const napiCanvasWindowsSource = path.join(repoRoot, "node_modules", "@napi-rs", "canvas-win32-x64-msvc");
+const anydocWindowsSource = path.join(repoRoot, "node_modules", "@firecrawl", "anydoc-win32-x64-msvc");
 const powerShellSource = path.join(bridgeRoot, "powershell");
 const samplesSource = path.join(bridgeRoot, "samples");
 const tdlSource = path.join(bridgeRoot, "tdl");
@@ -66,16 +77,18 @@ function validateSources() {
   ensureFile(path.join(webSocketPackageSource, "package.json"), "ws runtime dependency");
   ensureFile(path.join(electronAppSource, "main.mjs"), "Electron wrapper");
   ensureFile(path.join(electronAppSource, "package.json"), "Electron wrapper package");
+  ensureFile(path.join(anydocPackageSource, "package.json"), "AnyDoc runtime dependency");
+  ensureFile(path.join(anydocWindowsSource, "package.json"), "AnyDoc Windows runtime dependency");
   ensureFile(tdlFile, "native Tally PDF TDL");
   ensureContains(
     dashboardSource,
     `${connector.protocolName}://connect`,
-    "Polad web connector protocol"
+    "Polaad web connector protocol"
   );
   ensureContains(
     bridgeSource,
     connector.configFolderName,
-    "Polad bridge configuration folder"
+    "Polaad bridge configuration folder"
   );
   ensureContains(innoDefinition, connector.connectorName, "Inno Setup product name");
   ensureContains(innoDefinition, connector.protocolName, "Inno Setup protocol");
@@ -84,12 +97,25 @@ function validateSources() {
     connector.connectorName,
     "Electron product name"
   );
+  // Zvec is required for Local Matching vector search. Validate if installed.
+  if (fs.existsSync(path.join(zvecPackageSource, "package.json"))) {
+    ensureContains(path.join(electronAppSource, "main.mjs"), "Local Matching", "Electron Local Matching UI");
+    console.log(`Zvec package found: ${zvecPackageSource}`);
+  } else {
+    console.warn(`Warning: @zvec/zvec not installed at ${zvecPackageSource} — payload will fallback to FTS and UI will show unavailable. Install with: npm install @zvec/zvec --workspace @polaad/tally-bridge`);
+  }
   console.log(
     `Installer sources validated for ${connector.connectorName} (${connector.protocolName}://).`
   );
 }
 
 function resetDir(dir) {
+  const resolved = path.resolve(dir);
+  const allowed = [payloadDir, stagingDir].map((candidate) => path.resolve(candidate));
+  if (!allowed.includes(resolved)) throw new Error("Refusing to reset an unexpected installer directory: " + resolved);
+  if (fs.existsSync(resolved) && fs.lstatSync(resolved).isSymbolicLink()) {
+    throw new Error("Refusing to reset a linked installer directory: " + resolved);
+  }
   fs.rmSync(dir, { recursive: true, force: true });
   fs.mkdirSync(dir, { recursive: true });
 }
@@ -264,14 +290,49 @@ const appDir = path.join(payloadDir, "resources", "app");
 fs.mkdirSync(path.join(appDir, "src"), { recursive: true });
 fs.copyFileSync(path.join(electronAppSource, "main.mjs"), path.join(appDir, "main.mjs"));
 fs.copyFileSync(path.join(electronAppSource, "package.json"), path.join(appDir, "package.json"));
+copyDir(path.join(electronAppSource, "assets"), path.join(appDir, "assets"));
 fs.copyFileSync(bridgeSource, path.join(appDir, "src", "bridge.mjs"));
+copyDir(localMatchingSource, path.join(appDir, "src", "local-matching"));
+copyDir(documentParsingSource, path.join(appDir, "src", "document-parsing"));
+const documentParsingLogicDir = path.join(appDir, "src", "document-parsing", "backend-logic");
+fs.mkdirSync(documentParsingLogicDir, { recursive: true });
+for (const name of [
+  "bank-statement-deterministic.mjs",
+  "bank-statement-account.mjs",
+  "bank-statement-markdown-amounts.mjs",
+  "bank-statement-running-balance.mjs",
+  "bank-statement-resilience.mjs",
+  "bank-statement-pdf-columns.mjs",
+]) {
+  fs.copyFileSync(path.join(bankStatementWorkerSource, name), path.join(documentParsingLogicDir, name));
+}
 copyDir(webSocketPackageSource, path.join(appDir, "node_modules", "ws"));
+copyDir(anydocPackageSource, path.join(appDir, "node_modules", "@firecrawl", "anydoc"));
+copyDir(pdfjsPackageSource, path.join(appDir, "node_modules", "pdfjs-dist"));
+copyDir(napiCanvasSource, path.join(appDir, "node_modules", "@napi-rs", "canvas"));
+copyDir(napiCanvasWindowsSource, path.join(appDir, "node_modules", "@napi-rs", "canvas-win32-x64-msvc"));
+copyDir(anydocWindowsSource, path.join(appDir, "node_modules", "@firecrawl", "anydoc-win32-x64-msvc"));
+if (fs.existsSync(zvecPackageSource)) {
+  copyDir(path.join(repoRoot, "node_modules", "@zvec"), path.join(appDir, "node_modules", "@zvec"));
+  // Also copy @zvec's transitive bindings if present
+  const bindings = ["@zvec/bindings-win32-x64", "@zvec/bindings-linux-x64", "@zvec/bindings-darwin-arm64", "@zvec/bindings-linux-arm64"];
+  for (const b of bindings) {
+    const src = path.join(repoRoot, "node_modules", b);
+    if (fs.existsSync(src)) copyDir(src, path.join(appDir, "node_modules", b));
+  }
+  // Zvec runtime requires detect-libc (pure JS) — ensure it's in payload
+  const detectLibcSrc = path.join(repoRoot, "node_modules", "detect-libc");
+  if (fs.existsSync(detectLibcSrc)) copyDir(detectLibcSrc, path.join(appDir, "node_modules", "detect-libc"));
+  console.log("Zvec payload included (native bindings will require electron-rebuild).");
+} else {
+  console.warn("Zvec not installed — payload will use FTS fallback.");
+}
 fs.writeFileSync(
   path.join(payloadDir, "package.json"),
   `${JSON.stringify(
     {
       name: connector.runtimePackageName,
-      version: "0.1.56",
+      version: "0.1.71",
       private: true,
       type: "module",
     },
@@ -281,7 +342,8 @@ fs.writeFileSync(
 );
 
 if (fs.existsSync(outputExe)) fs.rmSync(outputExe, { force: true });
-execFileSync(innoCompiler, [innoDefinition], {
+const outputBaseName = path.basename(setupName, path.extname(setupName));
+execFileSync(innoCompiler, [innoDefinition, `/F${outputBaseName}`], {
   cwd: installerRoot,
   stdio: "inherit",
 });

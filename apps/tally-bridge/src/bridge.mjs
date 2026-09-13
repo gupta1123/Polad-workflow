@@ -8,21 +8,42 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { parseDocumentLocal } from "./document-parsing/parser.mjs";
+import { parseDocumentAndSuggestLedgers } from "./document-parsing/parse-and-suggest.mjs";
+import { getLocalMasterCatalogue, loadLocalDb } from "./local-matching/store.mjs";
+import { planChronologicalBillAllocations } from "./local-matching/bill-allocation.mjs";
+import {
+  activeVouchers,
+  ensureVoucherPartition,
+  financialYearRange,
+  getCachedBillBucket,
+  loadOperationalCache,
+  operationalStatus,
+  putCachedBillBucket,
+  saveOperationalCache,
+  upsertVoucherPartition,
+} from "./local-matching/operational-cache.mjs";
 
-const BRIDGE_VERSION = "0.1.57";
+const liveReadContext = new AsyncLocalStorage();
+const commandExecutionContext = new AsyncLocalStorage();
+const liveMasterCache = new Map();
+
+const BRIDGE_VERSION = "0.1.71";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
-// Realtime wakes the connector as soon as work is queued. The periodic cycle
-// is now only a health/fallback path, so keep it out of the exclusive Tally
-// lock used by interactive browser reads as much as possible.
-const DEFAULT_HEARTBEAT_INTERVAL_MS = 10_000;
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
 const TALLY_IMPORT_TIMEOUT_MS = 30_000;
 const BACKEND_REQUEST_TIMEOUT_MS = 10_000;
+const TALLY_HEARTBEAT_PROBE_INTERVAL_MS = 15_000;
 // Exports can be larger than imports, but they must still release the bridge
 // cycle if Tally is busy or has stopped responding.
 const TALLY_EXPORT_TIMEOUT_MS = 60_000;
+const BANK_MATCH_READ_TIMEOUT_MS = 20_000;
+const BANK_MATCH_MAX_XML_BYTES = 8 * 1024 * 1024;
+const BANK_MATCH_MAX_BILL_RESULT_BYTES = 4 * 1024 * 1024;
+const BANK_MATCH_BILL_BUDGET_MS = 90_000;
 const OPEN_BILL_LEDGER_BATCH_SIZE = 50;
-const BANK_REFERENCE_VOUCHER_BATCH_SIZE = 25;
 const CONFIG_DIR = path.join(os.homedir(), ".polaad-tally-bridge");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 const INSTALLATION_ID_PATH = path.join(CONFIG_DIR, "installation-id");
@@ -37,6 +58,30 @@ const PURCHASE_DOCUMENT_UDFS = {
 const DEFAULT_TALLY_DATA_ROOT = path.join(process.env.PUBLIC || "C:\\Users\\Public", "TallyPrime", "data");
 const CURRENT_FILE = fileURLToPath(import.meta.url);
 let cachedWindowsTlsCertificates;
+
+async function requestBridgeSemanticEmbeddings(config, inputs) {
+  if (!Array.isArray(inputs) || inputs.length === 0 || inputs.length > 256) {
+    throw new Error("AI embedding batch requires 1-256 inputs.");
+  }
+  const response = await fetch(`${config.apiBase}/api/tally/bridge/embeddings`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${config.bridgeToken}`,
+    },
+    body: JSON.stringify({ connectionId: config.connectionId, inputs }),
+    signal: AbortSignal.timeout(60_000),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(String(payload?.error || `Secure embedding request failed (${response.status}).`));
+  }
+  const embeddings = payload?.embeddings;
+  if (!Array.isArray(embeddings) || embeddings.length !== inputs.length) {
+    throw new Error("The secure embedding service returned an incomplete batch.");
+  }
+  return embeddings;
+}
 
 function windowsTlsCertificates() {
   if (cachedWindowsTlsCertificates) return cachedWindowsTlsCertificates;
@@ -197,8 +242,7 @@ async function readJsonResponse(response) {
   try {
     return text ? JSON.parse(text) : {};
   } catch {
-    const compact = text.replace(/\s+/g, " ").trim();
-    return { error: compact ? compact.slice(0, 500) : `HTTP ${response.status}` };
+    return { error: text || `HTTP ${response.status}` };
   }
 }
 
@@ -1437,7 +1481,8 @@ async function fetchAvailableCompanies(tallyUrl, activeCompanyName = null) {
       const name = getTagText(companyBlock, "NAME") || getAttribute(companyBlock, "NAME");
       const normalized = typeof name === "string" ? name.trim() : "";
       if (!normalized) continue;
-      const key = normalized.toLowerCase();
+      const guid = getTagText(companyBlock, "GUID") || getAttribute(companyBlock, "GUID");
+      const key = guid ? String(guid).trim().toLowerCase() : normalized.toLowerCase();
       if (seen.has(key)) continue;
       seen.add(key);
       const financialYearStart =
@@ -1447,7 +1492,7 @@ async function fetchAvailableCompanies(tallyUrl, activeCompanyName = null) {
         );
       companies.push({
         companyName: normalized,
-        guid: getTagText(companyBlock, "GUID") || getAttribute(companyBlock, "GUID"),
+        guid,
         financialYear: financialYearFromStartDate(financialYearStart),
         financialYearStart,
         booksFrom: normalizeTallyDate(getTagText(companyBlock, "BOOKSFROM")),
@@ -1849,6 +1894,12 @@ async function postPurchaseVoucher(tallyUrl, payload, companyName) {
 }
 
 async function postBankVoucher(tallyUrl, payload, companyName) {
+  const [resolvedPayload] = await resolveBankVoucherLedgerPayloads(tallyUrl, [payload], companyName);
+  [payload] = await validateBankVoucherBillAllocationsLive(
+    { tallyUrl },
+    [resolvedPayload],
+    companyName
+  );
   const voucherType = String(payload?.voucherType || "");
   const expectedDirection = payload?.expectedDirection || (/receipt/i.test(voucherType) ? "incoming" : "outgoing");
   const shouldCheckExisting =
@@ -1906,8 +1957,194 @@ async function postBankVoucher(tallyUrl, payload, companyName) {
     requireCreatedVoucher(await invokeTallyXml(tallyUrl, primaryXml)),
     payload
   );
+  if (!primaryOutcome.success) {
+    return { outcome: primaryOutcome, xml: primaryXml, retriedWithLegacyHeader: false };
+  }
 
-  return { outcome: primaryOutcome, xml: primaryXml, retriedWithLegacyHeader: false };
+  try {
+    const readback = await verifyBankTransactionInTally(
+      { tallyUrl, companyName },
+      { ...payload, expectedDirection }
+    );
+    const verification = readback.result || {};
+    if (verification.verificationStatus === "found") {
+      return {
+        outcome: {
+          success: true,
+          result: {
+            ...(primaryOutcome.result || {}),
+            verificationStatus: "verified",
+            duplicateCheck: verification,
+            voucherId: verification.voucherId || primaryOutcome.result?.lastVchId || null,
+            voucherNumber: verification.voucherNumber || payload.referenceNumber || null,
+          },
+        },
+        xml: primaryXml,
+        retriedWithLegacyHeader: false,
+      };
+    }
+    return {
+      outcome: {
+        success: false,
+        error: "Tally accepted the bank voucher import, but read-back could not verify the created voucher.",
+        result: {
+          ...(primaryOutcome.result || {}),
+          reconciliationRequired: true,
+          possibleDuplicateInTally: true,
+          voucherCreatedButVerificationFailed: true,
+          uncertaintyReason: verification.verificationStatus === "ambiguous"
+            ? "ambiguous_readback"
+            : "voucher_not_visible_after_import",
+          duplicateCheck: verification,
+        },
+      },
+      xml: primaryXml,
+      retriedWithLegacyHeader: false,
+    };
+  } catch (error) {
+    return {
+      outcome: {
+        success: false,
+        error: "Tally accepted the bank voucher import, but read-back was interrupted.",
+        result: {
+          ...(primaryOutcome.result || {}),
+          reconciliationRequired: true,
+          possibleDuplicateInTally: true,
+          voucherCreatedButVerificationFailed: true,
+          uncertaintyReason: "readback_interrupted",
+          readbackError: error instanceof Error ? error.message : String(error),
+        },
+      },
+      xml: primaryXml,
+      retriedWithLegacyHeader: false,
+    };
+  }
+}
+
+function normalizedGuid(value) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+export function resolveBankVoucherLedgerIdentities(payloads, liveMasters) {
+  const byGuid = new Map();
+  const byName = new Map();
+  for (const master of liveMasters || []) {
+    const guid = normalizedGuid(master?.guid);
+    const name = String(master?.name || "").trim();
+    if (guid) byGuid.set(guid, master);
+    if (name) byName.set(normalizeLooseName(name), master);
+  }
+  const resolve = (nameValue, guidValue, label) => {
+    const name = String(nameValue || "").trim();
+    const guid = normalizedGuid(guidValue);
+    const master = guid ? byGuid.get(guid) : byName.get(normalizeLooseName(name));
+    if (!master) {
+      throw new Error(`${label} '${name || guid || "unknown"}' is not present in the active Tally company. Refresh masters and review this row before posting.`);
+    }
+    return { name: master.name, guid: master.guid || guidValue || null };
+  };
+  return (payloads || []).map((payload) => {
+    const bank = resolve(payload?.bankLedgerName, payload?.bankLedgerGuid, "Bank ledger");
+    const counterparty = resolve(payload?.counterpartyLedgerName, payload?.counterpartyLedgerGuid, "Counterparty ledger");
+    return {
+      ...payload,
+      bankLedgerName: bank.name,
+      bankLedgerGuid: bank.guid,
+      counterpartyLedgerName: counterparty.name,
+      counterpartyLedgerGuid: counterparty.guid,
+      matchedLedgerName: counterparty.name,
+      liveMasterValidation: {
+        checkedAt: new Date().toISOString(),
+        bankLedger: bank,
+        counterpartyLedger: counterparty,
+      },
+    };
+  });
+}
+
+async function resolveBankVoucherLedgerPayloads(tallyUrl, payloads, companyName) {
+  const identities = (payloads || []).flatMap((payload) => [
+    { name: payload?.bankLedgerName, guid: payload?.bankLedgerGuid },
+    { name: payload?.counterpartyLedgerName, guid: payload?.counterpartyLedgerGuid },
+  ]).filter((identity) => identity.name || identity.guid);
+  const names = identities.map((identity) => identity.name).filter(Boolean);
+  const guids = identities.map((identity) => String(identity.guid || "").trim()).filter(Boolean);
+  const nameFormula = buildRequestedLedgerFormula(names, ["$Name"]);
+  const guidFormula = guids
+    .map((guid) => `($$IsEqual:$GUID:${tallyFormulaString(guid)})`)
+    .join(" OR ");
+  const formula = [nameFormula, guidFormula].filter(Boolean).map((part) => `(${part})`).join(" OR ");
+  const filterName = "PolaadBankVoucherLedgerIdentity";
+  const xml = await exportTallyCollection(tallyUrl, {
+    collectionName: "Polaad Bank Voucher Ledger Identity",
+    tallyType: "Ledger",
+    fetchFields: "Name,GUID,Parent,IsBillWiseOn",
+    companyName,
+    formulae: [{ name: filterName, formula }],
+    filterNames: [filterName],
+    timeoutMs: 20_000,
+    maxResponseBytes: 1024 * 1024,
+  });
+  return resolveBankVoucherLedgerIdentities(payloads, parseBankStatementMasterCollection(xml, "LEDGER"));
+}
+
+async function validateBankVoucherBillAllocationsLive(config, payloads, companyName) {
+  const allocatedPayloads = (payloads || []).filter((payload) =>
+    Array.isArray(payload?.billAllocations) && payload.billAllocations.length > 0
+  );
+  if (allocatedPayloads.length === 0) return payloads;
+  const ledgerNames = Array.from(new Set(
+    allocatedPayloads.map((payload) => String(payload.counterpartyLedgerName || "").trim()).filter(Boolean)
+  ));
+  const asOfDate = allocatedPayloads
+    .map((payload) => normalizeDateForCompare(payload.voucherDate))
+    .filter(Boolean)
+    .sort()
+    .at(-1) || null;
+  const outcome = await fetchCustomerOpenBillsFromTally(
+    config,
+    {
+      companyName,
+      ledgerNames,
+      asOfDate,
+      queryPurpose: "bank_statement_match",
+    }
+  );
+  const byLedger = outcome.result?.byLedger || {};
+  const consumed = new Map();
+  for (const payload of allocatedPayloads) {
+    const ledgerName = String(payload.counterpartyLedgerName || "").trim();
+    const bucket = byLedger[ledgerName];
+    if (!bucket || !Array.isArray(bucket.openBills)) {
+      throw new Error(`Open bills for '${ledgerName}' could not be verified immediately before posting.`);
+    }
+    const billByReference = new Map(
+      bucket.openBills.map((bill) => [normalizeExactReference(bill.referenceName || bill.voucherNumber), bill])
+    );
+    for (const allocation of payload.billAllocations) {
+      if (!/^agst\s+ref$/i.test(String(allocation?.referenceType || "").trim())) continue;
+      const referenceKey = normalizeExactReference(allocation?.referenceName);
+      const bill = billByReference.get(referenceKey);
+      if (!referenceKey || !bill) {
+        throw new Error(`Bill '${allocation?.referenceName || "unknown"}' is no longer open in '${ledgerName}'.`);
+      }
+      const amount = Math.abs(Number(allocation?.amount || 0));
+      const consumedKey = `${normalizeLooseName(ledgerName)}|${referenceKey}`;
+      const nextConsumed = Number(((consumed.get(consumedKey) || 0) + amount).toFixed(2));
+      const pendingAmount = Math.abs(Number(bill.pendingAmount ?? bill.amount ?? 0));
+      if (!(amount > 0) || nextConsumed - pendingAmount >= 0.005) {
+        throw new Error(`Bill '${allocation.referenceName}' changed in Tally. Refresh matching before posting.`);
+      }
+      consumed.set(consumedKey, nextConsumed);
+    }
+  }
+  const checkedAt = new Date().toISOString();
+  return (payloads || []).map((payload) => ({
+    ...payload,
+    liveBillValidation: Array.isArray(payload?.billAllocations) && payload.billAllocations.length > 0
+      ? { checkedAt, source: "live_tally_immediate_read" }
+      : null,
+  }));
 }
 
 export function getBankVoucherCommandBatchKey(payload = {}, fallbackCompanyName = null) {
@@ -1921,19 +2158,56 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
   const groups = new Map();
   for (const command of commands) {
     const payload = command?.payload || {};
-    // Tally accepts mixed voucher types and bill-allocation modes as separate
-    // TALLYMESSAGE entries in the same import envelope. Keep the grouping key
-    // limited to the shared duplicate-check context so a statement can post up
-    // to 50 vouchers in one request while retaining per-command isolation.
+    // A Tally import envelope can contain different voucher types and each
+    // TALLYMESSAGE carries its own bill allocations. Splitting on those fields
+    // reduced a mixed bank statement to batches of one even though all commands
+    // had been claimed together. Keep only the values shared by the duplicate
+    // pre/post-flight lookup; this lets up to 50 statement vouchers use one
+    // Tally request without weakening per-command result isolation.
     const key = getBankVoucherCommandBatchKey(payload, config.companyName);
     const group = groups.get(key) || [];
     group.push(command);
     groups.set(key, group);
   }
 
-  for (const group of groups.values()) {
+  for (const unresolvedGroup of groups.values()) {
+    let group;
+    try {
+      const companyName = unresolvedGroup[0]?.payload?.companyName || config.companyName || null;
+      const resolvedPayloads = await resolveBankVoucherLedgerPayloads(
+        config.tallyUrl,
+        unresolvedGroup.map((command) => command.payload || {}),
+        companyName
+      );
+      const validatedPayloads = await validateBankVoucherBillAllocationsLive(
+        config,
+        resolvedPayloads,
+        companyName
+      );
+      group = unresolvedGroup.map((command, index) => ({ ...command, payload: validatedPayloads[index] }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await sendCommandResults(config, unresolvedGroup.map((command) => ({
+        command,
+        outcome: {
+          success: false,
+          error: message,
+          result: {
+            transactionId: command.payload?.transactionId,
+            sourceBankTransactionId: command.payload?.transactionId,
+            beforeExecution: true,
+            liveMasterValidationFailed: true,
+          },
+        },
+      })));
+      console.log(`Bank voucher batch blocked before import: ${message}`);
+      continue;
+    }
     let preflightByTransactionId = null;
     try {
+      const targets = new Set(group.map((command) => JSON.stringify(command.payload?.target)));
+      if (targets.size !== 1) throw new Error("A Tally batch cannot cross company or connector sessions.");
+      await assertCommandTarget(config, group[0]);
       const firstPayload = group[0]?.payload || {};
       const batchPreflight = await reconcileBankTransactionsInTally(config, {
         companyName: firstPayload.companyName || config.companyName || null,
@@ -1953,11 +2227,22 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
         (batchPreflight.result?.transactions || []).map((row) => [String(row.transactionId || ""), row])
       );
     } catch (error) {
-      console.warn(
-        `Batch duplicate preflight was unavailable; falling back to independent checks: ${
-          error instanceof Error ? error.message : String(error)
-        }`
-      );
+      const message = error instanceof Error ? error.message : String(error);
+      await sendCommandResults(config, group.map((command) => ({
+        command,
+        outcome: {
+          success: false,
+          error: `Duplicate check could not be completed. Nothing was posted. ${message}`,
+          result: {
+            transactionId: command.payload?.transactionId,
+            sourceBankTransactionId: command.payload?.transactionId,
+            beforeExecution: true,
+            duplicateCheckIncomplete: true,
+          },
+        },
+      })));
+      console.warn(`Bank voucher batch blocked because duplicate preflight was unavailable: ${message}`);
+      continue;
     }
 
     const pendingCommands = [];
@@ -1996,6 +2281,14 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
           continue;
         }
 
+        if (preflight?.verificationStatus !== "missing") {
+          await sendCommandResult(config, command, {
+            success: false,
+            error: "Duplicate check returned an incomplete result. Nothing was posted.",
+            result: { transactionId, beforeExecution: true, duplicateCheckIncomplete: true },
+          });
+          continue;
+        }
         pendingCommands.push(command);
       } catch (error) {
         console.error(
@@ -2018,6 +2311,7 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
         pendingCommands.map((command) => command.payload),
         companyName
       );
+      await assertCommandTarget(config, pendingCommands[0]);
       batchOutcome = await invokeTallyXml(config.tallyUrl, batchXml);
     } catch (error) {
       batchOutcome = {
@@ -2028,40 +2322,8 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
     }
 
     const batchElapsedMs = Date.now() - batchStartedAt;
-    const importedCount =
-      Number(batchOutcome.result?.created || 0) + Number(batchOutcome.result?.altered || 0);
-    if (batchOutcome.success && importedCount >= pendingCommands.length) {
-      await sendCommandResults(
-        config,
-        pendingCommands.map((command) => ({
-          command,
-          outcome: {
-            success: true,
-            result: {
-              created: 1,
-              altered: 0,
-              transactionId: command.payload?.transactionId,
-              sourceBankTransactionId: command.payload?.transactionId,
-              voucherId: command.payload?.referenceNumber || command.id,
-              voucherNumber: command.payload?.referenceNumber || null,
-              requestXml: previewXml(batchXml),
-              batchImport: true,
-              batchSize: pendingCommands.length,
-              batchElapsedMs,
-            },
-          },
-        }))
-      );
-      console.log(
-        `Posted ${pendingCommands.length} bank vouchers in one Tally request (${batchElapsedMs} ms).`
-      );
-      continue;
-    }
-
-    // A Tally batch may create its valid messages and report only the invalid
-    // ones as exceptions. Reconcile once after a mixed result so already-created
-    // rows are never retried as duplicates, then retry only confirmed-missing
-    // rows independently. One bad voucher therefore cannot block the others.
+    // Tally import counters acknowledge the envelope, not each voucher. Always
+    // read every target back, even when CREATED equals the requested batch size.
     let postflightByTransactionId = null;
     try {
       const postflight = await reconcileBankTransactionsInTally(config, {
@@ -2086,11 +2348,12 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
       );
     }
 
+    const acknowledgementEntries = [];
     for (const command of pendingCommands) {
       const transactionId = String(command.payload?.transactionId || "");
       const postflight = postflightByTransactionId?.get(transactionId) || null;
       if (postflight?.verificationStatus === "found") {
-        await sendCommandResult(config, command, {
+        acknowledgementEntries.push({ command, outcome: {
           success: true,
           result: {
             created: 1,
@@ -2099,15 +2362,32 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
             voucherId: postflight.voucherId || command.payload?.referenceNumber || command.id,
             voucherNumber: postflight.voucherNumber || command.payload?.referenceNumber || null,
             duplicateCheck: postflight,
+            verificationStatus: "verified",
             requestXml: batchXml ? previewXml(batchXml) : null,
             batchImport: true,
             batchSize: pendingCommands.length,
             batchElapsedMs,
           },
-        });
+        }});
         continue;
       }
 
+      // A successful import followed by a missing/failed read-back is uncertain,
+      // never proof that it is safe to create the voucher again.
+      if (batchOutcome.success || !postflight || postflight.verificationStatus !== "missing") {
+        acknowledgementEntries.push({ command, outcome: {
+          success: false,
+          error: "The batch import outcome is uncertain. Read back Tally before retrying.",
+          result: {
+            transactionId,
+            reconciliationRequired: true,
+            possibleDuplicateInTally: true,
+            uncertaintyReason: !postflight ? "readback_unavailable" : "readback_did_not_confirm_import",
+            importSummary: batchOutcome.result || {},
+          },
+        }});
+        continue;
+      }
       try {
         await runCommand(
           config,
@@ -2128,6 +2408,14 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
         );
       }
     }
+
+    // The Tally import and postflight are already batch operations. Acknowledging
+    // each command one by one made a 50-row post spend roughly two minutes on
+    // avoidable API round trips. Keep per-command state, but report it in bounded
+    // concurrent groups so Supabase and the bridge remain protected.
+    if (acknowledgementEntries.length > 0) {
+      await sendCommandResults(config, acknowledgementEntries, 10);
+    }
   }
 }
 
@@ -2145,16 +2433,61 @@ async function postDebitNote(tallyUrl, payload, companyName) {
   return { outcome, xml };
 }
 
+export function decodeTallyResponseBytes(bytes, contentType = "") {
+  const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+  if (buffer.length >= 2 && buffer[0] === 0xff && buffer[1] === 0xfe) {
+    return new TextDecoder("utf-16le").decode(buffer.subarray(2));
+  }
+  if (buffer.length >= 2 && buffer[0] === 0xfe && buffer[1] === 0xff) {
+    return new TextDecoder("utf-16be").decode(buffer.subarray(2));
+  }
+  if (buffer.length >= 3 && buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) {
+    return new TextDecoder("utf-8").decode(buffer.subarray(3));
+  }
+  const declared = `${contentType} ${buffer.subarray(0, 256).toString("latin1")}`
+    .match(/(?:charset\s*=\s*|encoding\s*=\s*["'])([A-Za-z0-9._-]+)/i)?.[1]
+    ?.toLowerCase();
+  const encoding = declared === "utf16" || declared === "utf-16" ? "utf-16le"
+    : declared === "windows-1252" || declared === "cp1252" ? "windows-1252"
+      : "utf-8";
+  return new TextDecoder(encoding).decode(buffer);
+}
+
+async function readTallyResponse(response, maxResponseBytes = 0, label = "Tally response", controller = null) {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks = [];
+  let byteCount = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      byteCount += value.byteLength;
+      if (maxResponseBytes > 0 && byteCount > maxResponseBytes) {
+        controller?.abort();
+        throw new Error(`${label} exceeded the safe response size. Narrow the statement period or review this ledger separately.`);
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return decodeTallyResponseBytes(Buffer.concat(chunks, byteCount), response.headers.get("content-type") || "");
+}
+
 async function invokeTallyXml(tallyUrl, xml) {
+  const execution = commandExecutionContext.getStore();
+  if (execution) await assertCommandTarget(execution.config, execution.command);
   const controller = new AbortController();
   let timeout;
 
   try {
+    if (execution) execution.writeOutcomeUnknown = true;
     const response = await Promise.race([
       fetch(tallyUrl, {
         method: "POST",
         headers: {
-          "Content-Type": "text/xml",
+          "Content-Type": "text/xml; charset=utf-8",
         },
         body: xml,
         signal: controller.signal,
@@ -2169,8 +2502,10 @@ async function invokeTallyXml(tallyUrl, xml) {
       }),
     ]);
 
-    const text = await response.text();
-    return parseTallyImportResult(text, response.status);
+    const text = await readTallyResponse(response);
+    const parsed = parseTallyImportResult(text, response.status);
+    if (execution && /<IMPORTRESULT|<CREATED|<ERRORS|<LINEERROR/i.test(text)) execution.writeOutcomeUnknown = false;
+    return parsed;
   } finally {
     if (timeout) clearTimeout(timeout);
   }
@@ -2184,25 +2519,30 @@ async function exportTallyCollection(tallyUrl, options) {
   return exportTallyXml(
     tallyUrl,
     buildCollectionExportXml(options),
-    options.collectionName
+    options.collectionName,
+    options
   );
 }
 
-async function exportTallyXml(tallyUrl, xml, label = "Tally export") {
+async function exportTallyXml(tallyUrl, xml, label = "Tally export", options = {}) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), TALLY_EXPORT_TIMEOUT_MS);
+  const timeoutMs = options.timeoutMs || TALLY_EXPORT_TIMEOUT_MS;
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const response = await fetch(tallyUrl, {
       method: "POST",
       headers: {
-        "Content-Type": "text/xml",
+        "Content-Type": "text/xml; charset=utf-8",
       },
       body: xml,
-      signal: controller.signal,
+      signal: liveReadContext.getStore()?.signal
+        ? AbortSignal.any([controller.signal, liveReadContext.getStore().signal]) : controller.signal,
     });
 
-    const text = await response.text();
+    // Decode from bytes so Tally's UTF-8/UTF-16 declaration is respected and
+    // ledger punctuation is never silently changed before identity checks.
+    const text = await readTallyResponse(response, options.maxResponseBytes || 0, label, controller);
     const result = parseExportResult(text, response.status);
     if (!result.success) {
       throw new Error(
@@ -2214,7 +2554,8 @@ async function exportTallyXml(tallyUrl, xml, label = "Tally export") {
     return text;
   } catch (error) {
     if (error?.name === "AbortError") {
-      throw new Error(`${label} timed out after ${Math.round(TALLY_EXPORT_TIMEOUT_MS / 1000)} seconds.`);
+      if (liveReadContext.getStore()?.signal?.aborted) throw error;
+      throw new Error(`${label} timed out after ${Math.round(timeoutMs / 1000)} seconds.`, { cause: error });
     }
     throw error;
   } finally {
@@ -2817,7 +3158,7 @@ function normalizeExactReference(value) {
 
 function voucherHasExactReference(voucher, referenceNumber) {
   const expected = normalizeExactReference(referenceNumber);
-  if (expected.length < 5) return false;
+  if (!isStrongBankReference(expected)) return false;
   return [voucher.reference, ...(voucher.bankReferences || [])]
     .some((value) => normalizeExactReference(value) === expected);
 }
@@ -2883,12 +3224,39 @@ async function fetchLedgerClosingBalance(tallyUrl, options) {
   return parseTallyAmount(getTagText(xml, "CLOSINGBALANCE"));
 }
 
-function baseBankTransactionCandidates(vouchers, transaction, bankLedgerName, reservedVoucherIndexes = new Set()) {
+function indexBankVouchersByDate(vouchers) {
+  const byDate = new Map();
+  vouchers.forEach((voucher, index) => {
+    const date = normalizeDateForCompare(voucher.effectiveDate || voucher.date);
+    if (!byDate.has(date)) byDate.set(date, []);
+    byDate.get(date).push({ voucher, index });
+  });
+  return byDate;
+}
+
+function financialYearBounds(value) {
+  const normalized = normalizeDateForCompare(value);
+  if (!normalized) return null;
+  const [year, month] = normalized.split("-").map(Number);
+  const startYear = month >= 4 ? year : year - 1;
+  return { dateFrom: `${startYear}-04-01`, dateTo: `${startYear + 1}-03-31` };
+}
+
+function isStrongBankReference(value) {
+  const normalized = normalizeExactReference(value);
+  // Short words such as PAYMENT, CASH or CHARGES recur and are not transaction
+  // identities. Require a reasonably long alphanumeric bank/generated token.
+  return normalized.length >= 8 && /[a-z]/.test(normalized) && /\d/.test(normalized);
+}
+
+function baseBankTransactionCandidates(vouchers, transaction, bankLedgerName, reservedVoucherIndexes = new Set(), byDate = null) {
   const voucherDate = normalizeDateForCompare(transaction.voucherDate);
   const amount = Number(transaction.amount || 0);
-  return vouchers.flatMap((voucher, index) => {
+  const entries = byDate ? byDate.get(voucherDate) || [] : vouchers.map((voucher, index) => ({ voucher, index }));
+  return entries.flatMap(({ voucher, index }) => {
     if (reservedVoucherIndexes.has(index)) return [];
     const date = normalizeDateForCompare(voucher.effectiveDate || voucher.date);
+    if (!voucherDate || date !== voucherDate) return [];
     const bankEntry = getBankLedgerEntry(
       voucher,
       bankLedgerName,
@@ -2900,25 +3268,36 @@ function baseBankTransactionCandidates(vouchers, transaction, bankLedgerName, re
   });
 }
 
-function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, reservedVoucherIndexes) {
+function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, reservedVoucherIndexes, byDate = null) {
   const referenceNumber = String(transaction.referenceNumber || "").trim();
   const counterpartyLedgerName = String(transaction.counterpartyLedgerName || "").trim();
   const baseCandidates = baseBankTransactionCandidates(
     vouchers,
     transaction,
     bankLedgerName,
-    reservedVoucherIndexes
+    reservedVoucherIndexes,
+    byDate
   );
 
-  const hasUsableReference = normalizeExactReference(referenceNumber).length >= 5;
+  const hasUsableReference = isStrongBankReference(referenceNumber);
   const counterpartyKey = normalizeLooseName(counterpartyLedgerName);
   const hasUsableCounterparty = Boolean(counterpartyKey && !counterpartyKey.includes("suspense"));
   const identityInsufficient = !hasUsableReference && !hasUsableCounterparty;
   let candidates;
   if (hasUsableReference) {
-    // An exact usable bank reference is independent transaction identity. Party
-    // mismatch must not hide a voucher when the selected ledger was wrong.
-    candidates = baseCandidates.filter(({ voucher }) => voucherHasExactReference(voucher, referenceNumber));
+    // A bank reference can reveal a duplicate posted on the wrong date. Search
+    // the bounded financial-year identity export as well as same-date rows, but
+    // still require bank ledger, amount and accounting direction.
+    candidates = vouchers.flatMap((voucher, index) => {
+      if (reservedVoucherIndexes.has(index) || !voucherHasExactReference(voucher, referenceNumber)) return [];
+      const bankEntry = getBankLedgerEntry(
+        voucher,
+        bankLedgerName,
+        Number(transaction.amount || 0),
+        transaction.expectedDirection
+      );
+      return bankEntry ? [{ voucher, index, bankEntry }] : [];
+    });
   } else if (hasUsableCounterparty) {
     // Without a bank reference, the exact selected counterparty is mandatory.
     // Same-date and same-amount vouchers belonging to another ledger are not a
@@ -2977,12 +3356,12 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}, dep
   const dates = normalizedTransactions.map((transaction) => transaction.voucherDate).sort();
   const dateFrom = dates[0];
   const dateTo = dates.at(-1);
-  const { vouchers, diagnostics: queryDiagnostics } = await fetchBankReconciliationVouchers(
-    tallyUrl,
-    { companyName, dateFrom, dateTo, bankLedgerName, transactions: normalizedTransactions },
-    dependencies
-  );
+  const voucherRequest = { companyName, dateFrom, dateTo, bankLedgerName, transactions: normalizedTransactions };
+  const { vouchers, diagnostics: queryDiagnostics } = dependencies.voucherProvider
+    ? await dependencies.voucherProvider(tallyUrl, voucherRequest, dependencies)
+    : await fetchBankReconciliationVouchers(tallyUrl, voucherRequest, dependencies);
   const reservedVoucherIndexes = new Set();
+  const vouchersByDate = indexBankVouchersByDate(vouchers);
   const results = normalizedTransactions.map((transaction) => {
     const {
       candidates,
@@ -2994,16 +3373,13 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}, dep
       vouchers,
       transaction,
       bankLedgerName,
-      reservedVoucherIndexes
+      reservedVoucherIndexes,
+      vouchersByDate
     );
-    // An exact bank reference is expected to identify one economic transaction.
-    // If Tally contains that same strict reference more than once, the statement
-    // row is unquestionably already posted; the extra vouchers are a Tally data
-    // quality issue, not a reason to post the bank row again.
     const duplicateInTally = hasUsableReference && candidates.length > 1;
     const verificationStatus = identityInsufficient && candidates.length > 0
       ? "ambiguous"
-      : candidates.length === 1 || duplicateInTally
+      : candidates.length === 1
       ? "found"
       : candidates.length > 1
         ? "ambiguous"
@@ -3365,7 +3741,8 @@ function toOpenBill(block, ledgerName, evidence = {}) {
   if (pendingAmount <= 0) return null;
 
   const sourceVoucherType = getTagText(block, "VOUCHERTYPENAME") || getTagText(block, "VOUCHERTYPE") || null;
-  const kind = classifyOpenBillReferenceKind({
+  const nativeAdvance = String(getTagText(block, "ISADVANCE") || "").trim().toLowerCase();
+  const kind = nativeAdvance === "yes" ? "advance" : nativeAdvance === "no" ? "bill" : classifyOpenBillReferenceKind({
     billType: billReferenceType(block),
     sourceVoucherType,
     referenceName,
@@ -3581,8 +3958,12 @@ function earliestBillDate(blocks) {
   return dates[0] || null;
 }
 
-async function exportTargetedOpenBillXml(tallyUrl, { companyName, ledgerNames, asOfDate, forceTargeted = false }, exportCollection = exportTallyCollection) {
-  if (!forceTargeted && ledgerNames.length > OPEN_BILL_LEDGER_BATCH_SIZE) {
+async function exportTargetedOpenBillXml(
+  tallyUrl,
+  { companyName, ledgerNames, asOfDate, forceTargeted = false, forceFull = false },
+  exportCollection = exportTallyCollection
+) {
+  if (forceFull || (!forceTargeted && ledgerNames.length > OPEN_BILL_LEDGER_BATCH_SIZE)) {
     const xml = await exportCollection(tallyUrl, {
       collectionName: "Polaad Customer Open Bills", tallyType: "Bill",
       fetchFields: "Name,Parent,LedgerName,PartyLedgerName,BillType,TypeOfRef,Date,BillDate,DueDate,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance,Balance,PendingAmount,Amount",
@@ -3625,7 +4006,112 @@ async function exportTargetedBillEvidenceXml(tallyUrl, { companyName, ledgerName
   return { xml: responses.join("\n"), batchCount: batches.length };
 }
 
+async function fetchLedgerScopedBankBills(config, commandPayload, dependencies) {
+  // ChildOf gathers only this ledger. A Filter on Type: Bill first gathers all
+  // company bills; a voucher-history fallback can freeze Tally on a 4 GB PC.
+  const ledgerNames = [...new Set([
+    ...(Array.isArray(commandPayload.ledgerNames) ? commandPayload.ledgerNames : []),
+    commandPayload.ledgerName,
+  ].map((name) => String(name || "").trim()).filter(Boolean))];
+  if (!ledgerNames.length) throw new Error("Party open bill fetch requires ledgerName.");
+  const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
+  const exportCollection = dependencies.exportCollection || exportTallyCollection;
+  const asOfDate = normalizeDateForCompare(commandPayload.asOfDate || commandPayload.dateTo) || null;
+  const startedAt = Date.now();
+  const byLedger = Object.fromEntries(ledgerNames.map((name) => [name, {
+    ...emptyOpenBillBucket(name), complete: false, error: "Bill read was not completed.",
+  }]));
+  let billBatchCount = 0;
+  let billResultBytes = 0;
+  let stopReason = null;
+  for (const [index, ledgerName] of ledgerNames.entries()) {
+    dependencies.signal?.throwIfAborted();
+    liveReadContext.getStore()?.signal?.throwIfAborted();
+    if (Date.now() - startedAt >= BANK_MATCH_BILL_BUDGET_MS) {
+      stopReason ||= "The bill-read time budget was reached. Unchecked ledgers need review; no automatic retry was made.";
+    }
+    if (stopReason) {
+      byLedger[ledgerName].error = stopReason;
+      continue;
+    }
+    dependencies.onProgress?.(`Reading open bills ${index + 1}/${ledgerNames.length}: ${ledgerName}`);
+    let xml;
+    try {
+      billBatchCount += 1;
+      xml = await exportCollection(tallyUrl, {
+        collectionName: `Polaad Ledger Open Bills ${index + 1}`,
+        tallyType: "Bills", childOf: tallyFormulaString(ledgerName),
+        fetchFields: "Name,Parent,LedgerName,BillDate,DueDate,OpeningBalance,ClosingBalance,IsAdvance,BillType",
+        companyName: commandPayload.companyName || null, dateTo: asOfDate,
+        timeoutMs: Math.min(BANK_MATCH_READ_TIMEOUT_MS, BANK_MATCH_BILL_BUDGET_MS - (Date.now() - startedAt)),
+        maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
+      });
+    } catch (error) {
+      dependencies.signal?.throwIfAborted();
+      liveReadContext.getStore()?.signal?.throwIfAborted();
+      // Aborting HTTP does not stop Tally's internal report calculation. Do not
+      // queue more reads or retry against an unresponsive Tally in this run.
+      stopReason = `Bill reading stopped: ${error?.message || "Tally did not respond"}`;
+      byLedger[ledgerName].error = stopReason;
+      continue;
+    }
+    const bucket = emptyOpenBillBucket(ledgerName);
+    try {
+      if (!/<COLLECTION(?:\s|\/?>)/i.test(xml) || !/<\/ENVELOPE\s*>/i.test(xml) || /<LINEERROR[\s>]/i.test(xml)) {
+        throw new Error("Tally did not return a complete bill collection.");
+      }
+      for (const block of extractBlocks(xml, "BILL")) {
+        const parent = billLedgerName(block);
+        // Do not combine punctuation-distinct ledger identities or trust an
+        // unexpectedly unscoped result, even if Tally reports HTTP success.
+        if (parent && parent.trim().toLowerCase() !== ledgerName.toLowerCase()) {
+          throw new Error("Tally returned bills for another ledger.");
+        }
+        const closing = parseTallyAmount(getTagText(block, "CLOSINGBALANCE"));
+        if (closing === null) throw new Error("Tally omitted the pending bill balance.");
+        if (closing === 0) continue;
+        const nativeAdvance = String(getTagText(block, "ISADVANCE") || "").trim();
+        if (!/^(yes|no)$/i.test(nativeAdvance) && !/^(advance|new ref|agst ref)$/i.test(billReferenceType(block))) {
+          throw new Error("Tally omitted the bill/advance type. Review this ledger separately.");
+        }
+        const entry = toOpenBill(block, ledgerName);
+        if (!entry) throw new Error("Tally returned an incomplete bill reference.");
+        const { kind, ...value } = entry;
+        bucket[kind === "advance" ? "existingAdvances" : "openBills"].push(value);
+        bucket.rawCount += 1;
+      }
+      const bucketBytes = Buffer.byteLength(JSON.stringify(bucket), "utf8");
+      if (billResultBytes + bucketBytes > BANK_MATCH_MAX_BILL_RESULT_BYTES) {
+        stopReason = "The safe bill-result size was reached. Review the remaining ledgers separately.";
+        throw new Error(stopReason);
+      }
+      billResultBytes += bucketBytes;
+      byLedger[ledgerName] = { ...bucket, complete: true, error: null };
+    } catch (error) {
+      // Discard partial allocations for this ledger; other complete ledgers
+      // retain their results and can still be posted independently.
+      byLedger[ledgerName].error = error.message;
+    }
+  }
+  const first = byLedger[ledgerNames[0]];
+  return { success: true, result: {
+    ledgerName: ledgerNames[0], ledgerNames, byLedger,
+    complete: Object.values(byLedger).every((bucket) => bucket.complete),
+    ...(first.complete ? { openBills: first.openBills, existingAdvances: first.existingAdvances } : {}),
+    queryDiagnostics: {
+      requestedLedgerCount: ledgerNames.length, billBatchCount, billQueryMode: "ledger_child_of",
+      incompleteLedgerCount: Object.values(byLedger).filter((bucket) => !bucket.complete).length,
+      billObjectCount: Object.values(byLedger).reduce((total, bucket) => total + bucket.rawCount, 0),
+      voucherFallbackUsed: false, voucherBatchCount: 0, billResultBytes,
+      balanceBasis: "current_outstanding", totalMs: Date.now() - startedAt, asOfDate,
+    },
+  } };
+}
+
 async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}, dependencies = {}) {
+  if (commandPayload.queryPurpose === "bank_statement_match") {
+    return fetchLedgerScopedBankBills(config, commandPayload, dependencies);
+  }
   const ledgerNames = uniquePayloadLedgerNames(commandPayload);
   if (ledgerNames.length === 0) {
     throw new Error("Party open bill fetch requires ledgerName.");
@@ -3636,21 +4122,26 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}, depe
   const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
   const asOfDate = normalizeDateForCompare(commandPayload.asOfDate || commandPayload.dateTo) || null;
   const requestedDateFrom = normalizeDateForCompare(commandPayload.dateFrom) || null;
-  const forceTargeted =
-    commandPayload.queryPurpose === "bank_statement_match" && ledgerNames.length <= OPEN_BILL_LEDGER_BATCH_SIZE;
+  // Legacy non-bank consumers may explicitly request a snapshot. Bank matching
+  // always takes the ChildOf path above, even if full_snapshot was requested.
+  const forceFull = commandPayload.queryStrategy === "full_snapshot";
+  const forceTargeted = !forceFull && ledgerNames.length <= OPEN_BILL_LEDGER_BATCH_SIZE;
   const exportCollection = dependencies.exportCollection || exportTallyCollection;
   // Tally's local HTTP listener processes reports serially. Concurrent large
   // collection exports can leave one request waiting indefinitely, which
   // previously locked the whole connector cycle and surfaced as a dashboard
   // refresh timeout.
+  const billExportStartedAt = Date.now();
   const billExport = dependencies.billExport || await exportTargetedOpenBillXml(
     tallyUrl,
-    { companyName, ledgerNames, dateFrom: requestedDateFrom, asOfDate, forceTargeted },
+    { companyName, ledgerNames, dateFrom: requestedDateFrom, asOfDate, forceTargeted, forceFull },
     exportCollection
   );
+  const billExportCompletedAt = Date.now();
   const billBlocks = extractBlocks(billExport.xml, "BILL").filter((block) =>
     requestedLedgerByKey.has(normalizeLooseName(billLedgerName(block)))
   );
+  const billFilterCompletedAt = Date.now();
   const fallbackBlocks = billBlocks.filter(openBillBlockRequiresVoucherFallback);
   const fallbackLedgerNames = Array.from(new Set(fallbackBlocks.flatMap((block) => {
     const requestedLedgerName = requestedLedgerByKey.get(normalizeLooseName(billLedgerName(block)));
@@ -3771,18 +4262,218 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}, depe
         voucherQueryMode: voucherExport.queryMode || "targeted_chunks",
         voucherDateChunkCount: voucherExport.dateChunkCount ?? 0,
         voucherRetrySplitCount: voucherExport.retrySplitCount ?? 0,
+        billExportMs: billExportCompletedAt - billExportStartedAt,
+        billFilterMs: billFilterCompletedAt - billExportCompletedAt,
+        totalMs: Date.now() - billExportStartedAt,
         asOfDate,
       },
     },
   };
 }
 
-function buildVoucherMasterIdFormula(masterIds) {
-  return masterIds
-    .map((value) => String(value || "").trim())
-    .filter((value) => /^\d+$/.test(value))
-    .map((value) => `$MasterID = ${value}`)
-    .join(" OR ");
+async function matchBankStatementInTally(config, commandPayload = {}, dependencies = {}) {
+  const startedAt = Date.now();
+  const verificationOutcome = await reconcileBankTransactionsInTally(
+    config,
+    commandPayload,
+    dependencies
+  );
+  const verification = verificationOutcome.result || verificationOutcome;
+  await dependencies.assertCompany?.();
+  dependencies.onPartialResult?.({ phase: "voucher_presence", complete: false, ...verification });
+  dependencies.signal?.throwIfAborted();
+  const voucherCheckCompletedAt = Date.now();
+  const transactions = Array.isArray(commandPayload.transactions) ? commandPayload.transactions : [];
+  const transactionById = new Map(
+    transactions.map((transaction) => [String(transaction.transactionId || ""), transaction])
+  );
+  const billEligibleTransactionIds = new Set(
+    Array.isArray(commandPayload.billEligibleTransactionIds)
+      ? commandPayload.billEligibleTransactionIds.map((value) => String(value || ""))
+      : []
+  );
+  const missingLedgerNames = Array.from(new Set(
+    (Array.isArray(verification.transactions) ? verification.transactions : []).flatMap((result) => {
+      const transactionId = String(result?.transactionId || "");
+      if (result?.verificationStatus !== "missing" || !billEligibleTransactionIds.has(transactionId)) {
+        return [];
+      }
+      const ledgerName = String(transactionById.get(transactionId)?.counterpartyLedgerName || "").trim();
+      return ledgerName && !/^suspense(?:\s|$)/i.test(ledgerName) ? [ledgerName] : [];
+    })
+  ));
+
+  let billResult = {
+    ledgerNames: [],
+    byLedger: {},
+    openBills: [],
+    existingAdvances: [],
+    rawCount: 0,
+    queryDiagnostics: {
+      requestedLedgerCount: 0,
+      skipped: true,
+      reason: "No unmatched bill-eligible statement rows.",
+    },
+  };
+  if (missingLedgerNames.length > 0) {
+    const context = dependencies.operationalContext;
+    const cachedByLedger = {};
+    const liveLedgerNames = [];
+    for (const ledgerName of missingLedgerNames) {
+      const cached = context?.partition ? getCachedBillBucket(context.partition, ledgerName) : null;
+      if (cached) cachedByLedger[ledgerName] = cached;
+      else liveLedgerNames.push(ledgerName);
+    }
+    let liveBillResult = { byLedger: {}, queryDiagnostics: { skipped: true } };
+    if (liveLedgerNames.length > 0) {
+      dependencies.onProgress?.(`Voucher check complete. Reading open bills for ${liveLedgerNames.length} changed ledgers...`);
+      const billOutcome = await fetchCustomerOpenBillsFromTally(
+        config,
+        {
+          companyName: commandPayload.companyName,
+          ledgerName: liveLedgerNames[0],
+          ledgerNames: liveLedgerNames,
+          asOfDate: commandPayload.asOfDate,
+          queryPurpose: "bank_statement_match",
+        },
+        dependencies
+      );
+      liveBillResult = billOutcome.result || billOutcome;
+      if (context?.partition) {
+        for (const ledgerName of liveLedgerNames) {
+          const bucket = liveBillResult.byLedger?.[ledgerName];
+          if (bucket?.complete !== false && !bucket?.error) putCachedBillBucket(context.partition, ledgerName, bucket);
+        }
+        saveOperationalCache(context.db, context.options);
+      }
+    }
+    const byLedger = { ...cachedByLedger, ...(liveBillResult.byLedger || {}) };
+    billResult = {
+      ...liveBillResult,
+      ledgerNames: missingLedgerNames,
+      byLedger,
+      openBills: byLedger[missingLedgerNames[0]]?.openBills || [],
+      existingAdvances: byLedger[missingLedgerNames[0]]?.existingAdvances || [],
+      rawCount: Object.values(byLedger).reduce((total, bucket) => total + Number(bucket?.rawCount || 0), 0),
+      queryDiagnostics: {
+        ...(liveBillResult.queryDiagnostics || {}),
+        requestedLedgerCount: missingLedgerNames.length,
+        cachedLedgerCount: Object.keys(cachedByLedger).length,
+        liveLedgerCount: liveLedgerNames.length,
+        cacheSource: "connector_open_bill_cache",
+      },
+    };
+  }
+
+  return {
+    success: true,
+    result: {
+      ...verification,
+      billLedgerNames: missingLedgerNames,
+      openBillsByLedger: billResult.byLedger || {},
+      connectorBillAllocationPlans: planChronologicalBillAllocations({
+        transactions: transactions.filter((transaction) => billEligibleTransactionIds.has(String(transaction.transactionId || ""))),
+        verificationRows: verification.transactions || [],
+        openBillsByLedger: billResult.byLedger || {},
+      }),
+      matchDiagnostics: {
+        voucherCheck: verification.queryDiagnostics || null,
+        openBillCheck: billResult.queryDiagnostics || null,
+        voucherCheckMs: voucherCheckCompletedAt - startedAt,
+        openBillCheckMs: Date.now() - voucherCheckCompletedAt,
+        totalMs: Date.now() - startedAt,
+      },
+    },
+  };
+}
+
+const VOUCHER_CACHE_FULL_REFRESH_MS = 7 * 24 * 60 * 60 * 1_000;
+const CACHED_VOUCHER_FETCH_FIELDS =
+  "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,AlterID,GUID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.Name,AllLedgerEntries.BankAllocations.InstrumentNumber,AllLedgerEntries.BankAllocations.TransactionName,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.BillDate,AllLedgerEntries.BillAllocations.Amount";
+
+function isCompleteVoucherEnvelope(xml) {
+  return /<\/ENVELOPE\s*>/i.test(xml) && /<(?:COLLECTION|VOUCHER)(?:\s|\/?>)/i.test(xml);
+}
+
+async function refreshCachedBankVouchers(
+  tallyUrl,
+  { companyName, dateFrom, dateTo, bankLedgerName, transactions },
+  dependencies = {}
+) {
+  const startedAt = Date.now();
+  const options = {
+    appUserDataPath: dependencies.appUserDataPath,
+    baseDir: dependencies.localMatchingBaseDir,
+  };
+  const db = loadOperationalCache(options);
+  const fy = financialYearRange(dateFrom);
+  const { key, partition } = ensureVoucherPartition(db, {
+    companyGuid: dependencies.companyGuid || null,
+    companyName,
+    bankLedgerGuid: dependencies.bankLedgerGuid || null,
+    bankLedgerName,
+    financialYear: fy.key,
+  });
+  const lastFullAt = Date.parse(partition.lastFullRefreshAt || "") || 0;
+  const fullRefresh = !partition.lastFullRefreshAt || Date.now() - lastFullAt >= VOUCHER_CACHE_FULL_REFRESH_MS;
+  const mode = fullRefresh ? "full_snapshot" : "scoped_snapshot";
+  partition.status = "refreshing";
+  saveOperationalCache(db, options);
+
+  const exportStartedAt = Date.now();
+  try {
+    const xml = await (dependencies.exportCollection || exportTallyCollection)(tallyUrl, {
+      collectionName: fullRefresh
+        ? "Polaad Cached Bank Vouchers"
+        : "Polaad Statement Bank Vouchers",
+      tallyType: "Vouchers : Ledger",
+      childOf: tallyFormulaString(bankLedgerName),
+      fetchFields: CACHED_VOUCHER_FETCH_FIELDS,
+      companyName,
+      dateFrom: fullRefresh ? fy.dateFrom : dateFrom,
+      dateTo: fullRefresh ? fy.dateTo : dateTo,
+      timeoutMs: BANK_MATCH_READ_TIMEOUT_MS,
+      maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
+    });
+    if (!isCompleteVoucherEnvelope(xml)) {
+      throw new Error("Tally did not return a complete voucher collection for the local index.");
+    }
+    const changedVouchers = parseVoucherCollection(xml);
+    const update = upsertVoucherPartition(partition, changedVouchers, {
+      mode, bankLedgerName, dateFrom, dateTo,
+    });
+    partition.lastError = null;
+    saveOperationalCache(db, options);
+    dependencies.operationalContext = { db, key, partition, options };
+
+    const strongReferences = new Set(
+      (transactions || []).map((item) => String(item.referenceNumber || "").trim()).filter(isStrongBankReference)
+    );
+    const vouchers = activeVouchers(partition).filter((voucher) => {
+      const date = normalizeDateForCompare(voucher.effectiveDate || voucher.date);
+      return (date >= dateFrom && date <= dateTo) ||
+        (strongReferences.size > 0 && strongReferences.has(String(voucher.reference || "").trim()));
+    });
+    return {
+      vouchers,
+      diagnostics: {
+        source: "connector_voucher_index",
+        refreshMode: mode,
+        exportMs: Date.now() - exportStartedAt,
+        totalMs: Date.now() - startedAt,
+        changedVoucherCount: changedVouchers.length,
+        scannedVoucherCount: vouchers.length,
+        cachedVoucherCount: partition.voucherCount || 0,
+        counts: update.counts,
+        financialYear: fy.key,
+      },
+    };
+  } catch (error) {
+    partition.status = "error";
+    partition.lastError = error instanceof Error ? error.message : String(error);
+    saveOperationalCache(db, options);
+    throw error;
+  }
 }
 
 async function fetchBankReconciliationVouchers(
@@ -3792,85 +4483,100 @@ async function fetchBankReconciliationVouchers(
 ) {
   const exportCollection = dependencies.exportCollection || exportTallyCollection;
   const startedAt = Date.now();
-  const bankEntryFormulaName = "AutodealerBankLedgerEntry";
-  const bankVoucherFormulaName = "AutodealerBankVoucher";
-  const leanXml = await exportCollection(tallyUrl, {
-    collectionName: "Polaad Bank Statement Reconciliation",
-    tallyType: "Voucher",
-    fetchFields:
-      "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,PartyLedgerName,MasterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive",
-    companyName,
-    dateFrom,
-    dateTo,
-    formulae: [
-      {
-        name: bankEntryFormulaName,
-        formula: buildRequestedLedgerFormula([bankLedgerName], ["$LedgerName"]),
-      },
-      {
-        name: bankVoucherFormulaName,
-        formula: `$$FilterCount:AllLedgerEntries:${bankEntryFormulaName} > 0`,
-      },
-    ],
-    filterNames: [bankVoucherFormulaName],
-  });
+  const strongReferences = Array.from(new Set(
+    (transactions || [])
+      .map((transaction) => String(transaction.referenceNumber || "").trim())
+      .filter(isStrongBankReference)
+  ));
+  const needsSameDateScan = (transactions || []).some(
+    (transaction) => !isStrongBankReference(transaction.referenceNumber)
+  );
+  // Secondary collection: gather this bank's vouchers directly, instead of
+  // gathering all company vouchers and applying FilterCount afterwards.
+  // Fetch bank-allocation references with the primary export
+  // so a missing top-level Reference does not trigger another serial Tally
+  // request for the same vouchers.
+  const leanXml = needsSameDateScan
+    ? await exportCollection(tallyUrl, {
+        collectionName: "Polaad Bank Statement Reconciliation",
+        tallyType: "Vouchers : Ledger",
+        childOf: tallyFormulaString(bankLedgerName),
+        fetchFields:
+          "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,PartyLedgerName,MasterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.Name,AllLedgerEntries.BankAllocations.InstrumentNumber,AllLedgerEntries.BankAllocations.TransactionName",
+        companyName,
+        dateFrom,
+        dateTo,
+        timeoutMs: BANK_MATCH_READ_TIMEOUT_MS,
+        maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
+      })
+    : "<ENVELOPE><COLLECTION></COLLECTION></ENVELOPE>";
   const leanCompletedAt = Date.now();
-  const vouchers = parseVoucherCollection(leanXml).filter(
+  if (!/<\/ENVELOPE\s*>/i.test(leanXml) ||
+      !/<(?:COLLECTION|VOUCHER)(?:\s|\/?>)/i.test(leanXml)) {
+    throw new Error("Tally did not return a complete bank voucher collection. Duplicate checking could not be completed.");
+  }
+  const sameDateVouchers = parseVoucherCollection(leanXml).filter(
     (voucher) => !/^yes$/i.test(String(voucher.isCancelled || ""))
   );
-
-  // Polaad-created vouchers expose the UTR in the top-level Reference. Only
-  // fetch expensive nested bank allocations for unresolved candidates.
-  const detailMasterIds = new Set();
-  for (const transaction of transactions) {
-    const referenceNumber = String(transaction.referenceNumber || "").trim();
-    if (normalizeExactReference(referenceNumber).length < 5) continue;
-    const baseCandidates = baseBankTransactionCandidates(vouchers, transaction, bankLedgerName);
-    if (baseCandidates.some(({ voucher }) => voucherHasExactReference(voucher, referenceNumber))) continue;
-    for (const { voucher } of baseCandidates) {
-      if (isNumericMasterId(voucher.masterId)) detailMasterIds.add(String(voucher.masterId));
-    }
-  }
-
-  const detailBatches = chunkValues([...detailMasterIds], BANK_REFERENCE_VOUCHER_BATCH_SIZE);
-  const referenceByMasterId = new Map();
-  for (const [index, masterIds] of detailBatches.entries()) {
-    const masterFilterName = "PolaadRequestedBankVoucher";
-    const formula = buildVoucherMasterIdFormula(masterIds);
-    if (!formula) continue;
-    const detailXml = await exportCollection(tallyUrl, {
-      collectionName: `Polaad Bank Reference Evidence ${index + 1}`,
-      tallyType: "Voucher",
+  let crossDateVouchers = [];
+  let crossDateExportMs = 0;
+  const financialYear = financialYearBounds(dateFrom);
+  if (strongReferences.length > 0 && financialYear) {
+    const crossDateStartedAt = Date.now();
+    const filterName = "PolaadBankReferenceIdentity";
+    const referenceFormula = strongReferences
+      .map((reference) => `($$IsEqual:$Reference:${tallyFormulaString(reference)})`)
+      .join(" OR ");
+    const crossDateXml = await exportCollection(tallyUrl, {
+      collectionName: "Polaad Bank Reference Identity",
+      tallyType: "Vouchers : Ledger",
+      childOf: tallyFormulaString(bankLedgerName),
       fetchFields:
-        "MasterID,Reference,AllLedgerEntries.BankAllocations.Name,AllLedgerEntries.BankAllocations.InstrumentNumber,AllLedgerEntries.BankAllocations.TransactionName",
+        "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,PartyLedgerName,MasterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.Name,AllLedgerEntries.BankAllocations.InstrumentNumber,AllLedgerEntries.BankAllocations.TransactionName",
       companyName,
-      dateFrom,
-      dateTo,
-      formulae: [{ name: masterFilterName, formula }],
-      filterNames: [masterFilterName],
+      dateFrom: financialYear.dateFrom,
+      dateTo: financialYear.dateTo,
+      formulae: [{ name: filterName, formula: referenceFormula }],
+      filterNames: [filterName],
+      timeoutMs: BANK_MATCH_READ_TIMEOUT_MS,
+      maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
     });
-    for (const voucher of parseVoucherCollection(detailXml)) {
-      if (!voucher.masterId) continue;
-      referenceByMasterId.set(String(voucher.masterId), voucher.bankReferences || []);
+    if (!/<\/ENVELOPE\s*>/i.test(crossDateXml)) {
+      throw new Error("Tally did not return a complete financial-year duplicate lookup.");
     }
+    crossDateVouchers = parseVoucherCollection(crossDateXml).filter(
+      (voucher) => !/^yes$/i.test(String(voucher.isCancelled || ""))
+    );
+    crossDateExportMs = Date.now() - crossDateStartedAt;
   }
-
-  for (const voucher of vouchers) {
-    const references = referenceByMasterId.get(String(voucher.masterId || ""));
-    if (references?.length) {
-      voucher.bankReferences = [...new Set([...(voucher.bankReferences || []), ...references])];
-    }
+  const voucherByIdentity = new Map();
+  for (const voucher of [...sameDateVouchers, ...crossDateVouchers]) {
+    const key = [
+      voucher.masterId || "",
+      voucher.voucherNumber || "",
+      normalizeDateForCompare(voucher.effectiveDate || voucher.date) || "",
+      voucher.reference || "",
+    ].join("|");
+    if (!voucherByIdentity.has(key)) voucherByIdentity.set(key, voucher);
   }
+  const vouchers = Array.from(voucherByIdentity.values());
 
   return {
     vouchers,
     diagnostics: {
       leanExportMs: leanCompletedAt - startedAt,
-      referenceExportMs: Date.now() - leanCompletedAt,
+      referenceExportMs: 0,
+      crossDateExportMs,
       totalMs: Date.now() - startedAt,
       scannedVoucherCount: vouchers.length,
-      detailedVoucherCount: detailMasterIds.size,
-      detailBatchCount: detailBatches.length,
+      detailedVoucherCount: 0,
+      detailBatchCount: 0,
+      primaryIncludesBankReferences: true,
+      queryMode: strongReferences.length > 0
+        ? needsSameDateScan
+          ? "bank_ledger_plus_financial_year_reference"
+          : "financial_year_reference"
+        : "bank_ledger_child_of",
     },
   };
 }
@@ -4213,7 +4919,6 @@ async function postMastersToBackend(config, payload) {
       Authorization: `Bearer ${config.bridgeToken}`,
     },
     body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(60_000),
   });
   const result = await readJsonResponse(response);
 
@@ -4320,8 +5025,9 @@ async function testTally(tallyUrl) {
       // Readiness must always inspect the current Tally session. Supplying
       // SVCURRENTCOMPANY here would test a remembered/requested company and
       // could falsely report it as the active UI company.
-      body: buildTallyReadinessXml(null),
-      signal: controller.signal,
+      body: '<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Function</TYPE><ID>$$CurrentCompany</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES></DESC></BODY></ENVELOPE>',
+      signal: liveReadContext.getStore()?.signal
+        ? AbortSignal.any([controller.signal, liveReadContext.getStore().signal]) : controller.signal,
     });
 
     const text = await response.text();
@@ -4347,9 +5053,9 @@ async function testTally(tallyUrl) {
       };
     }
 
-    const possibleCompanyLoaded = !lineError && status === "1";
+    const possibleCompanyLoaded = !lineError && status !== "0";
     const activeCompanyName = possibleCompanyLoaded
-      ? await fetchActiveCompanyName(normalizeTallyUrl(tallyUrl))
+      ? getTagText(text, "RESULT") || extractCompanyName(text)
       : null;
     // The readiness collection can contain ledgers from the first loaded
     // company in a multi-company Tally session. It is not proof that this is
@@ -4378,6 +5084,8 @@ async function testTally(tallyUrl) {
   }
 }
 
+const commandLeases = new Map();
+
 async function receiveNextCommands(config, limit = MAX_COMMANDS_PER_CYCLE) {
   const url = new URL(`${config.apiBase}/api/tally/bridge/commands/next`);
   url.searchParams.set("connectionId", config.connectionId);
@@ -4400,8 +5108,11 @@ async function receiveNextCommands(config, limit = MAX_COMMANDS_PER_CYCLE) {
     throw new Error(payload.error || `Command poll failed with HTTP ${response.status}.`);
   }
 
-  if (Array.isArray(payload.commands)) return payload.commands;
-  return payload.command ? [payload.command] : [];
+  const commands = Array.isArray(payload.commands) ? payload.commands : payload.command ? [payload.command] : [];
+  for (const command of commands) {
+    if (command.claimToken) commandLeases.set(command.id, { id: command.id, token: command.claimToken, connectionId: config.connectionId });
+  }
+  return commands;
 }
 
 async function sendCommandResults(config, entries, concurrency = 10) {
@@ -4415,9 +5126,15 @@ async function sendCommandResults(config, entries, concurrency = 10) {
 }
 
 async function sendCommandResult(config, command, outcome) {
+  if (!outcome.success && commandExecutionContext.getStore()?.writeOutcomeUnknown) {
+    outcome = { ...outcome, result: { ...(outcome.result || {}), reconciliationRequired: true, possibleDuplicateInTally: true } };
+  }
   const status = outcome.success ? "succeeded" : "failed";
   const error = outcome.error ?? null;
   console.log(`Reporting command ${command.id} as ${status}${error ? `: ${error}` : ""}`);
+  // Stop renewing even if the acknowledgement is lost. An uncertain command is
+  // then quarantined for readback; it is never silently re-imported.
+  commandLeases.delete(command.id);
 
   const response = await fetch(`${config.apiBase}/api/tally/bridge/commands/${command.id}/result`, {
     method: "POST",
@@ -4427,6 +5144,7 @@ async function sendCommandResult(config, command, outcome) {
     },
     body: JSON.stringify({
       connectionId: config.connectionId,
+      claimToken: command.claimToken,
       status,
       success: outcome.success,
       result: outcome.result ?? {},
@@ -4514,8 +5232,74 @@ async function materializePurchaseSourceDocument(payload) {
   };
 }
 
+async function assertCommandTarget(config, command) {
+  const target = command?.payload?.target;
+  if (!target || target.installationId !== config.installationRef || target.sessionGeneration !== config.sessionGeneration || target.connectionId !== config.connectionId) {
+    throw new Error("The command targets an old or different connector session. Review it before retrying.");
+  }
+  // Rendering a previously verified document is not a new Tally read/write.
+  if (command.commandType === "parse_document" ||
+      command.commandType === "parse_and_suggest" ||
+      command.commandType === "export_debit_note_pdf" ||
+      (command.commandType === "create_debit_note" && command.payload?.operation === "export_native_pdf")) return;
+  const readiness = await testTally(config.tallyUrl);
+  const companies = await fetchAvailableCompanies(config.tallyUrl, readiness.companyName);
+  const active = companies.filter((company) => company.isActive);
+  if (active.length !== 1 || String(active[0].guid || "").toLowerCase() !== target.companyGuid) {
+    throw new Error("The active company GUID does not match this command. Switch Tally to the intended company.");
+  }
+}
+
 async function runCommand(config, command, options = {}) {
+  return commandExecutionContext.run({ config, command }, () => executeCommand(config, command, options));
+}
+
+async function executeCommand(config, command, options = {}) {
   if (!command) return;
+  try {
+    await assertCommandTarget(config, command);
+  } catch (error) {
+    await sendCommandResult(config, command, { success: false, error: error.message, result: { beforeExecution: true } });
+    return;
+  }
+
+  if (command.commandType === "parse_document") {
+    try {
+      const parsed = await parseDocumentLocal(command.payload || {});
+      await sendCommandResult(config, command, { success: true, result: parsed });
+      console.log(`Command ${command.id} completed: document parsed locally as ${parsed.outputFormat}.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error ?? "Document parsing failed.");
+      await sendCommandResult(config, command, {
+        success: false,
+        result: { processing: "local", ocrUsed: false, code: error?.code || "parse_failed" },
+        error: message,
+      });
+      console.log(`Command ${command.id} failed: ${message}`);
+    }
+    return;
+  }
+
+  if (command.commandType === "parse_and_suggest") {
+    try {
+      const result = await parseDocumentAndSuggestLedgers(command.payload || {}, {
+        appUserDataPath: options.appUserDataPath,
+        baseDir: options.localMatchingBaseDir,
+        embedTexts: options.embedTexts || ((inputs) => requestBridgeSemanticEmbeddings(config, inputs)),
+      });
+      await sendCommandResult(config, command, { success: true, result });
+      console.log(`Command ${command.id} completed: parsed ${result.transactions.length} transaction(s) and retrieved vector candidates.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error ?? "Document parsing and ledger retrieval failed.");
+      await sendCommandResult(config, command, {
+        success: false,
+        result: { processing: "local", searchMode: "vector_only", code: error?.code || "parse_and_suggest_failed" },
+        error: message,
+      });
+      console.log(`Command ${command.id} failed: ${message}`);
+    }
+    return;
+  }
 
   if (command.commandType === "sync_masters") {
     try {
@@ -4961,6 +5745,8 @@ async function pairBridge(args) {
   writeConfig({
     apiBase,
     connectionId,
+    installationRef: payload.connection?.installationRef,
+    sessionGeneration: payload.connection?.sessionGeneration,
     bridgeToken: payload.bridgeToken,
     tallyUrl,
     bridgeName,
@@ -5003,14 +5789,14 @@ async function sendHeartbeat(config, testResult, availableCompanies = []) {
   return payload;
 }
 
-async function runOnce(config, options = {}) {
+async function runOnce(config, options = {}, executeExclusive = null) {
   // A verified Debit Note document needs the already-confirmed voucher fields
   // and the local PDF renderer, not a fresh Tally HTTP call. Claim and finish
   // it before a slow/unreachable Tally heartbeat can hold the customer send
   // flow hostage for a minute.
   const deferredCommands = [];
   try {
-    const claimedCommands = await receiveNextCommands(config);
+    const claimedCommands = options.skipCommandPolling ? [] : await receiveNextCommands(config);
     for (const command of claimedCommands) {
       const isVerifiedDebitNotePdf =
         command.commandType === "export_debit_note_pdf" ||
@@ -5025,7 +5811,21 @@ async function runOnce(config, options = {}) {
     emitLog(options, "error", commandError instanceof Error ? commandError.message : String(commandError));
   }
 
-  const result = await testTally(config.tallyUrl);
+  const runTallyTask = (task) => executeExclusive
+    ? executeExclusive(task, "background")
+    : task();
+  const readinessCache = options.tallyReadinessCache || null;
+  const cachedReadinessIsFresh =
+    readinessCache?.result &&
+    Date.now() - Number(readinessCache.fetchedAt || 0) < TALLY_HEARTBEAT_PROBE_INTERVAL_MS;
+  const result = cachedReadinessIsFresh
+    ? readinessCache.result
+    : await runTallyTask(() => testTally(config.tallyUrl));
+  if (readinessCache && !cachedReadinessIsFresh) {
+    readinessCache.result = result;
+    readinessCache.fetchedAt = Date.now();
+  }
+  result.observedAt = new Date(readinessCache?.fetchedAt || Date.now()).toISOString();
   const companyCache = options.companyHeartbeatCache || null;
   const cacheIsFresh =
     companyCache &&
@@ -5034,7 +5834,7 @@ async function runOnce(config, options = {}) {
   const availableCompanies = result.tallyReachable
     ? cacheIsFresh
       ? companyCache.companies
-      : await fetchAvailableCompanies(config.tallyUrl, result.companyName)
+      : await runTallyTask(() => fetchAvailableCompanies(config.tallyUrl, result.companyName))
     : [];
   if (companyCache && result.tallyReachable && !cacheIsFresh) {
     companyCache.activeCompanyName = result.companyName || null;
@@ -5053,25 +5853,7 @@ async function runOnce(config, options = {}) {
   );
 
   try {
-    const bankVoucherCommands = deferredCommands.filter(
-      (command) => command.commandType === "post_bank_voucher"
-    );
-    for (const command of deferredCommands) {
-      if (command.commandType !== "post_bank_voucher") {
-        try {
-          await runCommand(config, command, options);
-        } catch (error) {
-          console.error(
-            `Command ${command.id} failed without blocking the remaining queue: ${
-              error instanceof Error ? error.message : String(error)
-            }`
-          );
-        }
-      }
-    }
-    if (bankVoucherCommands.length > 0) {
-      await runBankVoucherCommandBatch(config, bankVoucherCommands, options);
-    }
+    await processClaimedCommands(config, deferredCommands, options, executeExclusive);
   } catch (commandError) {
     console.error(commandError instanceof Error ? commandError.message : commandError);
   }
@@ -5100,19 +5882,93 @@ function tallyLiveGatewayUrl(config) {
   return url.toString();
 }
 
+function createExclusiveScheduler(options = {}) {
+  let active = false;
+  let stopped = false;
+  const priorityOrder = ["posting", "preflight", "matching", "interactive", "manual", "background"];
+  const queues = new Map(priorityOrder.map((name) => [name, []]));
+
+  const scheduleNext = () => {
+    if (active || stopped) return;
+    const entry = priorityOrder.map((name) => queues.get(name)).find((queue) => queue.length)?.shift();
+    if (!entry) return;
+    active = true;
+    Promise.resolve()
+      .then(entry.task)
+      .then(entry.resolve, entry.reject)
+      .finally(() => {
+        active = false;
+        scheduleNext();
+      });
+  };
+
+  const execute = (task, priority = "background", lifecycle = {}) => new Promise((resolve, reject) => {
+    if (stopped || options.isStopped?.()) {
+      reject(new Error("The connector has stopped."));
+      return;
+    }
+    const normalizedPriority = queues.has(priority) ? priority : "background";
+    const queue = queues.get(normalizedPriority);
+    let timer;
+    const cleanup = () => {
+      clearTimeout(timer);
+      lifecycle.signal?.removeEventListener("abort", cancel);
+    };
+    const entry = {
+      task: () => {
+        cleanup();
+        lifecycle.signal?.throwIfAborted();
+        if (lifecycle.deadlineAt && Date.now() >= lifecycle.deadlineAt) throw new Error("Live Tally request deadline exceeded.");
+        return task();
+      },
+      resolve,
+      reject: (error) => { cleanup(); reject(error); },
+    };
+    const cancel = () => {
+      const index = queue.indexOf(entry);
+      if (index < 0) return;
+      queue.splice(index, 1);
+      entry.reject(new Error("Live Tally request cancelled before execution."));
+    };
+    if (lifecycle.signal?.aborted) { entry.reject(new Error("Live Tally request cancelled.")); return; }
+    lifecycle.signal?.addEventListener("abort", cancel, { once: true });
+    if (normalizedPriority !== "background") {
+      timer = setTimeout(() => {
+        const index = queue.indexOf(entry);
+        if (index < 0) return;
+        queue.splice(index, 1);
+        entry.reject(new Error("Tally is busy. This request waited 15 seconds; try again when the current operation finishes."));
+      }, Math.min(15_000, Math.max(1, (lifecycle.deadlineAt || Infinity) - Date.now())));
+    }
+    queue.push(entry);
+    scheduleNext();
+  });
+
+  execute.stop = () => {
+    stopped = true;
+    const error = new Error("The connector has stopped.");
+    for (const entry of priorityOrder.flatMap((name) => queues.get(name).splice(0))) {
+      entry.reject(error);
+    }
+  };
+  execute.hasPendingInteractive = () => priorityOrder
+    .filter((name) => name !== "background")
+    .some((name) => queues.get(name).length > 0);
+  execute.isBusy = () => active;
+  return execute;
+}
+
 function startTallyLiveChannel(config, executeExclusive, options = {}) {
   let socket = null;
   let reconnectTimer = null;
-  let keepaliveTimer = null;
   let stopped = false;
+  const operations = new Map();
 
   const log = (level, message) => emitLog(options, level, message);
   const send = (payload) => {
     if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload));
   };
   const scheduleReconnect = () => {
-    if (keepaliveTimer) clearInterval(keepaliveTimer);
-    keepaliveTimer = null;
     if (stopped || reconnectTimer) return;
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
@@ -5125,18 +5981,57 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
     const requestId = String(message.requestId || "").trim();
     const operation = String(message.operation || "");
     if (!requestId) return;
+    if (operations.has(requestId)) return;
+    const controller = new AbortController();
+    operations.set(requestId, controller);
+    const deadlineAt = Math.min(Number(message.deadlineAt) || Infinity, Date.now() + 240_000);
+    const deadlineTimer = setTimeout(() => controller.abort(), Math.max(1, deadlineAt - Date.now()));
+    let phase = "Waiting for Tally";
+    const onProgress = (message) => { phase = message; send({ type: "progress", requestId, message }); };
+    const progressTimer = setInterval(() => onProgress(`${phase.replace(/ \(\d+s\)$/, "")} (${Math.floor((Date.now() - operationStartedAt) / 1000)}s)`), 2000);
     const operationStartedAt = Date.now();
+    let lockWaitMs = 0;
+    let executionStartedAt = operationStartedAt;
     log("info", `Live operation started: ${operation} (${requestId}).`);
     try {
       const lockRequestedAt = Date.now();
-      const data = await executeExclusive(async () => {
-        const lockWaitMs = Date.now() - lockRequestedAt;
-        if (operation === "company_check") return collectTallyCompanyCheck(config);
+      const data = await executeExclusive(() => liveReadContext.run({ signal: controller.signal }, async () => {
+        lockWaitMs = Date.now() - lockRequestedAt;
+        executionStartedAt = Date.now();
+        onProgress("Reading Tally data");
+        if (operation === "company_check") {
+          const readiness = await testTally(config.tallyUrl);
+          return { ...readiness, activeCompany: readiness.companyName, selectedCompany: readiness.companyName,
+            companies: await fetchAvailableCompanies(config.tallyUrl, readiness.companyName) };
+        }
+        if (!message.target || message.target.installationId !== config.installationRef || message.target.sessionGeneration !== config.sessionGeneration) {
+          throw new Error("This request targets a different connector session. Reconnect with the latest installer.");
+        }
+        const assertCompany = async () => {
+          controller.signal.throwIfAborted();
+          const readiness = await testTally(config.tallyUrl);
+          const companies = await fetchAvailableCompanies(config.tallyUrl, readiness.companyName);
+          const active = companies.filter((company) => company.isActive);
+          if (active.length !== 1 || String(active[0].guid || "").trim().toLowerCase() !== message.target.companyGuid) {
+            throw new Error("The active Tally company changed. Select the intended company and check again.");
+          }
+        };
+        if (operation === "local_ledger_catalogue") {
+          const db = loadLocalDb({ appUserDataPath: options.appUserDataPath, baseDir: options.localMatchingBaseDir });
+          const catalogue = getLocalMasterCatalogue(db, {
+            companyName: message.companyName,
+            companyGuid: message.target.companyGuid,
+          });
+          if (!catalogue) throw new Error("The connector has no local ledger catalogue for this company. Open Ledger matching and update ledgers first.");
+          return { source: "connector_local_db", ...catalogue };
+        }
+        await assertCompany();
         if (operation === "bank_ledgers") {
           const outcome = await fetchBankLedgersFromTally(config, {
             companyNames: message.companyNames,
             companyName: message.companyName,
           });
+          await assertCompany();
           return outcome.result || outcome;
         }
         if (operation === "ledger_masters") {
@@ -5150,11 +6045,19 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
             requestedMasterTypes.includes("ledger") &&
             requestedMasterTypes.includes("group") &&
             message.payload?.persistSnapshot !== true;
-          const masters = await collectTallyMasters(config, {
+          const cacheKey = JSON.stringify([message.target.installationId, message.target.companyGuid,
+            message.target.sessionGeneration, [...requestedMasterTypes].sort(), message.payload?.fieldProfile || ""]);
+          const cached = liveMasterCache.get(cacheKey);
+          const cacheable = message.payload?.persistSnapshot !== true && message.payload?.forceRefresh !== true;
+          const masters = cacheable && cached && Date.now() - cached.fetchedAt < 15_000 ? cached.masters : await collectTallyMasters(config, {
             companyName: message.companyName,
             requestedMasterTypes,
             fieldProfile: message.payload?.fieldProfile || (isBankStatementMasterRead ? "bank_statement" : ""),
           });
+          if (cacheable && masters !== cached?.masters) {
+            if (liveMasterCache.size >= 4) liveMasterCache.delete(liveMasterCache.keys().next().value);
+            liveMasterCache.set(cacheKey, { masters, fetchedAt: Date.now() });
+          }
           const requestedTypes = new Set(requestedMasterTypes);
           const masterPayload = {};
           if (requestedTypes.has("ledger")) masterPayload.ledgers = masters.ledgers;
@@ -5214,21 +6117,60 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
             };
           }
           log("info", `Live ledger response size: ${Buffer.byteLength(JSON.stringify(response))} bytes.`);
+          await assertCompany();
           return response;
         }
         if (operation === "verify_bank_transaction") {
           const outcome = await reconcileBankTransactionsInTally(config, message.payload || {});
+          await assertCompany();
+          return outcome.result || outcome;
+        }
+        if (operation === "match_bank_statement") {
+          const outcome = await matchBankStatementInTally(config, message.payload || {}, {
+            signal: controller.signal,
+            assertCompany,
+            onProgress,
+            onPartialResult: (data) => send({ type: "partial_result", requestId, data }),
+            voucherProvider: refreshCachedBankVouchers,
+            appUserDataPath: options.appUserDataPath,
+            localMatchingBaseDir: options.localMatchingBaseDir,
+            companyGuid: message.target?.companyGuid || null,
+          });
+          await assertCompany();
           return outcome.result || outcome;
         }
         if (operation === "fetch_customer_open_bills") {
-          const outcome = await fetchCustomerOpenBillsFromTally(config, message.payload || {});
+          const outcome = await fetchCustomerOpenBillsFromTally(config, message.payload || {}, { signal: controller.signal, onProgress });
+          await assertCompany();
           return outcome.result || outcome;
         }
         throw new Error("Unsupported live Tally operation.");
-      });
+      }), operation === "verify_bank_transaction"
+        ? "preflight"
+        : operation === "match_bank_statement"
+          ? "matching"
+          : "interactive", { signal: controller.signal, deadlineAt });
+      controller.signal.throwIfAborted();
+      const executionMs = Date.now() - executionStartedAt;
+      if (data && typeof data === "object") {
+        data.liveTimings = {
+          ...(data.liveTimings || {}),
+          lockWaitMs,
+          executionMs,
+          totalMs: Date.now() - operationStartedAt,
+        };
+        if (operation === "match_bank_statement" && data.matchDiagnostics) {
+          data.matchDiagnostics = {
+            ...data.matchDiagnostics,
+            lockWaitMs,
+            executionMs,
+            totalWithLockMs: Date.now() - operationStartedAt,
+          };
+        }
+      }
       log(
         "info",
-        `Live operation completed: ${operation} (${requestId}) in ${Date.now() - operationStartedAt} ms.`
+        `Live operation completed: ${operation} (${requestId}) in ${Date.now() - operationStartedAt} ms (lock wait ${lockWaitMs} ms, execution ${executionMs} ms).`
       );
       send({ type: "operation_result", requestId, success: true, companyName: message.companyName, data });
     } catch (error) {
@@ -5243,6 +6185,10 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
         companyName: message.companyName,
         error: error instanceof Error ? error.message : String(error || "Live Tally operation failed."),
       });
+    } finally {
+      clearInterval(progressTimer);
+      clearTimeout(deadlineTimer);
+      operations.delete(requestId);
     }
   };
 
@@ -5259,13 +6205,6 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
           connectionId: config.connectionId,
           token: config.bridgeToken,
         });
-        // Send application data as well as relying on WebSocket pong frames.
-        // This keeps the cloud route active and prevents a healthy live
-        // connector from being dropped on the platform's idle boundary.
-        keepaliveTimer = setInterval(() => {
-          send({ type: "keepalive", timestamp: Date.now() });
-        }, 15_000);
-        keepaliveTimer.unref?.();
       });
       socket.addEventListener("message", (event) => {
         try {
@@ -5274,6 +6213,8 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
             log("info", "Live Tally channel connected.");
           } else if (message.type === "operation") {
             void handleOperation(message);
+          } else if (message.type === "cancel") {
+            operations.get(String(message.requestId || ""))?.abort();
           } else if (message.type === "error") {
             log("error", `Live Tally channel: ${message.error || "unknown error"}`);
           }
@@ -5286,6 +6227,7 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
         log("error", `Live Tally channel is unavailable${detail ? `: ${detail}` : ""}; retrying.`);
       });
       socket.addEventListener("close", (event) => {
+        for (const controller of operations.values()) controller.abort();
         const code = Number(event?.code || 0);
         const reason = String(event?.reason || "").trim();
         if (!stopped && (code !== 1000 || reason)) {
@@ -5302,8 +6244,7 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
   connect();
   return () => {
     stopped = true;
-    if (keepaliveTimer) clearInterval(keepaliveTimer);
-    keepaliveTimer = null;
+    for (const controller of operations.values()) controller.abort();
     if (reconnectTimer) clearTimeout(reconnectTimer);
     socket?.close();
   };
@@ -5314,7 +6255,6 @@ async function fetchCommandRealtimeConfig(config) {
   url.searchParams.set("connectionId", config.connectionId);
   const response = await fetch(url, {
     headers: { Authorization: `Bearer ${config.bridgeToken}` },
-    signal: AbortSignal.timeout(BACKEND_REQUEST_TIMEOUT_MS),
   });
   const payload = await readJsonResponse(response);
   if (!response.ok) {
@@ -5325,12 +6265,15 @@ async function fetchCommandRealtimeConfig(config) {
   return payload.realtime ?? null;
 }
 
-async function processClaimedCommands(config, commands, options = {}) {
+async function processClaimedCommands(config, commands, options = {}, executeExclusive = null) {
+  const runBackgroundTask = (task, priority = "background") => executeExclusive
+    ? executeExclusive(task, priority)
+    : task();
   const bankVoucherCommands = commands.filter((command) => command.commandType === "post_bank_voucher");
   for (const command of commands) {
     if (command.commandType === "post_bank_voucher") continue;
     try {
-      await runCommand(config, command, options);
+      await runBackgroundTask(() => runCommand(config, command, options));
     } catch (error) {
       console.error(
         `Command ${command.id} failed without blocking the remaining queue: ${
@@ -5340,11 +6283,11 @@ async function processClaimedCommands(config, commands, options = {}) {
     }
   }
   if (bankVoucherCommands.length > 0) {
-    await runBankVoucherCommandBatch(config, bankVoucherCommands, options);
+    await runBackgroundTask(() => runBankVoucherCommandBatch(config, bankVoucherCommands, options), "posting");
   }
 }
 
-async function drainPendingCommands(config, options = {}) {
+async function drainPendingCommands(config, options = {}, executeExclusive = null) {
   let processed = 0;
   while (processed < MAX_COMMANDS_PER_CYCLE) {
     const commands = await receiveNextCommands(
@@ -5355,7 +6298,7 @@ async function drainPendingCommands(config, options = {}) {
     // Preserve the bank-voucher batch path even when Realtime wakes the bridge.
     // Processing each notification independently would re-run duplicate
     // preflight once per voucher and be slower than the polling path.
-    await processClaimedCommands(config, commands, options);
+    await processClaimedCommands(config, commands, options, executeExclusive);
     processed += commands.length;
   }
   return processed;
@@ -5391,10 +6334,11 @@ function startCommandWakeChannel(config, executeExclusive, options = {}) {
   let messageRef = 1;
   let realtimeConfig = null;
   let wakeRunning = false;
-  let wakeQueued = false;
+  let wakeRequested = false;
 
   const log = (level, message) => emitLog(options, level, message);
   const clearSocketTimers = () => {
+    options.onWakeHealth?.(false);
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     heartbeatTimer = null;
   };
@@ -5405,21 +6349,19 @@ function startCommandWakeChannel(config, executeExclusive, options = {}) {
     return ref;
   };
   const runWake = async (reason) => {
-    // Broadcasts can arrive faster than a backend/Tally pass completes. Keep
-    // at most one follow-up wake instead of adding an unbounded mutex queue.
     if (wakeRunning) {
-      wakeQueued = true;
+      wakeRequested = true;
       return;
     }
     wakeRunning = true;
     try {
       do {
-        wakeQueued = false;
-        const processed = await executeExclusive(() => drainPendingCommands(config, options));
+        wakeRequested = false;
+        const processed = await drainPendingCommands(config, options, executeExclusive);
         if (processed > 0) {
           log("info", `Processed ${processed} queued Tally command${processed === 1 ? "" : "s"} after ${reason}.`);
         }
-      } while (wakeQueued && !stopped);
+      } while (wakeRequested);
     } catch (error) {
       log("error", error instanceof Error ? error.message : "Immediate Tally command check failed.");
     } finally {
@@ -5466,6 +6408,7 @@ function startCommandWakeChannel(config, executeExclusive, options = {}) {
           const [, , frameTopic, eventName, payload] = frame;
           if (frameTopic !== topic) return;
           if (eventName === "phx_reply" && payload?.status === "ok") {
+            options.onWakeHealth?.(true);
             log("info", "Immediate Tally command notifications connected; polling remains as fallback.");
             void runWake("notification-channel startup");
             return;
@@ -5513,35 +6456,24 @@ async function startBridge(args) {
   console.log(`Starting Tally bridge for ${config.tallyUrl}`);
   console.log(`Sending heartbeat every ${intervalMs} ms.`);
 
-  let running = false;
-  let pendingExclusive = 0;
-  const executeExclusive = async (task) => {
-    pendingExclusive += 1;
-    while (running) await new Promise((resolve) => setTimeout(resolve, 25));
-    pendingExclusive -= 1;
-    running = true;
-    try {
-      return await task();
-    } finally {
-      running = false;
-    }
-  };
-  const runnerOptions = { companyHeartbeatCache: {} };
+  const executeExclusive = createExclusiveScheduler();
+  const runnerOptions = { companyHeartbeatCache: {}, tallyReadinessCache: {} };
+  let backgroundCycleRunning = false;
   const runSerially = async () => {
-    if (running || pendingExclusive > 0) {
+    if (backgroundCycleRunning) {
       console.log("Previous bridge cycle is still running; skipping this heartbeat.");
       return;
     }
 
-    running = true;
+    backgroundCycleRunning = true;
     try {
-      await runOnce(config, runnerOptions);
+      await runOnce(config, runnerOptions, executeExclusive);
     } finally {
-      running = false;
+      backgroundCycleRunning = false;
     }
   };
 
-  await runOnce(config, runnerOptions);
+  await runOnce(config, runnerOptions, executeExclusive);
   startCommandWakeChannel(config, executeExclusive, runnerOptions);
   startTallyLiveChannel(config, executeExclusive);
   setInterval(() => {
@@ -5585,25 +6517,21 @@ function createBridgeRunner(options = {}) {
 
   const intervalMs = Number(options.intervalMs || DEFAULT_HEARTBEAT_INTERVAL_MS);
   let timer = null;
-  let running = false;
-  let pendingExclusive = 0;
+  let livenessTimer = null;
+  let commandPollTimer = null;
+  let leaseTimer = null;
+  let renewingLeases = false;
+  let livenessRunning = false;
+  let commandPollRunning = false;
+  let wakeHealthy = false;
+  let lastCommandPollAt = 0;
+  let backgroundCycleRunning = false;
   let stopped = false;
   let stopTallyLiveChannel = null;
   let stopCommandWakeChannel = null;
   const companyHeartbeatCache = {};
-
-  const executeExclusive = async (task) => {
-    pendingExclusive += 1;
-    while (running && !stopped) await new Promise((resolve) => setTimeout(resolve, 25));
-    pendingExclusive -= 1;
-    if (stopped) throw new Error("The connector has stopped.");
-    running = true;
-    try {
-      return await task();
-    } finally {
-      running = false;
-    }
-  };
+  const tallyReadinessCache = {};
+  const executeExclusive = createExclusiveScheduler({ isStopped: () => stopped });
 
   const stop = (reason = "stopped", error = null) => {
     if (stopped) return;
@@ -5616,6 +6544,10 @@ function createBridgeRunner(options = {}) {
     stopTallyLiveChannel = null;
     stopCommandWakeChannel?.();
     stopCommandWakeChannel = null;
+    executeExclusive.stop();
+    clearInterval(livenessTimer);
+    clearInterval(commandPollTimer);
+    clearInterval(leaseTimer);
     if (typeof options.onStop === "function") {
       options.onStop({ reason, error, timestamp: new Date().toISOString() });
     }
@@ -5623,14 +6555,18 @@ function createBridgeRunner(options = {}) {
 
   const runSerially = async () => {
     if (stopped) return;
-    if (running || pendingExclusive > 0) {
+    if (backgroundCycleRunning) {
       emitLog(options, "info", "Previous bridge cycle is still running; skipping this heartbeat.");
       return;
     }
 
-    running = true;
+    backgroundCycleRunning = true;
     try {
-      const cycle = await runOnce(config, { ...options, companyHeartbeatCache });
+      const cycle = await runOnce(
+        config,
+        { ...options, companyHeartbeatCache, tallyReadinessCache, skipCommandPolling: true },
+        executeExclusive
+      );
       if (typeof options.onStatus === "function") {
         options.onStatus(cycle);
       }
@@ -5649,7 +6585,7 @@ function createBridgeRunner(options = {}) {
         stop(error?.status === 426 ? "update required" : "revoked", error);
       }
     } finally {
-      running = false;
+      backgroundCycleRunning = false;
     }
   };
 
@@ -5659,22 +6595,72 @@ function createBridgeRunner(options = {}) {
       return stopped;
     },
     async start() {
+      if (!config.installationRef || !Number.isInteger(config.sessionGeneration)) {
+        throw new Error("Pair this PC again from Polaad after installing connector 0.1.58. The previous session has no installation scope.");
+      }
       emitLog(options, "info", `Starting Tally bridge for ${config.tallyUrl}`);
       emitLog(options, "info", `Sending heartbeat every ${intervalMs} ms.`);
-      stopCommandWakeChannel = startCommandWakeChannel(config, executeExclusive, options);
+      stopCommandWakeChannel = startCommandWakeChannel(config, executeExclusive, {
+        ...options, onWakeHealth: (healthy) => { wakeHealthy = healthy; },
+      });
       stopTallyLiveChannel = startTallyLiveChannel(config, executeExclusive, options);
+      leaseTimer = setInterval(async () => {
+        const claims = [...commandLeases.values()].filter((claim) => claim.connectionId === config.connectionId).map(({ id, token }) => ({ id, token }));
+        if (stopped || renewingLeases || !claims.length) return;
+        renewingLeases = true;
+        try {
+          const response = await fetch(`${config.apiBase}/api/tally/bridge/commands/renew`, {
+            method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${config.bridgeToken}` },
+            body: JSON.stringify({ connectionId: config.connectionId, claims }),
+            signal: AbortSignal.timeout(BACKEND_REQUEST_TIMEOUT_MS),
+          });
+          if (!response.ok) throw new Error("Command lease renewal failed; check connector connection.");
+        } catch (error) { emitLog(options, "error", error.message); }
+        finally { renewingLeases = false; }
+      }, 30_000);
+      // Presence must never wait behind Tally exports or financial commands.
+      // Reuse the observation timestamp: liveness does not make old company
+      // observations fresh enough to authorize posting.
+      livenessTimer = setInterval(async () => {
+        if (stopped || livenessRunning) return;
+        livenessRunning = true;
+        try {
+          const result = tallyReadinessCache.result || { tallyReachable: false, companyLoaded: false };
+          const heartbeat = await sendHeartbeat(config, {
+            ...result,
+            livenessOnly: true,
+            observedAt: tallyReadinessCache.fetchedAt ? new Date(tallyReadinessCache.fetchedAt).toISOString() : null,
+            busy: executeExclusive.isBusy(),
+          }, companyHeartbeatCache.companies || []);
+          options.onStatus?.({ result, connection: heartbeat?.connection, heartbeat, timestamp: new Date().toISOString() });
+        } catch (error) {
+          emitLog(options, "error", error.message || "Heartbeat failed.");
+          if ([401, 409, 426].includes(error.status)) stop("session unavailable", error);
+        } finally { livenessRunning = false; }
+      }, 10_000);
+      commandPollTimer = setInterval(async () => {
+        if (stopped || commandPollRunning || Date.now() - lastCommandPollAt < (wakeHealthy ? 60_000 : 15_000)) return;
+        commandPollRunning = true;
+        lastCommandPollAt = Date.now();
+        try { await drainPendingCommands(config, options, executeExclusive); }
+        catch (error) { emitLog(options, "error", error.message || "Command recovery poll failed."); }
+        finally { commandPollRunning = false; }
+      }, 5000);
       await runSerially();
       if (!stopped) {
         timer = setInterval(() => {
           runSerially().catch((error) => {
             emitLog(options, "error", error instanceof Error ? error.message : String(error));
           });
-        }, intervalMs);
+        }, Math.max(intervalMs, TALLY_HEARTBEAT_PROBE_INTERVAL_MS));
       }
     },
     stop,
     async runOnce() {
       await runSerially();
+    },
+    runTallyTask(task, priority = "background", lifecycle = {}) {
+      return executeExclusive(task, priority, lifecycle);
     },
   };
 }
@@ -6176,6 +7162,7 @@ export {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_TALLY_URL,
   createBridgeRunner,
+  createExclusiveScheduler,
   classifyOpenBillReferenceKind,
   classifyTaxLedgers,
   buildCollectionExportXml,
@@ -6188,6 +7175,7 @@ export {
   fetchBankLedgersFromTally,
   findBankLedgersFromMasters,
   fetchCustomerOpenBillsFromTally,
+  matchBankStatementInTally,
   normalizeTallyUrl,
   openBillBlockRequiresVoucherFallback,
   pairBridge,
@@ -6196,7 +7184,9 @@ export {
   purchaseVoucherReadbackComparison,
   readConfig,
   reconcileBankTransactionsInTally,
+  refreshCachedBankVouchers,
   strictBankTransactionCandidates,
+  indexBankVouchersByDate,
   runOnce,
   startBridge,
   testBridge,

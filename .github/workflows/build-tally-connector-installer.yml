@@ -1,7 +1,15 @@
-name: Build Polad Tally Connector
+name: Build Polaad Tally Connector
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "apps/tally-bridge/**"
+      - "installer/tally-bridge/**"
+      - "scripts/build-tally-connector-installer.mjs"
+      - ".github/workflows/build-tally-connector-installer.yml"
 
 permissions:
   contents: write
@@ -20,10 +28,13 @@ jobs:
         with:
           node-version: 24
 
+      - name: Install project dependencies
+        run: npm ci
+
       - name: Install Windows Electron runtime
         shell: pwsh
         run: |
-          $runtimeRoot = Join-Path $env:RUNNER_TEMP "polad-electron-runtime"
+          $runtimeRoot = Join-Path $env:RUNNER_TEMP "polaad-electron-runtime"
           New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
           Push-Location $runtimeRoot
           npm init --yes
@@ -34,34 +45,34 @@ jobs:
           if (-not (Test-Path (Join-Path $electronDist "electron.exe"))) {
             throw "Electron runtime was not downloaded to $electronDist"
           }
-          "POLAD_CONNECTOR_RUNTIME=$electronDist" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "POLAAD_CONNECTOR_RUNTIME=$electronDist" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Validate installer identity
         run: npm run installer:tally-bridge:validate
 
-      - name: Build Polad installer
+      - name: Build Polaad installer
         run: npm run installer:tally-bridge
 
       - name: Record installer checksum
         shell: pwsh
-        run: Get-FileHash installer\tally-bridge\output\PoladTallyConnectorSetup.exe -Algorithm SHA256
+        run: Get-FileHash installer\tally-bridge\output\PolaadTallyConnectorSetup.exe -Algorithm SHA256
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: PoladTallyConnectorSetup
-          path: installer/tally-bridge/output/PoladTallyConnectorSetup.exe
+          name: PolaadTallyConnectorSetup
+          path: installer/tally-bridge/output/PolaadTallyConnectorSetup.exe
           if-no-files-found: error
 
-      - name: Publish permanent GitHub release
+      - name: Publish connector release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "polad-tally-connector-v0.1.32"
-          $installer = "installer\tally-bridge\output\PoladTallyConnectorSetup.exe"
+          $tag = "polaad-tally-connector-v0.1.71"
+          $installer = "installer\tally-bridge\output\PolaadTallyConnectorSetup.exe"
           gh release view $tag *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --target $env:GITHUB_SHA --title "Polad Tally Connector v0.1.32" --notes "Windows installer for the Polad Tally Connector. Registers the polaad-tally protocol, installs separately under C:\Polad\tally-bridge, and supports durable connector session control."
+            gh release create $tag --target $env:GITHUB_SHA --title "Polaad Tally Connector v0.1.71" --notes "Windows installer for the Polaad Tally Connector."
           }
           gh release upload $tag $installer --clobber

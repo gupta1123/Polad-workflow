@@ -1,0 +1,85 @@
+export type TallyBridgeCommandType =
+  | "alter_ledger"
+  | "create_ledger"
+  | "fetch_bank_ledgers"
+  | "sync_masters"
+  | "post_bank_voucher"
+  | "fetch_customer_open_bills"
+  | "create_debit_note"
+  | "export_debit_note_pdf"
+  | "create_purchase_voucher"
+  | "verify_bank_transaction"
+  | "parse_document"
+  | "parse_and_suggest";
+
+export type TallyBridgeCommandStatus =
+  | "queued"
+  | "claimed"
+  | "succeeded"
+  | "failed"
+  | "canceled";
+
+export type TallyBridgeCommandRow = {
+  id: string;
+  connection_id: string;
+  owner_user_id: string;
+  company_dataset_id: string | null;
+  command_type: TallyBridgeCommandType;
+  status: TallyBridgeCommandStatus;
+  priority: number;
+  payload: Record<string, unknown>;
+  result: Record<string, unknown> | null;
+  error: string | null;
+  attempts: number;
+  max_attempts: number;
+  available_at: string;
+  claimed_at: string | null;
+  completed_at: string | null;
+  bridge_version: string | null;
+  created_at: string;
+  updated_at: string;
+  claim_token?: string | null;
+  lease_expires_at?: string | null;
+  target_session_generation?: number | null;
+  reconciliation_required?: boolean;
+};
+
+export const TALLY_BRIDGE_COMMAND_TYPES: TallyBridgeCommandType[] = [
+  "alter_ledger",
+  "create_ledger",
+  "fetch_bank_ledgers",
+  "sync_masters",
+  "post_bank_voucher",
+  "fetch_customer_open_bills",
+  "create_debit_note",
+  "export_debit_note_pdf",
+  "create_purchase_voucher",
+  "verify_bank_transaction",
+  "parse_document",
+  "parse_and_suggest",
+];
+
+export function serializeTallyBridgeCommand(row: TallyBridgeCommandRow, includeClaimToken = false) {
+  return {
+    id: row.id,
+    connectionId: row.connection_id,
+    commandType: row.command_type,
+    status: row.status,
+    priority: row.priority,
+    payload: row.payload,
+    result: row.result,
+    error: row.error,
+    attempts: row.attempts,
+    maxAttempts: row.max_attempts,
+    availableAt: row.available_at,
+    claimedAt: row.claimed_at,
+    completedAt: row.completed_at,
+    bridgeVersion: row.bridge_version,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    ...(includeClaimToken ? { claimToken: row.claim_token ?? null } : {}),
+    leaseExpiresAt: row.lease_expires_at ?? null,
+    sessionGeneration: row.target_session_generation ?? null,
+    reconciliationRequired: row.reconciliation_required ?? false,
+  };
+}

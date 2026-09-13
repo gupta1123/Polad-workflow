@@ -1,20 +1,430 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import {
   buildCollectionExportXml,
+  buildBankVoucherBatchXml,
+  buildBankVoucherXml,
   buildPurchaseVoucherXml,
   buildRequestedLedgerFormula,
   classifyOpenBillReferenceKind,
   classifyTaxLedgers,
+  createExclusiveScheduler,
+  decodeTallyResponseBytes,
   findBankLedgersFromMasters,
   fetchCustomerOpenBillsFromTally,
+  getBankVoucherCommandBatchKey,
+  matchBankStatementInTally,
   openBillBlockRequiresVoucherFallback,
+  parseBankStatementMasterCollection,
+  parseLedgerClosingBalance,
   parseTallyImportResult,
   purchaseVoucherReadbackComparison,
   reconcileBankTransactionsInTally,
+  refreshCachedBankVouchers,
+  resolveBankVoucherLedgerIdentities,
   strictBankTransactionCandidates,
+  indexBankVouchersByDate,
+  fetchAvailableCompanies,
+  testTally,
 } from "./bridge.mjs";
+
+test("operational voucher provider bootstraps once then requests a statement-scoped bank snapshot", async (t) => {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "polaad-voucher-provider-"));
+  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+  const calls = [];
+  const fullXml = '<ENVELOPE><COLLECTION><VOUCHER><DATE>20260801</DATE><EFFECTIVEDATE>20260801</EFFECTIVEDATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME><VOUCHERNUMBER>1</VOUCHERNUMBER><REFERENCE>UTR-1</REFERENCE><PARTYLEDGERNAME>Customer</PARTYLEDGERNAME><MASTERID>10</MASTERID><ALTERID>20</ALTERID><GUID>v-1</GUID><ALLLEDGERENTRIES.LIST><LEDGERNAME>Bank</LEDGERNAME><AMOUNT>-100</AMOUNT><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST></VOUCHER></COLLECTION></ENVELOPE>';
+  const request = {
+    companyName: "Company", bankLedgerName: "Bank", dateFrom: "2026-08-01", dateTo: "2026-08-01",
+    transactions: [{ referenceNumber: "UTR-1" }],
+  };
+  const dependencies = {
+    localMatchingBaseDir: baseDir,
+    companyGuid: "company-guid",
+    exportCollection: async (_url, options) => { calls.push(options); return fullXml; },
+  };
+  const first = await refreshCachedBankVouchers("http://tally", request, dependencies);
+  assert.equal(first.diagnostics.refreshMode, "full_snapshot");
+  assert.equal(first.vouchers.length, 1);
+  const second = await refreshCachedBankVouchers("http://tally", request, dependencies);
+  assert.equal(second.diagnostics.refreshMode, "scoped_snapshot");
+  assert.equal(calls[1].tallyType, "Vouchers : Ledger");
+  assert.equal(calls[1].dateFrom, request.dateFrom);
+  assert.equal(calls[1].dateTo, request.dateTo);
+  assert.equal(calls[1].formulae, undefined);
+});
+
+test("Tally response decoding preserves Unicode ledger punctuation", () => {
+  const xml = '<LEDGER NAME="Task Metcorp Global (Opc) Private Limited – Jalna"></LEDGER>';
+  assert.equal(decodeTallyResponseBytes(Buffer.from(xml, "utf8")), xml);
+  const utf16 = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(xml, "utf16le")]);
+  assert.equal(decodeTallyResponseBytes(utf16), xml);
+});
+
+test("bank posting resolves a stale cached name by stable Tally GUID", () => {
+  const [resolved] = resolveBankVoucherLedgerIdentities([{
+    bankLedgerName: "HDFC Bank",
+    bankLedgerGuid: "bank-guid",
+    counterpartyLedgerName: "Task Metcorp Global (Opc) Private Limited ? Jalna",
+    counterpartyLedgerGuid: "party-guid",
+  }], [
+    { name: "HDFC Bank", guid: "BANK-GUID" },
+    { name: "Task Metcorp Global (Opc) Private Limited – Jalna", guid: "PARTY-GUID" },
+  ]);
+  assert.equal(resolved.counterpartyLedgerName, "Task Metcorp Global (Opc) Private Limited – Jalna");
+  assert.throws(() => resolveBankVoucherLedgerIdentities([{
+    bankLedgerName: "HDFC Bank", bankLedgerGuid: "bank-guid",
+    counterpartyLedgerName: "Missing", counterpartyLedgerGuid: "missing-guid",
+  }], [{ name: "HDFC Bank", guid: "bank-guid" }]), /not present in the active Tally company/);
+});
+
+test("direct receipt and payment XML contain no bill reference or Advance allocation", () => {
+  for (const voucherType of ["Receipt", "Payment"]) {
+    const xml = buildBankVoucherXml({
+      voucherType, voucherDate: "2026-08-24", bankLedgerName: "Axis Bank",
+      counterpartyLedgerName: "Test Party", counterpartyIsPartyLedger: true,
+      amount: 20000, referenceNumber: "DIRECT-TEST", billAllocations: [],
+    }, "Test Company");
+    assert.match(xml, /Test Party/);
+    assert.match(xml, /Axis Bank/);
+    assert.doesNotMatch(xml, /BILLALLOCATIONS\.LIST|<BILLTYPE>|Advance|Agst Ref/);
+  }
+});
+
+test("cancelled and expired interactive work never enters Tally", async () => {
+  const scheduler = createExclusiveScheduler();
+  let release;
+  let started;
+  const ready = new Promise((resolve) => { started = resolve; });
+  const first = scheduler(async () => { started(); await new Promise((resolve) => { release = resolve; }); }, "background");
+  await ready;
+  let invoked = false;
+  const controller = new AbortController();
+  const cancelled = scheduler(() => { invoked = true; }, "interactive", { signal: controller.signal });
+  const cancellation = assert.rejects(cancelled);
+  controller.abort();
+  await cancellation;
+  const expired = scheduler(() => { invoked = true; }, "interactive", { deadlineAt: Date.now() + 20 });
+  await assert.rejects(expired, /timed out|deadline|expired|wait/i);
+  release();
+  await first;
+  assert.equal(invoked, false);
+  assert.equal(await scheduler(() => "next", "interactive"), "next");
+  scheduler.stop();
+});
+
+test("readiness uses one small current-company query, not a ledger export", async (t) => {
+  const bodies = [];
+  t.mock.method(globalThis, "fetch", async (_url, options) => {
+    bodies.push(options.body);
+    return new Response("<ENVELOPE><RESULT>Polaad</RESULT></ENVELOPE>");
+  });
+  const result = await testTally("http://tally.invalid");
+  assert.equal(result.companyName, "Polaad");
+  assert.equal(result.companyLoaded, true);
+  assert.equal(bodies.length, 1);
+  assert.match(bodies[0], /\$\$CurrentCompany/);
+  assert.doesNotMatch(bodies[0], /<COLLECTION|SVCURRENTCOMPANY|Ledger/i);
+});
+
+test("different company GUIDs with the same name are not silently collapsed", async (t) => {
+  t.mock.method(globalThis, "fetch", async () => new Response(
+    '<ENVELOPE><STATUS>1</STATUS><COMPANY NAME="Same"><GUID>guid-a</GUID></COMPANY><COMPANY NAME="Same"><GUID>guid-b</GUID></COMPANY></ENVELOPE>'
+  ));
+  const companies = await fetchAvailableCompanies("http://tally.invalid", "Same");
+  assert.deepEqual(companies.map((company) => company.guid), ["guid-a", "guid-b"]);
+  assert.equal(companies.filter((company) => company.isActive).length, 2);
+});
+
+for (const size of [9227, 12000]) {
+  test(`indexed matching preserves exact identities and reservations for ${size} vouchers`, () => {
+    const vouchers = Array.from({ length: size }, (_, index) => ({
+      ...bankVoucher({ reference: `UTR-${index % 100}`, party: `Party ${index % 7}` }),
+      date: `202608${String(index % 28 + 1).padStart(2, "0")}`,
+      effectiveDate: `202608${String(index % 28 + 1).padStart(2, "0")}`,
+    }));
+    const byDate = indexBankVouchersByDate(vouchers);
+    const reserved = new Set([0, 100, 2800]);
+    for (let index = 0; index < 35; index += 1) {
+      const transaction = {
+        voucherDate: `2026-08-${String(index % 28 + 1).padStart(2, "0")}`,
+        amount: 1250, expectedDirection: "incoming",
+        referenceNumber: index % 2 ? `UTR-${index % 100}` : "",
+        counterpartyLedgerName: index % 3 ? `Party ${index % 7}` : "Suspense",
+      };
+      const baseline = strictBankTransactionCandidates(vouchers, transaction, "ICICI Current Account", reserved);
+      const indexed = strictBankTransactionCandidates(vouchers, transaction, "ICICI Current Account", reserved, byDate);
+      assert.deepEqual(indexed, baseline);
+    }
+    assert.ok(Math.max(...[...byDate.values()].map((rows) => rows.length)) < size / 20);
+  });
+}
+
+test("interactive Tally work runs before queued background work", async () => {
+  const scheduler = createExclusiveScheduler();
+  const order = [];
+  let releaseFirst;
+  let markFirstStarted;
+  const firstStarted = new Promise((resolve) => {
+    markFirstStarted = resolve;
+  });
+  const firstBlocked = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+
+  const first = scheduler(async () => {
+    order.push("background-1");
+    markFirstStarted();
+    await firstBlocked;
+  }, "background");
+  await firstStarted;
+  const second = scheduler(() => order.push("background-2"), "background");
+  const interactive = scheduler(() => order.push("interactive"), "interactive");
+  releaseFirst();
+  await Promise.all([first, second, interactive]);
+
+  assert.deepEqual(order, ["background-1", "interactive", "background-2"]);
+});
+
+test("bank-statement master parser keeps lean ledger identity and targeted bank details", () => {
+  const lean = parseBankStatementMasterCollection(
+    '<ENVELOPE><LEDGER NAME="Customer A"><PARENT>Sundry Debtors</PARENT><GUID>L-1</GUID><ISBILLWISEON>Yes</ISBILLWISEON><EMAIL>unused@example.com</EMAIL></LEDGER></ENVELOPE>',
+    "LEDGER"
+  );
+  assert.equal(lean.length, 1);
+  assert.equal(lean[0].name, "Customer A");
+  assert.equal(lean[0].parent, "Sundry Debtors");
+  assert.equal(lean[0].raw.billWiseEnabled, true);
+  assert.equal(lean[0].email, undefined);
+
+  const detailed = parseBankStatementMasterCollection(
+    '<ENVELOPE><LEDGER NAME="State Bank"><PARENT>Bank Accounts</PARENT><GUID>B-1</GUID><BANKNAME>SBI</BANKNAME><BANKACCOUNTNUMBER>1234</BANKACCOUNTNUMBER><IFSCCODE>SBIN0001</IFSCCODE><CLOSINGBALANCE>500 Cr</CLOSINGBALANCE></LEDGER></ENVELOPE>',
+    "LEDGER",
+    { bankDetails: true }
+  );
+  assert.equal(detailed[0].bankName, "SBI");
+  assert.equal(detailed[0].bankAccountNumber, "1234");
+  assert.equal(detailed[0].closingBalance, 500);
+  assert.equal(detailed[0].closingBalanceType, "Cr");
+});
+
+test("ledger closing balances preserve Tally Dr and Cr meaning", () => {
+  assert.deepEqual(parseLedgerClosingBalance("1,24,500.00 Dr"), {
+    amount: 124500,
+    type: "Dr",
+    raw: "1,24,500.00 Dr",
+  });
+  assert.deepEqual(parseLedgerClosingBalance("842300 Cr"), {
+    amount: 842300,
+    type: "Cr",
+    raw: "842300 Cr",
+  });
+  assert.deepEqual(parseLedgerClosingBalance("-950"), {
+    amount: 950,
+    type: "Dr",
+    raw: "-950",
+  });
+  assert.deepEqual(parseLedgerClosingBalance(""), {
+    amount: null,
+    type: null,
+    raw: null,
+  });
+});
+
+test("outgoing supplier payments create Payment vouchers with bill allocations", () => {
+  const xml = buildBankVoucherXml({
+    companyName: "Solution Nyx",
+    voucherType: "Payment",
+    voucherDate: "2026-08-17",
+    bankLedgerName: "State Bank of India",
+    counterpartyLedgerName: "Mahavir Steel Corporation",
+    counterpartyIsPartyLedger: true,
+    bankLedgerEntryIsDebit: false,
+    amount: 94000,
+    referenceNumber: "SB61708260002",
+    billAllocations: [
+      { referenceType: "Agst Ref", referenceName: "MSC/26-27/403", amount: 75000 },
+      { referenceType: "Agst Ref", referenceName: "MSC/26-27/404", amount: 19000 },
+    ],
+  });
+
+  assert.match(xml, /<VOUCHERTYPENAME>Payment<\/VOUCHERTYPENAME>/);
+  assert.match(xml, /<LEDGERNAME>Mahavir Steel Corporation<\/LEDGERNAME>/);
+  assert.match(xml, /<NAME>MSC\/26-27\/403<\/NAME>/);
+  assert.match(xml, /<NAME>MSC\/26-27\/404<\/NAME>/);
+  assert.match(xml, /<LEDGERNAME>State Bank of India<\/LEDGERNAME>/);
+});
+
+test("explicitly requested Advance allocation does not settle an existing bill", () => {
+  const xml = buildBankVoucherXml({
+    companyName: "Solution Nyx",
+    voucherType: "Receipt",
+    voucherDate: "2026-08-17",
+    bankLedgerName: "State Bank of India",
+    counterpartyLedgerName: "Aarohi Steel Distributors",
+    counterpartyIsPartyLedger: true,
+    bankLedgerEntryIsDebit: true,
+    amount: 5977,
+    referenceNumber: "SBS01010900001",
+    billAllocations: [
+      { referenceType: "Advance", referenceName: "ADV-20260817-0900001", amount: 5977 },
+    ],
+  });
+
+  assert.match(xml, /<VOUCHERTYPENAME>Receipt<\/VOUCHERTYPENAME>/);
+  assert.match(xml, /<NAME>ADV-20260817-0900001<\/NAME>/);
+  assert.match(xml, /<BILLTYPE>Advance<\/BILLTYPE>/);
+  assert.doesNotMatch(xml, /<BILLTYPE>Agst Ref<\/BILLTYPE>/);
+});
+
+test("bank voucher supports Tally's documented Data import envelope", () => {
+  const xml = buildBankVoucherXml(
+    {
+      companyName: "Solution Nyx",
+      voucherType: "Receipt",
+      voucherDate: "2026-08-11",
+      bankLedgerName: "State Bank of India",
+      counterpartyLedgerName: "Indus Metal Recovery",
+      bankLedgerEntryIsDebit: true,
+      amount: 140000,
+      referenceNumber: "SBIN1108260001",
+    },
+    null,
+    { legacyEnvelope: true }
+  );
+
+  assert.match(xml, /<HEADER><VERSION>1<\/VERSION><TALLYREQUEST>Import<\/TALLYREQUEST><TYPE>Data<\/TYPE><ID>Vouchers<\/ID><\/HEADER>/);
+  assert.match(xml, /<BODY><DESC><STATICVARIABLES>/);
+  assert.match(xml, /<\/DESC><DATA><TALLYMESSAGE/);
+  assert.doesNotMatch(xml, /<IMPORTDATA>|<REQUESTDESC>|<REQUESTDATA>/);
+  assert.match(xml, /<DATE>20260811<\/DATE>/);
+  assert.match(xml, /<EFFECTIVEDATE>20260811<\/EFFECTIVEDATE>/);
+});
+
+test("bank voucher batch puts every voucher in one documented Tally request", () => {
+  const payload = {
+    companyName: "Solution Nyx",
+    voucherType: "Receipt",
+    voucherDate: "2026-08-11",
+    bankLedgerName: "State Bank of India",
+    counterpartyLedgerName: "Indus Metal Recovery",
+    counterpartyIsPartyLedger: true,
+    bankLedgerEntryIsDebit: true,
+    amount: 140000,
+  };
+  const xml = buildBankVoucherBatchXml(
+    Array.from({ length: 50 }, (_, index) => ({
+      ...payload,
+      referenceNumber: `BATCH-REF-${index + 1}`,
+    })),
+    null
+  );
+
+  assert.equal((xml.match(/<TALLYMESSAGE\b/g) || []).length, 50);
+  assert.equal((xml.match(/<VOUCHER\b/g) || []).length, 50);
+  assert.match(xml, /<TALLYREQUEST>Import<\/TALLYREQUEST>/);
+  assert.match(xml, /<DESC><STATICVARIABLES>/);
+  assert.doesNotMatch(xml, /<IMPORTDATA>|<REQUESTDESC>|<REQUESTDATA>/);
+  assert.match(xml, /<VOUCHERNUMBER>BATCH-REF-1<\/VOUCHERNUMBER>/);
+  assert.match(xml, /<VOUCHERNUMBER>BATCH-REF-50<\/VOUCHERNUMBER>/);
+});
+
+test("bank voucher batch supports mixed voucher types and bill allocation modes", () => {
+  const common = {
+    companyName: "Solution Nyx",
+    voucherDate: "2026-08-22",
+    bankLedgerName: "Axis Bank",
+    amount: 1000,
+  };
+  const xml = buildBankVoucherBatchXml(
+    [
+      {
+        ...common,
+        voucherType: "Receipt",
+        counterpartyLedgerName: "Customer A",
+        counterpartyIsPartyLedger: true,
+        bankLedgerEntryIsDebit: true,
+        referenceNumber: "MIXED-RECEIPT-BILL",
+        billAllocations: [{ referenceName: "INV-1", referenceType: "Agst Ref", amount: 1000 }],
+      },
+      {
+        ...common,
+        voucherType: "Payment",
+        counterpartyLedgerName: "Bank Charges",
+        counterpartyIsPartyLedger: false,
+        bankLedgerEntryIsDebit: false,
+        referenceNumber: "MIXED-PAYMENT-PLAIN",
+      },
+      {
+        ...common,
+        voucherType: "Contra",
+        counterpartyLedgerName: "Cash",
+        counterpartyIsPartyLedger: false,
+        bankLedgerEntryIsDebit: true,
+        referenceNumber: "MIXED-CONTRA",
+      },
+    ],
+    null
+  );
+
+  assert.equal((xml.match(/<TALLYMESSAGE\b/g) || []).length, 3);
+  assert.match(xml, /<VOUCHERTYPENAME>Receipt<\/VOUCHERTYPENAME>/);
+  assert.match(xml, /<VOUCHERTYPENAME>Payment<\/VOUCHERTYPENAME>/);
+  assert.match(xml, /<VOUCHERTYPENAME>Contra<\/VOUCHERTYPENAME>/);
+  assert.match(xml, /<BILLTYPE>Agst Ref<\/BILLTYPE>/);
+
+  const mixedKeys = [
+    { voucherType: "Receipt", billAllocations: [{ referenceName: "INV-1" }] },
+    { voucherType: "Payment", billAllocations: [] },
+    { voucherType: "Contra" },
+  ].map((variant) =>
+    getBankVoucherCommandBatchKey(
+      { ...common, ...variant },
+      null
+    )
+  );
+  assert.equal(new Set(mixedKeys).size, 1);
+});
+
+
+test("outgoing Contra vouchers debit the destination and credit the statement bank", () => {
+  const xml = buildBankVoucherXml({
+    companyName: "Solution Nyx",
+    voucherType: "Contra",
+    voucherDate: "2026-08-17",
+    bankLedgerName: "State Bank of India",
+    counterpartyLedgerName: "HDFC Bank",
+    bankLedgerEntryIsDebit: false,
+    amount: 50000,
+    referenceNumber: "TRANSFER-1",
+  });
+
+  assert.match(xml, /<VOUCHERTYPENAME>Contra<\/VOUCHERTYPENAME>/);
+  assert.match(xml, /<LEDGERNAME>HDFC Bank<\/LEDGERNAME>[\s\S]*?<ISDEEMEDPOSITIVE>Yes<\/ISDEEMEDPOSITIVE>/);
+  assert.match(xml, /<LEDGERNAME>State Bank of India<\/LEDGERNAME>[\s\S]*?<ISDEEMEDPOSITIVE>No<\/ISDEEMEDPOSITIVE>/);
+  assert.ok(xml.indexOf("<LEDGERNAME>HDFC Bank</LEDGERNAME>") < xml.indexOf("<LEDGERNAME>State Bank of India</LEDGERNAME>"));
+});
+
+test("incoming Contra vouchers debit the statement bank and credit the source account", () => {
+  const xml = buildBankVoucherXml({
+    companyName: "Solution Nyx",
+    voucherType: "Contra",
+    voucherDate: "2026-08-17",
+    bankLedgerName: "State Bank of India",
+    counterpartyLedgerName: "Cash",
+    bankLedgerEntryIsDebit: true,
+    amount: 25000,
+    referenceNumber: "CASH-DEPOSIT-1",
+  });
+
+  assert.match(xml, /<VOUCHERTYPENAME>Contra<\/VOUCHERTYPENAME>/);
+  assert.match(xml, /<LEDGERNAME>State Bank of India<\/LEDGERNAME>[\s\S]*?<ISDEEMEDPOSITIVE>Yes<\/ISDEEMEDPOSITIVE>/);
+  assert.match(xml, /<LEDGERNAME>Cash<\/LEDGERNAME>[\s\S]*?<ISDEEMEDPOSITIVE>No<\/ISDEEMEDPOSITIVE>/);
+  assert.ok(xml.indexOf("<LEDGERNAME>State Bank of India</LEDGERNAME>") < xml.indexOf("<LEDGERNAME>Cash</LEDGERNAME>"));
+});
 
 test("collection exports apply Tally-side formula filters", () => {
   const xml = buildCollectionExportXml({ collectionName: "Filtered Bills", tallyType: "Bill", fetchFields: "Name,LedgerName,ClosingBalance", companyName: "Solution Nyx", dateTo: "2026-08-17", formulae: [{ name: "RequestedLedger", formula: '$$IsEqual:$LedgerName:"Customer A"' }], filterNames: ["RequestedLedger"] });
@@ -36,11 +446,18 @@ test("voucher fallback is required only for incomplete Bill exports", () => {
   assert.equal(openBillBlockRequiresVoucherFallback(incomplete), true);
 });
 
-test("zero targeted bills avoids the voucher export", async () => {
+const billCollection = (bills = "") => `<ENVELOPE><STATUS>1</STATUS><COLLECTION>${bills}</COLLECTION></ENVELOPE>`;
+
+test("zero ledger-scoped bills avoids the voucher export", async () => {
   const calls = [];
-  const result = await fetchCustomerOpenBillsFromTally({ tallyUrl: "http://127.0.0.1:9000" }, { ledgerNames: ["Customer A"], queryPurpose: "bank_statement_match" }, { exportCollection: async (_url, options) => { calls.push(options); return "<ENVELOPE><STATUS>1</STATUS></ENVELOPE>"; } });
+  const result = await fetchCustomerOpenBillsFromTally({ tallyUrl: "http://127.0.0.1:9000" }, { ledgerNames: ["Customer A"], queryPurpose: "bank_statement_match" }, { exportCollection: async (_url, options) => { calls.push(options); return billCollection(); } });
   assert.equal(calls.length, 1);
+  assert.equal(calls[0].tallyType, "Bills");
+  assert.equal(calls[0].childOf, '"Customer A"');
+  assert.equal(calls[0].filterNames, undefined);
   assert.deepEqual(result.result.openBills, []);
+  assert.equal(result.result.queryDiagnostics.billQueryMode, "ledger_child_of");
+  assert.equal(result.result.byLedger["Customer A"].complete, true);
   assert.equal(result.result.queryDiagnostics.voucherFallbackUsed, false);
 });
 
@@ -51,20 +468,107 @@ test("complete Bill data avoids the voucher fallback", async () => {
   assert.equal(result.result.openBills[0].pendingAmount, 500);
 });
 
-test("incomplete Bill data performs a targeted voucher fallback", async () => {
+test("incomplete bank Bill data is held, never a voucher-history fallback", async () => {
   const calls = [];
-  const result = await fetchCustomerOpenBillsFromTally({ tallyUrl: "http://127.0.0.1:9000" }, { ledgerNames: ["Customer A"], queryPurpose: "bank_statement_match" }, { exportCollection: async (_url, options) => { calls.push(options); return options.tallyType === "Bill" ? '<ENVELOPE><BILL NAME="INV-1"><LEDGERNAME>Customer A</LEDGERNAME><OPENINGBALANCE>500</OPENINGBALANCE></BILL></ENVELOPE>' : '<ENVELOPE><STATUS>1</STATUS></ENVELOPE>'; } });
-  assert.equal(calls.length, 2);
-  assert.deepEqual(calls.map((call) => call.tallyType), ["Bill", "Voucher"]);
-  assert.equal(result.result.queryDiagnostics.voucherFallbackUsed, true);
+  const result = await fetchCustomerOpenBillsFromTally({ tallyUrl: "http://127.0.0.1:9000" }, { ledgerNames: ["Customer A"], queryPurpose: "bank_statement_match" }, { exportCollection: async (_url, options) => { calls.push(options); return billCollection('<BILL NAME="INV-1"><LEDGERNAME>Customer A</LEDGERNAME><OPENINGBALANCE>500</OPENINGBALANCE></BILL>'); } });
+  assert.equal(calls.length, 1);
+  assert.equal(result.result.byLedger["Customer A"].complete, false);
+  assert.match(result.result.byLedger["Customer A"].error, /pending bill balance/);
+  assert.equal(result.result.openBills, undefined);
+  assert.equal(result.result.queryDiagnostics.voucherFallbackUsed, false);
 });
 
-test("large ledger sets use one full Bill collection", async () => {
+test("51 ledgers stay sequential and ledger-scoped, even with full_snapshot requested", async () => {
   const calls = [];
+  let active = 0;
   const ledgerNames = Array.from({ length: 51 }, (_, index) => `Customer ${index + 1}`);
-  const result = await fetchCustomerOpenBillsFromTally({ tallyUrl: "http://127.0.0.1:9000" }, { ledgerNames, queryPurpose: "bank_statement_match" }, { exportCollection: async (_url, options) => { calls.push(options); return "<ENVELOPE><STATUS>1</STATUS></ENVELOPE>"; } });
-  assert.equal(calls.length, 1);
-  assert.equal(result.result.queryDiagnostics.billQueryMode, "full");
+  const result = await fetchCustomerOpenBillsFromTally({ tallyUrl: "http://127.0.0.1:9000" }, { ledgerNames, queryPurpose: "bank_statement_match", queryStrategy: "full_snapshot" }, { exportCollection: async (_url, options) => {
+    assert.equal(++active, 1); calls.push(options); await Promise.resolve(); active--; return billCollection();
+  } });
+  assert.equal(calls.length, 51);
+  for (const [index, call] of calls.entries()) {
+    assert.equal(call.childOf, JSON.stringify(ledgerNames[index]));
+    assert.equal(call.tallyType, "Bills");
+    assert.equal(call.filterNames, undefined);
+    assert.equal(call.formulae, undefined);
+    assert.equal(call.timeoutMs <= 20000, true);
+    assert.equal(call.maxResponseBytes, 8 * 1024 * 1024);
+  }
+  assert.equal(result.result.queryDiagnostics.billQueryMode, "ledger_child_of");
+});
+
+test("native IsAdvance and remaining balance are authoritative without voucher evidence", async () => {
+  const ledgerNames = ['A & B "Ltd"', 'A-B', 'AB'];
+  const calls = [];
+  const outcome = await fetchCustomerOpenBillsFromTally({}, { ledgerNames, queryPurpose: "bank_statement_match" }, {
+    exportCollection: async (_url, options) => { calls.push(options); return billCollection(
+      '<BILL NAME="ADV-named-invoice"><ISADVANCE>No</ISADVANCE><BILLDATE>20260801</BILLDATE><OPENINGBALANCE>-125000</OPENINGBALANCE><CLOSINGBALANCE>-20000</CLOSINGBALANCE></BILL>' +
+      '<BILL NAME="Receipt-123"><ISADVANCE>Yes</ISADVANCE><CLOSINGBALANCE>30000</CLOSINGBALANCE></BILL>'); },
+  });
+  assert.equal(calls.length, 3, "punctuation-distinct ledgers are not merged");
+  assert.match(buildCollectionExportXml(calls[0]), /CHILD OF : &quot;A &amp; B \\&quot;Ltd\\&quot;&quot;/);
+  const bucket = outcome.result.byLedger[ledgerNames[0]];
+  assert.equal(bucket.complete, true);
+  assert.equal(bucket.openBills[0].pendingAmount, 20000);
+  assert.equal(bucket.openBills[0].originalAmount, 125000);
+  assert.equal(bucket.openBills[0].invoiceDate, "2026-08-01");
+  assert.equal(bucket.existingAdvances[0].pendingAdvanceAmount, 30000);
+  assert.equal(outcome.result.queryDiagnostics.voucherBatchCount, 0);
+});
+
+test("partial or unscoped bill XML holds only that ledger, not complete ledgers", async () => {
+  const responses = [
+    billCollection('<BILL NAME="INV"><PARENT>Wrong ledger</PARENT><ISADVANCE>No</ISADVANCE><CLOSINGBALANCE>500</CLOSINGBALANCE></BILL>'),
+    billCollection('<BILL NAME="INV"><CLOSINGBALANCE>500</CLOSINGBALANCE></BILL>'),
+    '<ENVELOPE><STATUS>1</STATUS></ENVELOPE>',
+    billCollection(),
+  ];
+  const { result } = await fetchCustomerOpenBillsFromTally({}, { ledgerNames: ["A", "B", "C", "D"], queryPurpose: "bank_statement_match" }, {
+    exportCollection: async () => responses.shift(),
+  });
+  for (const name of ["A", "B", "C"]) assert.equal(result.byLedger[name].complete, false);
+  assert.equal(result.byLedger.D.complete, true);
+  assert.deepEqual(result.byLedger.D.openBills, []);
+  assert.equal(result.queryDiagnostics.incompleteLedgerCount, 3);
+});
+
+test("timeout stops subsequent reads but preserves completed ledger buckets", async () => {
+  let count = 0;
+  const { result } = await fetchCustomerOpenBillsFromTally({}, { ledgerNames: ["A", "B", "C"], queryPurpose: "bank_statement_match" }, {
+    exportCollection: async () => { if (++count === 2) throw new Error("Tally timed out"); return billCollection(); },
+  });
+  assert.equal(count, 2);
+  assert.equal(result.byLedger.A.complete, true);
+  assert.equal(result.byLedger.B.complete, false);
+  assert.equal(result.byLedger.C.complete, false);
+  assert.match(result.byLedger.C.error, /stopped.*timed out/);
+});
+
+test("bank bill response byte limit is enforced before parsing", async (t) => {
+  t.mock.method(globalThis, "fetch", async () => new Response("x".repeat(8 * 1024 * 1024 + 1)));
+  const { result } = await fetchCustomerOpenBillsFromTally({}, { ledgerNames: ["A"], queryPurpose: "bank_statement_match" });
+  assert.equal(result.byLedger.A.complete, false);
+  assert.match(result.byLedger.A.error, /safe response size/);
+});
+
+test("combined ledger results remain bounded for the live socket", async () => {
+  let calls = 0;
+  const { result } = await fetchCustomerOpenBillsFromTally({}, { ledgerNames: ["A", "B", "C"], queryPurpose: "bank_statement_match" }, {
+    exportCollection: async () => { calls++; return billCollection(`<BILL NAME="${"x".repeat(1500000)}"><ISADVANCE>No</ISADVANCE><CLOSINGBALANCE>100</CLOSINGBALANCE></BILL>`); },
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.byLedger.A.complete, true);
+  assert.equal(result.byLedger.B.complete, false);
+  assert.equal(result.byLedger.C.complete, false);
+  assert.match(result.byLedger.B.error, /safe bill-result size/);
+  assert.ok(result.queryDiagnostics.billResultBytes < 4 * 1024 * 1024);
+});
+
+test("malformed bank response cannot mark every row missing", async () => {
+  await assert.rejects(() => reconcileBankTransactionsInTally({}, {
+    bankLedgerName: "Bank", includeBalanceProof: false,
+    transactions: [{ transactionId: "A", voucherDate: "2026-08-24", amount: 100, expectedDirection: "incoming" }],
+  }, { exportCollection: async () => '<ENVELOPE><STATUS>1</STATUS></ENVELOPE>' }), /Duplicate checking could not be completed/);
 });
 
 test("a failed Bill query is not reported as an empty result", async () => {
@@ -136,7 +640,31 @@ test("strict bank presence marks same-date amount evidence insufficient for Susp
   assert.equal(result.identityInsufficient, true);
 });
 
-test("statement reconciliation uses one lean export when top-level references match", async () => {
+test("a repeated strong reference is ambiguous and a cross-date reference is still found", () => {
+  const transaction = {
+    voucherDate: "2026-08-01",
+    amount: 1250,
+    expectedDirection: "incoming",
+    referenceNumber: "UTR-123456",
+    counterpartyLedgerName: "Customer A",
+  };
+  const first = bankVoucher({ reference: "UTR-123456" });
+  const otherDate = {
+    ...bankVoucher({ reference: "UTR-123456" }),
+    date: "20260731",
+    effectiveDate: "20260731",
+  };
+  const one = strictBankTransactionCandidates(
+    [otherDate], transaction, "ICICI Current Account", new Set()
+  );
+  assert.equal(one.candidates.length, 1);
+  const repeated = strictBankTransactionCandidates(
+    [first, otherDate], transaction, "ICICI Current Account", new Set()
+  );
+  assert.equal(repeated.candidates.length, 2);
+});
+
+test("statement reconciliation uses one bounded financial-year export when strong references match", async () => {
   const calls = [];
   const outcome = await reconcileBankTransactionsInTally(
     { tallyUrl: "http://127.0.0.1:9000" },
@@ -164,12 +692,19 @@ test("statement reconciliation uses one lean export when top-level references ma
   );
 
   assert.equal(calls.length, 1);
-  assert.doesNotMatch(calls[0].fetchFields, /BankAllocations/);
+  assert.match(calls[0].fetchFields, /BankAllocations/);
+  assert.equal(calls[0].tallyType, "Vouchers : Ledger");
+  assert.equal(calls[0].childOf, '"ICICI Current Account"');
+  assert.equal(calls[0].dateFrom, "2026-04-01");
+  assert.equal(calls[0].dateTo, "2027-03-31");
+  assert.equal(calls[0].formulae.length, 1);
+  assert.match(calls[0].formulae[0].formula, /UTR-123456/);
   assert.equal(outcome.result.transactions[0].verificationStatus, "found");
   assert.equal(outcome.result.queryDiagnostics.detailBatchCount, 0);
+  assert.equal(outcome.result.queryDiagnostics.queryMode, "financial_year_reference");
 });
 
-test("statement reconciliation fetches bank allocations only for unresolved candidate vouchers", async () => {
+test("statement reconciliation reads bank allocations from the primary export", async () => {
   const calls = [];
   const outcome = await reconcileBankTransactionsInTally(
     { tallyUrl: "http://127.0.0.1:9000" },
@@ -191,19 +726,83 @@ test("statement reconciliation fetches bank allocations only for unresolved cand
     {
       exportCollection: async (_url, options) => {
         calls.push(options);
-        if (calls.length === 1) {
-          return '<ENVELOPE><VOUCHER><DATE>20260801</DATE><EFFECTIVEDATE>20260801</EFFECTIVEDATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME><VOUCHERNUMBER>1</VOUCHERNUMBER><PARTYLEDGERNAME>Customer A</PARTYLEDGERNAME><MASTERID>101</MASTERID><ALLLEDGERENTRIES.LIST><LEDGERNAME>ICICI Current Account</LEDGERNAME><AMOUNT>-1250</AMOUNT><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST><ALLLEDGERENTRIES.LIST><LEDGERNAME>Customer A</LEDGERNAME><AMOUNT>1250</AMOUNT><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST></VOUCHER></ENVELOPE>';
+        return '<ENVELOPE><VOUCHER><DATE>20260801</DATE><EFFECTIVEDATE>20260801</EFFECTIVEDATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME><VOUCHERNUMBER>1</VOUCHERNUMBER><PARTYLEDGERNAME>Customer A</PARTYLEDGERNAME><MASTERID>101</MASTERID><ALLLEDGERENTRIES.LIST><LEDGERNAME>ICICI Current Account</LEDGERNAME><AMOUNT>-1250</AMOUNT><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><BANKALLOCATIONS.LIST><INSTRUMENTNUMBER>UTR-123456</INSTRUMENTNUMBER></BANKALLOCATIONS.LIST></ALLLEDGERENTRIES.LIST><ALLLEDGERENTRIES.LIST><LEDGERNAME>Customer A</LEDGERNAME><AMOUNT>1250</AMOUNT><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST></VOUCHER></ENVELOPE>';
+      },
+    }
+  );
+
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].fetchFields, /BankAllocations/);
+  assert.equal(outcome.result.transactions[0].verificationStatus, "found");
+  assert.equal(outcome.result.queryDiagnostics.detailedVoucherCount, 0);
+  assert.equal(outcome.result.queryDiagnostics.primaryIncludesBankReferences, true);
+});
+
+test("live statement matching verifies vouchers and fetches bills in one connector operation", async () => {
+  const calls = [];
+  const outcome = await matchBankStatementInTally(
+    { tallyUrl: "http://127.0.0.1:9000" },
+    {
+      companyName: "Solution Nyx",
+      bankLedgerName: "ICICI Current Account",
+      includeBalanceProof: false,
+      asOfDate: "2026-08-01",
+      billEligibleTransactionIds: ["txn-found", "txn-missing"],
+      transactions: [
+        {
+          transactionId: "txn-found",
+          voucherDate: "2026-08-01",
+          amount: 1250,
+          expectedDirection: "incoming",
+          referenceNumber: "UTR-FOUND-1",
+          counterpartyLedgerName: "Customer A",
+        },
+        {
+          transactionId: "txn-missing",
+          voucherDate: "2026-08-01",
+          amount: 500,
+          expectedDirection: "incoming",
+          referenceNumber: "UTR-MISSING-1",
+          counterpartyLedgerName: "Customer B",
+        },
+      ],
+    },
+    {
+      exportCollection: async (_url, options) => {
+        calls.push(options);
+        if (options.tallyType === "Vouchers : Ledger") {
+          return '<ENVELOPE><VOUCHER><DATE>20260801</DATE><EFFECTIVEDATE>20260801</EFFECTIVEDATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME><VOUCHERNUMBER>1</VOUCHERNUMBER><REFERENCE>UTR-FOUND-1</REFERENCE><PARTYLEDGERNAME>Customer A</PARTYLEDGERNAME><MASTERID>101</MASTERID><ALLLEDGERENTRIES.LIST><LEDGERNAME>ICICI Current Account</LEDGERNAME><AMOUNT>-1250</AMOUNT><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST><ALLLEDGERENTRIES.LIST><LEDGERNAME>Customer A</LEDGERNAME><AMOUNT>1250</AMOUNT><ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST></VOUCHER></ENVELOPE>';
         }
-        return '<ENVELOPE><VOUCHER><MASTERID>101</MASTERID><ALLLEDGERENTRIES.LIST><BANKALLOCATIONS.LIST><INSTRUMENTNUMBER>UTR-123456</INSTRUMENTNUMBER></BANKALLOCATIONS.LIST></ALLLEDGERENTRIES.LIST></VOUCHER></ENVELOPE>';
+        return billCollection('<BILL NAME="INV-B-1"><LEDGERNAME>Customer B</LEDGERNAME><ISADVANCE>No</ISADVANCE><BILLDATE>20260720</BILLDATE><OPENINGBALANCE>500</OPENINGBALANCE><CLOSINGBALANCE>500</CLOSINGBALANCE></BILL>');
       },
     }
   );
 
   assert.equal(calls.length, 2);
-  assert.match(calls[1].fetchFields, /BankAllocations/);
-  assert.match(calls[1].formulae[0].formula, /\$MasterID = 101/);
   assert.equal(outcome.result.transactions[0].verificationStatus, "found");
-  assert.equal(outcome.result.queryDiagnostics.detailedVoucherCount, 1);
+  assert.equal(outcome.result.transactions[1].verificationStatus, "missing");
+  assert.deepEqual(outcome.result.billLedgerNames, ["Customer B"]);
+  assert.equal(outcome.result.openBillsByLedger["Customer B"].openBills.length, 1);
+  assert.equal(outcome.result.openBillsByLedger["Customer A"], undefined);
+  assert.equal(outcome.result.matchDiagnostics.openBillCheck.requestedLedgerCount, 1);
+});
+
+test("Suspense and non-bill-wise rows get duplicate checking but no bill reads", async () => {
+  const calls = [];
+  const { result } = await matchBankStatementInTally({}, {
+    bankLedgerName: "Bank", includeBalanceProof: false,
+    billEligibleTransactionIds: ["party", "suspense"],
+    transactions: ["party", "suspense", "direct"].map((id) => ({
+      transactionId: id, voucherDate: "2026-08-24", amount: 100,
+      expectedDirection: "incoming", referenceNumber: id,
+      counterpartyLedgerName: id === "party" ? "Customer" : id === "suspense" ? "Suspense" : "Interest Income",
+    })),
+  }, { exportCollection: async (_url, options) => { calls.push(options); return billCollection(); } });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls.map((call) => call.childOf), ['"Bank"', '"Customer"']);
+  assert.equal(result.transactions.length, 3);
+  assert.ok(result.transactions.every((row) => row.verificationStatus === "missing"));
+  assert.deepEqual(result.billLedgerNames, ["Customer"]);
 });
 
 test("open-bill classification preserves invoices and recovers exported advances", () => {

@@ -1,5 +1,10 @@
-import { redirect } from "next/navigation";
+import { AppShell } from "@/components/dashboard/AppShell";
+import { CollectionsDashboardPage } from "@/components/collections/CollectionsDashboardPage";
 
 export default function CollectionsRoute() {
-  redirect("/cash-deposits");
+  return (
+    <AppShell>
+      <CollectionsDashboardPage />
+    </AppShell>
+  );
 }

@@ -1,12 +1,12 @@
 #define AppName "Polaad Tally Connector"
-#define AppVersion "0.1.56"
+#define AppVersion "0.1.71"
 #define AppPublisher "Polaad"
 #define AppInstallDir "C:\Polaad\tally-bridge"
 #define AppExeName "Polaad Tally Connector.exe"
 #define TdlFileName "polaad-native-debit-note-export.tdl"
 
 [Setup]
-AppId={{9A6F0ED7-1C44-4DC2-A8E5-4CC9F00C1571}
+AppId={{C3B8D6B9-7F0E-42C6-A142-8706167053EC}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}

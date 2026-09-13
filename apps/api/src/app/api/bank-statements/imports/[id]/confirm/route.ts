@@ -1,0 +1,871 @@
+import { browserDatasetIds } from "@/lib/tally/browser-scope";
+import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
+import { createHash } from "node:crypto";
+import { requireRequestUser } from "@/lib/api/request-auth";
+import {
+  buildTransactionFingerprint,
+  extractCounterpartyName,
+  maskAccountNumber,
+  normalizeAccountNumber,
+  normalizeIfscCode,
+  parseAmount,
+  parseDate,
+  serializeAccount,
+  type BankAccountInput,
+  type ParsedBankTransaction,
+} from "@/lib/bank-statements";
+import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { isBankStatementExtractionIncomplete } from "@/lib/bank-statement-extraction-status";
+
+export const runtime = "nodejs";
+
+type ConfirmPayload = {
+  accountId?: string | null;
+  account?: BankAccountInput;
+  transactions?: ParsedBankTransaction[];
+  reconcileAgainstLiveTally?: boolean;
+};
+
+type QueueableTransactionRow = {
+  id: string;
+  transaction_date: string;
+  value_date: string | null;
+  description: string;
+  reference_number: string | null;
+  debit_amount: number | string | null;
+  credit_amount: number | string | null;
+  suggested_ledger_name: string | null;
+  confirmed_ledger_name: string | null;
+};
+
+type PostedLogRow = {
+  fingerprint: string;
+  status: string;
+  tally_voucher_id: string | null;
+  tally_posted_at: string | null;
+};
+
+type ExistingTransactionRow = {
+  id: string;
+  fingerprint: string | null;
+  statement_import_id: string | null;
+  tally_status: string | null;
+};
+
+type TransactionCheckpointMarker = {
+  transactionDate: string;
+  valueDate: string | null;
+  description: string;
+  referenceNumber: string | null;
+  debitAmount: number | null;
+  creditAmount: number | null;
+  balanceAmount: number | null;
+  transactionType: string;
+  category: string;
+  counterpartyName: string | null;
+  fingerprint: string;
+};
+
+type DraftTransactionRow = {
+  transaction_date: string;
+  value_date: string | null;
+  description: string;
+  reference_number: string | null;
+  debit_amount: number | null | undefined;
+  credit_amount: number | null | undefined;
+  balance_amount: number | null | undefined;
+  transaction_type: string;
+  category: string;
+  counterparty_name: string | null;
+  suggested_ledger_name?: string | null;
+  suggestion_confidence?: number | null;
+  suggestion_reason?: string | null;
+  confirmed_ledger_name?: string | null;
+  ledger_mapping_source?: string | null;
+  additional_charges?: Array<Record<string, unknown>>;
+  confidence?: number | null;
+  raw_payload?: Record<string, unknown>;
+  fingerprint: string;
+  tally_status?: string;
+};
+
+function isSupabaseConnectivityError(error: unknown) {
+  const text = [
+    error instanceof Error ? error.message : "",
+    typeof error === "object" && error && "details" in error ? String((error as { details?: unknown }).details ?? "") : "",
+    typeof error === "object" && error && "cause" in error ? String((error as { cause?: unknown }).cause ?? "") : "",
+  ].join("\n");
+
+  return /fetch failed|ConnectTimeoutError|UND_ERR_CONNECT_TIMEOUT|ECONNRESET|ETIMEDOUT|ENOTFOUND/i.test(text);
+}
+
+function readRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function getEffectiveImportStatus(row: Record<string, unknown>) {
+  const rawStatus = String(row.status ?? "");
+  const meta = readRecord(row.processing_meta);
+  const analysis = readRecord(meta.analysis);
+  const analysisStatus = typeof analysis.status === "string" ? analysis.status : "";
+  const jobStatus = typeof meta.jobStatus === "string" ? meta.jobStatus : "";
+
+  if (
+    rawStatus === "processing" &&
+    (analysisStatus === "completed" || jobStatus === "completed")
+  ) {
+    const previewTransactionCount = Number(meta.previewTransactionCount ?? 0);
+    return previewTransactionCount > 0 ? "ready_to_review" : "manual_review_required";
+  }
+
+  return rawStatus;
+}
+
+function serializeImport(row: Record<string, unknown>) {
+  return {
+    id: String(row.id),
+    bankAccountId: row.bank_account_id ? String(row.bank_account_id) : null,
+    originalFileName: String(row.original_file_name ?? ""),
+    status: getEffectiveImportStatus(row),
+    statementPeriodStart: row.statement_period_start ? String(row.statement_period_start) : null,
+    statementPeriodEnd: row.statement_period_end ? String(row.statement_period_end) : null,
+    importedTransactionCount: Number(row.imported_transaction_count ?? 0),
+    duplicateTransactionCount: Number(row.duplicate_transaction_count ?? 0),
+    createdAt: String(row.created_at ?? ""),
+  };
+}
+
+function toText(value: unknown) {
+  return String(value ?? "").trim();
+}
+
+function toTransaction(value: unknown): ParsedBankTransaction | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  const transactionDate = parseDate(row.transactionDate);
+  const description = toText(row.description);
+  if (!transactionDate || !description) return null;
+
+  const debitAmount = parseAmount(row.debitAmount);
+  const creditAmount = parseAmount(row.creditAmount);
+
+  return {
+    transactionDate,
+    valueDate: parseDate(row.valueDate),
+    description,
+    referenceNumber: toText(row.referenceNumber) || null,
+    debitAmount,
+    creditAmount,
+    balanceAmount: parseAmount(row.balanceAmount),
+    transactionType: toText(row.transactionType) || "unknown",
+    category: toText(row.category) || "unknown",
+    counterpartyName: toText(row.counterpartyName) || extractCounterpartyName(description),
+    suggestedLedgerName: toText(row.suggestedLedgerName) || null,
+    suggestionConfidence:
+      typeof row.suggestionConfidence === "number" && Number.isFinite(row.suggestionConfidence)
+        ? row.suggestionConfidence
+        : null,
+    suggestionReason: toText(row.suggestionReason) || null,
+    confirmedLedgerName: toText(row.confirmedLedgerName) || null,
+    additionalCharges: Array.isArray(row.additionalCharges)
+      ? row.additionalCharges.filter(
+          (entry): entry is Record<string, unknown> =>
+            Boolean(entry) && typeof entry === "object" && !Array.isArray(entry)
+        )
+      : [],
+    confidence:
+      typeof row.confidence === "number" && Number.isFinite(row.confidence)
+        ? row.confidence
+        : null,
+    rawPayload:
+      row.rawPayload && typeof row.rawPayload === "object" && !Array.isArray(row.rawPayload)
+        ? (row.rawPayload as Record<string, unknown>)
+        : {},
+  };
+}
+
+function latestRowTransactionDate(rows: Array<{ transaction_date: string }>) {
+  return rows
+    .map((row) => row.transaction_date)
+    .sort()
+    .at(-1);
+}
+
+function checkpointDate(value: unknown) {
+  const raw = typeof value === "string" ? value : "";
+  const match = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+  return match?.[1] ?? null;
+}
+
+function normalizeCheckpointText(value?: string | null) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeCheckpointAmount(value: number | string | null | undefined) {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(String(value).replace(/,/g, ""));
+  return Number.isFinite(parsed) ? Number(parsed.toFixed(2)) : null;
+}
+
+function checkpointAmountsMatch(
+  left: number | string | null | undefined,
+  right: number | string | null | undefined
+) {
+  const normalizedLeft = normalizeCheckpointAmount(left);
+  const normalizedRight = normalizeCheckpointAmount(right);
+  if (normalizedLeft === null || normalizedRight === null) return normalizedLeft === normalizedRight;
+  return Math.abs(normalizedLeft - normalizedRight) < 0.005;
+}
+
+function readTransactionCheckpointMarker(value: unknown): TransactionCheckpointMarker | null {
+  let row = value;
+  if (typeof value === "string") {
+    try {
+      row = JSON.parse(value || "{}");
+    } catch {
+      return null;
+    }
+  }
+  if (!row || typeof row !== "object" || Array.isArray(row)) return null;
+  const marker = row as Partial<TransactionCheckpointMarker>;
+  if (!marker.transactionDate || typeof marker.transactionDate !== "string") return null;
+  return {
+    transactionDate: marker.transactionDate,
+    valueDate: typeof marker.valueDate === "string" ? marker.valueDate : null,
+    description: typeof marker.description === "string" ? marker.description : "",
+    referenceNumber: typeof marker.referenceNumber === "string" ? marker.referenceNumber : null,
+    debitAmount: normalizeCheckpointAmount(marker.debitAmount),
+    creditAmount: normalizeCheckpointAmount(marker.creditAmount),
+    balanceAmount: normalizeCheckpointAmount(marker.balanceAmount),
+    transactionType: typeof marker.transactionType === "string" ? marker.transactionType : "unknown",
+    category: typeof marker.category === "string" ? marker.category : "unknown",
+    counterpartyName: typeof marker.counterpartyName === "string" ? marker.counterpartyName : null,
+    fingerprint: typeof marker.fingerprint === "string" ? marker.fingerprint : "",
+  };
+}
+
+function buildTransactionCheckpointMarker(row: DraftTransactionRow): TransactionCheckpointMarker {
+  return {
+    transactionDate: row.transaction_date,
+    valueDate: row.value_date,
+    description: row.description,
+    referenceNumber: row.reference_number,
+    debitAmount: normalizeCheckpointAmount(row.debit_amount),
+    creditAmount: normalizeCheckpointAmount(row.credit_amount),
+    balanceAmount: normalizeCheckpointAmount(row.balance_amount),
+    transactionType: row.transaction_type,
+    category: row.category,
+    counterpartyName: row.counterparty_name,
+    fingerprint: row.fingerprint,
+  };
+}
+
+function transactionMatchesCheckpoint(row: DraftTransactionRow, marker: TransactionCheckpointMarker) {
+  if (marker.fingerprint && row.fingerprint === marker.fingerprint) return true;
+  if (row.transaction_date !== marker.transactionDate) return false;
+  if (!checkpointAmountsMatch(row.debit_amount, marker.debitAmount)) return false;
+  if (!checkpointAmountsMatch(row.credit_amount, marker.creditAmount)) return false;
+  if (!checkpointAmountsMatch(row.balance_amount, marker.balanceAmount)) return false;
+  if (normalizeCheckpointText(row.description) !== normalizeCheckpointText(marker.description)) return false;
+  if (marker.referenceNumber && normalizeCheckpointText(row.reference_number) !== normalizeCheckpointText(marker.referenceNumber)) {
+    return false;
+  }
+  return true;
+}
+
+function rowsAfterImportCheckpoint(
+  rows: DraftTransactionRow[],
+  marker: TransactionCheckpointMarker | null,
+  legacyCheckpointDate: string | null
+) {
+  const markerDate = marker?.transactionDate || legacyCheckpointDate;
+  if (!markerDate) {
+    return {
+      markerFound: null as boolean | null,
+      rows,
+      skippedCount: 0,
+    };
+  }
+
+  if (!marker) {
+    return {
+      markerFound: null as boolean | null,
+      rows,
+      skippedCount: 0,
+    };
+  }
+
+  if (marker && !hasPostingAmount({ debit_amount: marker.debitAmount, credit_amount: marker.creditAmount })) {
+    return {
+      markerFound: false,
+      rows,
+      skippedCount: 0,
+    };
+  }
+
+  const sameDateRowExists = rows.some((row) => row.transaction_date === markerDate);
+  if (!sameDateRowExists) {
+    return {
+      markerFound: null as boolean | null,
+      rows,
+      skippedCount: 0,
+    };
+  }
+
+  const markerIndex = marker ? rows.findIndex((row) => transactionMatchesCheckpoint(row, marker)) : -1;
+  if (markerIndex >= 0) {
+    const nextRows = rows.filter(
+      (row, index) => row.transaction_date > markerDate || (row.transaction_date === markerDate && index > markerIndex)
+    );
+    return {
+      markerFound: true,
+      rows: nextRows,
+      skippedCount: rows.length - nextRows.length,
+    };
+  }
+
+  return {
+    markerFound: false,
+    rows,
+    skippedCount: 0,
+  };
+}
+
+function latestTransactionRow(rows: DraftTransactionRow[]) {
+  return rows.reduce<DraftTransactionRow | null>((latest, row) => {
+    if (!latest) return row;
+    return row.transaction_date >= latest.transaction_date ? row : latest;
+  }, null);
+}
+
+function getTransactionAmount(row: {
+  debit_amount?: number | string | null;
+  credit_amount?: number | string | null;
+}) {
+  return Math.max(normalizeCheckpointAmount(row.debit_amount) ?? 0, normalizeCheckpointAmount(row.credit_amount) ?? 0);
+}
+
+function hasPostingAmount(row: {
+  debit_amount?: number | string | null;
+  credit_amount?: number | string | null;
+}) {
+  return getTransactionAmount(row) > 0;
+}
+
+function serializeQueueableTransaction(row: QueueableTransactionRow) {
+  return {
+    id: row.id,
+    transactionDate: row.transaction_date,
+    valueDate: row.value_date,
+    description: row.description,
+    referenceNumber: row.reference_number,
+    debitAmount: row.debit_amount,
+    creditAmount: row.credit_amount,
+    suggestedLedgerName: row.confirmed_ledger_name || row.suggested_ledger_name || null,
+    confirmedLedgerName: row.confirmed_ledger_name || null,
+  };
+}
+
+export function OPTIONS(request: Request) {
+  return optionsWithCors(request);
+}
+
+export async function POST(
+  request: Request,
+  context: { params: Promise<{ id: string }> }
+) {
+  try {
+    const user = await requireRequestUser(request);
+    if (!user) {
+      return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
+    }
+
+    const { id } = await context.params;
+    const body = (await request.json().catch(() => ({}))) as ConfirmPayload;
+    const reconcileAgainstLiveTally = body.reconcileAgainstLiveTally === true;
+    const submittedTransactions = (body.transactions ?? []).flatMap((value) => {
+      const transaction = toTransaction(value);
+      return transaction ? [transaction] : [];
+    });
+    const transactions = submittedTransactions.filter((transaction) =>
+      hasPostingAmount({
+        debit_amount: transaction.debitAmount,
+        credit_amount: transaction.creditAmount,
+      })
+    );
+
+    if (transactions.length === 0) {
+      return jsonWithCors(
+        request,
+        { error: "Add at least one valid debit or credit transaction before confirming." },
+        { status: 400 }
+      );
+    }
+
+    const supabase = createSupabaseAdminClient();
+    const { data: importRow, error: importError } = await supabase
+      .from("bank_statement_imports")
+      .select("*")
+      .eq("id", id)
+      .eq("owner_user_id", user.id)
+      .in("company_dataset_id", await browserDatasetIds(request, user.id))
+      .single();
+
+    if (importError || !importRow) {
+      return jsonWithCors(request, { error: "Bank statement import was not found." }, { status: 404 });
+    }
+    const ambiguousAmountRows = transactions.filter((transaction) =>
+      Number(Number(transaction.debitAmount ?? 0) > 0) +
+        Number(Number(transaction.creditAmount ?? 0) > 0) !== 1
+    );
+    if (ambiguousAmountRows.length > 0) {
+      return jsonWithCors(
+        request,
+        {
+          error: `${ambiguousAmountRows.length} transaction row(s) do not have exactly one Debit or Credit amount. Correct the extracted statement before confirming.`,
+          code: "BANK_STATEMENT_AMOUNT_DIRECTION_AMBIGUOUS",
+        },
+        { status: 409 }
+      );
+    }
+
+    const effectiveImportStatus = getEffectiveImportStatus(importRow as Record<string, unknown>);
+    const importProcessingMeta = readRecord(importRow.processing_meta);
+    const extractionDiagnostics = readRecord(importProcessingMeta.extractionDiagnostics);
+    const extractionIncomplete = isBankStatementExtractionIncomplete({
+      effectiveImportStatus,
+      processing: effectiveImportStatus === "processing",
+      transactionCount: transactions.length,
+      extractionDiagnostics,
+      legacyRequiresManualExtraction: Boolean(importProcessingMeta.requiresManualExtraction),
+    });
+    if (effectiveImportStatus === "processing" || extractionIncomplete) {
+      const unresolvedPages = Array.isArray(extractionDiagnostics.unresolvedPages)
+        ? extractionDiagnostics.unresolvedPages.map(Number).filter(Number.isFinite)
+        : [];
+      return jsonWithCors(
+        request,
+        {
+          error: "This statement is only partially extracted and cannot be confirmed or sent to Tally.",
+          detail: unresolvedPages.length > 0
+            ? `Unresolved PDF pages: ${unresolvedPages.join(", ")}. Retry analysis before continuing.`
+            : "Retry analysis and verify every PDF page before continuing.",
+          code: "BANK_STATEMENT_COVERAGE_INCOMPLETE",
+        },
+        { status: 409 }
+      );
+    }
+
+    const accountIdWasProvided = Object.prototype.hasOwnProperty.call(body, "accountId");
+    let accountId = accountIdWasProvided
+      ? body.accountId || null
+      : importRow.bank_account_id || null;
+    let accountRow = null;
+    const submittedAccount = body.account ?? {};
+
+    if (accountId) {
+      const { data, error } = await supabase
+        .from("bank_accounts")
+        .select("*")
+        .eq("id", accountId)
+        .eq("owner_user_id", user.id)
+        .eq("company_dataset_id", importRow.company_dataset_id)
+        .single();
+      if (error || !data) {
+        return jsonWithCors(request, { error: "Selected bank account was not found." }, { status: 404 });
+      }
+      accountRow = data;
+    } else {
+      const account = submittedAccount;
+      const accountNumber =
+        account.accountNumber || importRow.extracted_account_number || "";
+      const normalizedAccountNumber = normalizeAccountNumber(accountNumber);
+      const manualLedgerName = String(account.tallyLedgerName ?? "").trim();
+      // A statement without a readable account number can still be posted when
+      // the user deliberately selects a bank ledger. Use a stable internal key
+      // for the bank-account record; it is never presented as a real account.
+      const accountKey = normalizedAccountNumber || (
+        manualLedgerName
+          ? `MANUAL-${createHash("sha256").update(`${user.id}|${manualLedgerName.toLowerCase()}`).digest("hex").slice(0, 24).toUpperCase()}`
+          : ""
+      );
+      if (!accountKey) {
+        return jsonWithCors(
+          request,
+          { error: "Select and confirm a Tally bank ledger before posting." },
+          { status: 400 }
+        );
+      }
+
+      const insertPayload = {
+        owner_user_id: user.id,
+        company_dataset_id: importRow.company_dataset_id,
+        bank_name: account.bankName || importRow.extracted_bank_name || null,
+        account_number_normalized: accountKey,
+        account_number_masked: normalizedAccountNumber ? maskAccountNumber(accountNumber) : "UNVERIFIED",
+        account_holder_name: account.accountHolderName || importRow.extracted_account_holder_name || null,
+        ifsc_code: normalizeIfscCode(account.ifscCode || importRow.extracted_ifsc_code || null) || null,
+        tally_ledger_name: manualLedgerName || null,
+      };
+
+      const { data, error } = await supabase
+        .from("bank_accounts")
+        .insert(insertPayload)
+        .select("*")
+        .single();
+
+      if (error) {
+        const { data: existing, error: existingError } = await supabase
+          .from("bank_accounts")
+          .select("*")
+          .eq("owner_user_id", user.id)
+          .eq("account_number_normalized", accountKey)
+          .eq("company_dataset_id", importRow.company_dataset_id)
+          .single();
+        if (existingError || !existing) throw error;
+        accountRow = existing;
+      } else {
+        accountRow = data;
+      }
+      accountId = accountRow.id;
+    }
+
+    if (!accountId || !accountRow) {
+      return jsonWithCors(request, { error: "Bank account could not be resolved." }, { status: 400 });
+    }
+    if (accountRow.company_dataset_id !== importRow.company_dataset_id) {
+      return jsonWithCors(request, { error: "The bank account belongs to a different Tally company." }, { status: 409 });
+    }
+
+    const rowsByFingerprint = new Map(
+      transactions.map((transaction) => {
+        const fingerprint = buildTransactionFingerprint(accountId, transaction);
+        return [
+          fingerprint,
+          {
+            owner_user_id: user.id,
+            company_dataset_id: importRow.company_dataset_id,
+            bank_account_id: accountId,
+            statement_import_id: id,
+            transaction_date: transaction.transactionDate,
+            value_date: transaction.valueDate || transaction.transactionDate,
+            description: transaction.description,
+            reference_number: transaction.referenceNumber || null,
+            debit_amount: transaction.debitAmount,
+            credit_amount: transaction.creditAmount,
+            balance_amount: transaction.balanceAmount,
+            transaction_type: transaction.transactionType || "unknown",
+            category: transaction.category || "unknown",
+            counterparty_name: transaction.counterpartyName ?? extractCounterpartyName(transaction.description),
+            suggested_ledger_name: transaction.suggestedLedgerName ?? null,
+            suggestion_confidence: transaction.suggestionConfidence ?? null,
+            suggestion_reason: transaction.suggestionReason ?? null,
+            confirmed_ledger_name: transaction.confirmedLedgerName ?? null,
+            ledger_mapping_source: null,
+            additional_charges: transaction.additionalCharges ?? [],
+            confidence: transaction.confidence ?? null,
+            raw_payload: transaction.rawPayload ?? {},
+            fingerprint,
+            tally_status: "pending",
+          },
+        ];
+      })
+    );
+    const rows = Array.from(rowsByFingerprint.values());
+    const previousReview = readRecord(readRecord(importRow.processing_meta).review);
+    const reviewRevision = Math.max(0, Number(previousReview.revision ?? 0) || 0) + 1;
+    const reviewDigest = createHash("sha256").update(JSON.stringify({
+      version: 2,
+      sourceSha256: importRow.source_sha256 ?? null,
+      companyDatasetId: importRow.company_dataset_id,
+      bankAccountId: accountId,
+      rows: rows.map((row) => ({
+        fingerprint: row.fingerprint,
+        transactionDate: row.transaction_date,
+        valueDate: row.value_date,
+        description: row.description,
+        referenceNumber: row.reference_number,
+        debitAmount: row.debit_amount,
+        creditAmount: row.credit_amount,
+        balanceAmount: row.balance_amount,
+        confirmedLedgerName: row.confirmed_ledger_name,
+      })),
+    })).digest("hex");
+    for (const row of rows) {
+      row.raw_payload = {
+        ...readRecord(row.raw_payload),
+        review: { version: 2, revision: reviewRevision, digest: reviewDigest },
+      };
+    }
+    const lastImportedTransactionDate = checkpointDate(accountRow.last_imported_transaction_at);
+    const lastImportedTransactionMarker = readTransactionCheckpointMarker(
+      accountRow.last_imported_transaction_marker
+    );
+    const checkpointResult = rowsAfterImportCheckpoint(
+      rows,
+      lastImportedTransactionMarker,
+      lastImportedTransactionDate
+    );
+    const rowsAfterCheckpoint = reconcileAgainstLiveTally ? rows : checkpointResult.rows;
+
+    const submittedFingerprints = rows.map((row) => row.fingerprint);
+    const existingTransactionsPromise = submittedFingerprints.length
+      ? supabase
+          .from("bank_transactions")
+          .select("id, fingerprint, statement_import_id, tally_status")
+          .eq("owner_user_id", user.id)
+          .eq("company_dataset_id", importRow.company_dataset_id)
+          .eq("bank_account_id", accountId)
+          .in("fingerprint", submittedFingerprints)
+      : Promise.resolve({ data: [], error: null });
+    const postingLogPromise = submittedFingerprints.length
+      ? supabase
+          .from("bank_transaction_posting_log")
+          .select("fingerprint, status, tally_voucher_id, tally_posted_at")
+          .eq("owner_user_id", user.id)
+          .eq("bank_account_id", accountId)
+          .in("status", ["posted", "verified", "needs_tally_review", "queued"])
+          .in("fingerprint", submittedFingerprints)
+      : Promise.resolve({ data: [], error: null });
+
+    const [
+      { data: existingTransactionData, error: existingTransactionReadError },
+      { data: postedLogData, error: postedLogReadError },
+    ] = await Promise.all([existingTransactionsPromise, postingLogPromise]);
+
+    if (existingTransactionReadError) throw existingTransactionReadError;
+    if (postedLogReadError) throw postedLogReadError;
+
+    const existingFingerprints = new Set(
+      ((existingTransactionData ?? []) as ExistingTransactionRow[]).flatMap((row) =>
+        row.fingerprint ? [row.fingerprint] : []
+      )
+    );
+    const existingQueueableRows = ((existingTransactionData ?? []) as ExistingTransactionRow[]).filter(
+      (row) =>
+        row.id &&
+        row.fingerprint &&
+        (reconcileAgainstLiveTally || row.statement_import_id === id) &&
+        ["pending", "failed", "missing_in_tally", "verification_failed"].includes(row.tally_status || "")
+    );
+    const submittedRowsByFingerprint = new Map(rows.map((row) => [row.fingerprint, row]));
+    const postedByFingerprint = new Map(
+      ((postedLogData ?? []) as unknown as PostedLogRow[]).map((row) => [row.fingerprint, row])
+    );
+    const snapshotRows = rowsAfterCheckpoint.flatMap((row) => {
+      if (existingFingerprints.has(row.fingerprint)) return [];
+      const postedLog = postedByFingerprint.get(row.fingerprint);
+      if (!postedLog) return [row];
+      return [
+        {
+          ...row,
+          tally_status:
+            postedLog.status === "verified"
+              ? "verified"
+              : postedLog.status === "posted"
+                ? "posted"
+                : "needs_tally_review",
+          tally_posted_at: postedLog.tally_posted_at,
+          tally_voucher_id: postedLog.tally_voucher_id,
+        },
+      ];
+    });
+
+    const rowsToInsert = snapshotRows.map((row) => ({
+      owner_user_id: user.id,
+      company_dataset_id: importRow.company_dataset_id,
+      bank_account_id: accountId,
+      statement_import_id: id,
+      transaction_date: row.transaction_date,
+      value_date: row.value_date,
+      description: row.description,
+      reference_number: row.reference_number,
+      debit_amount: row.debit_amount,
+      credit_amount: row.credit_amount,
+      balance_amount: row.balance_amount,
+      transaction_type: row.transaction_type,
+      category: row.category,
+      counterparty_name: row.counterparty_name,
+      suggested_ledger_name: row.suggested_ledger_name,
+      suggestion_confidence: row.suggestion_confidence,
+      suggestion_reason: row.suggestion_reason,
+      confirmed_ledger_name: row.confirmed_ledger_name,
+      ledger_mapping_source: row.ledger_mapping_source,
+      additional_charges: row.additional_charges,
+      confidence: row.confidence,
+      raw_payload: row.raw_payload,
+      fingerprint: row.fingerprint,
+      tally_status: row.tally_status,
+      tally_posted_at: "tally_posted_at" in row ? row.tally_posted_at : null,
+      tally_voucher_id: "tally_voucher_id" in row ? row.tally_voucher_id : null,
+    }));
+
+    if (rowsToInsert.length > 0) {
+      const { error: insertError } = await supabase.from("bank_transactions").insert(rowsToInsert);
+      if (insertError) throw insertError;
+    }
+
+    if (existingQueueableRows.length > 0) {
+      const refreshRows = existingQueueableRows.flatMap((existingRow) => {
+        const matchingRow = existingRow.fingerprint
+          ? submittedRowsByFingerprint.get(existingRow.fingerprint)
+          : null;
+        if (!matchingRow) return [];
+        return [{
+          id: existingRow.id,
+          ...matchingRow,
+          statement_import_id: id,
+          // A re-analysis may refresh source fields, but it must never erase a
+          // posting checkpoint or make an uncertain/posted transaction retryable.
+          tally_status: existingRow.tally_status,
+        }];
+      });
+      if (refreshRows.length > 0) {
+        const { error: refreshError } = await supabase
+          .from("bank_transactions")
+          .upsert(refreshRows, {
+            onConflict: "owner_user_id,bank_account_id,fingerprint",
+          });
+        if (refreshError) throw refreshError;
+      }
+    }
+
+    const latestAcceptedRow = latestTransactionRow(rowsAfterCheckpoint);
+    const latestAcceptedDate = latestAcceptedRow?.transaction_date ?? latestRowTransactionDate(rowsAfterCheckpoint);
+    const latestAcceptedMarker = latestAcceptedRow ? buildTransactionCheckpointMarker(latestAcceptedRow) : null;
+    const accountUpdate = latestAcceptedDate
+      ? {
+          last_imported_transaction_at: `${latestAcceptedDate}T00:00:00.000Z`,
+          last_imported_transaction_marker: latestAcceptedMarker,
+        }
+      : {};
+
+    const accountUpdatePromise = latestAcceptedDate
+      ? supabase
+          .from("bank_accounts")
+          .update(accountUpdate)
+          .eq("id", accountId)
+          .eq("owner_user_id", user.id)
+          .eq("company_dataset_id", importRow.company_dataset_id)
+          .select("*")
+          .single()
+      : supabase
+          .from("bank_accounts")
+          .select("*")
+          .eq("id", accountId)
+          .eq("owner_user_id", user.id)
+          .eq("company_dataset_id", importRow.company_dataset_id)
+          .single();
+
+    const queueableTransactionsPromise = supabase
+      .from("bank_transactions")
+      .select(
+        "id, transaction_date, value_date, description, reference_number, debit_amount, credit_amount, suggested_ledger_name, confirmed_ledger_name"
+      )
+      .eq("owner_user_id", user.id)
+      .eq("company_dataset_id", importRow.company_dataset_id)
+      .eq("bank_account_id", accountId)
+      .eq("statement_import_id", id)
+      .in("tally_status", ["pending", "failed", "missing_in_tally", "verification_failed"])
+      .or("debit_amount.gt.0,credit_amount.gt.0")
+      .order("transaction_date", { ascending: true })
+      .order("id", { ascending: true });
+
+    const [
+      { data: updatedAccount, error: accountUpdateError },
+      { data: updatedImport, error: importUpdateError },
+      { data: queueableTransactionData, error: queueableTransactionsError },
+    ] =
+      await Promise.all([
+        accountUpdatePromise,
+        supabase
+          .from("bank_statement_imports")
+          .update({
+            bank_account_id: accountId,
+            status: "imported",
+            imported_transaction_count: rowsToInsert.length,
+            duplicate_transaction_count: transactions.length - rowsToInsert.length,
+            processing_meta: {
+              ...(importRow.processing_meta && typeof importRow.processing_meta === "object"
+                ? importRow.processing_meta
+                : {}),
+              confirmedAt: new Date().toISOString(),
+              confirmedTransactionCount: transactions.length,
+              ignoredNonPostingRowCount: submittedTransactions.length - transactions.length,
+              importedAfterTransactionDate: lastImportedTransactionDate,
+              importedAfterTransactionMarker: lastImportedTransactionMarker,
+              checkpointMarkerFound: checkpointResult.markerFound,
+              skippedByCheckpointCount: checkpointResult.skippedCount,
+              existingTransactionCount: existingFingerprints.size,
+              existingQueueableTransactionCount: existingQueueableRows.length,
+              appendCompletedAt: new Date().toISOString(),
+              alreadyPostedTransactionCount: postedByFingerprint.size,
+              reconciledAgainstLiveTally: reconcileAgainstLiveTally,
+              review: {
+                version: 2,
+                revision: reviewRevision,
+                digest: reviewDigest,
+                sourceSha256: importRow.source_sha256 ?? null,
+              },
+              bankLedgerSelection: {
+                ledgerName: String(submittedAccount.tallyLedgerName ?? "").trim() || null,
+                mode: normalizeAccountNumber(
+                  submittedAccount.accountNumber || importRow.extracted_account_number || ""
+                )
+                  ? "verified_or_existing_account"
+                  : "manual_override",
+                confirmedAt: new Date().toISOString(),
+              },
+            },
+          })
+          .eq("id", id)
+          .eq("owner_user_id", user.id)
+          .eq("company_dataset_id", importRow.company_dataset_id)
+          .select("*")
+          .single(),
+        queueableTransactionsPromise,
+      ]);
+
+    if (accountUpdateError) throw accountUpdateError;
+    if (importUpdateError) throw importUpdateError;
+    if (queueableTransactionsError) throw queueableTransactionsError;
+
+    const queueableTransactions = ((queueableTransactionData ?? []) as QueueableTransactionRow[])
+      .filter(hasPostingAmount)
+      .map(serializeQueueableTransaction);
+
+    return jsonWithCors(request, {
+      account: serializeAccount(updatedAccount),
+      import: serializeImport(updatedImport as Record<string, unknown>),
+      importedTransactionCount: rowsToInsert.length,
+      duplicateTransactionCount: transactions.length - rowsToInsert.length,
+      skippedByCheckpointCount: checkpointResult.skippedCount,
+      existingTransactionCount: existingFingerprints.size,
+      existingQueueableTransactionCount: existingQueueableRows.length,
+      alreadyPostedTransactionCount: postedByFingerprint.size,
+      queueableTransactions,
+    });
+  } catch (error) {
+    console.error("Error in POST /api/bank-statements/imports/[id]/confirm:", error);
+    if (isSupabaseConnectivityError(error)) {
+      return jsonWithCors(
+        request,
+        {
+          error:
+            "Could not reach Supabase while saving the bank statement. Please retry; existing entries will be handled as duplicates when the connection is back.",
+        },
+        { status: 503 }
+      );
+    }
+    return jsonWithCors(
+      request,
+      { error: error instanceof Error ? error.message : "Internal server error" },
+      { status: 500 }
+    );
+  }
+}

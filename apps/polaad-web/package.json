@@ -1,5 +1,5 @@
 {
-  "name": "@autodealer/polaad-web",
+  "name": "@polaad/web",
   "version": "1.0.0",
   "private": true,
   "engines": {
@@ -7,14 +7,18 @@
     "npm": "11.x"
   },
   "scripts": {
-    "dev": "next dev --turbopack --port 3000",
+    "dev": "node --use-system-ca ../../node_modules/next/dist/bin/next dev --turbopack --port 3000",
     "build": "next build --turbopack",
-    "start": "next start",
+    "start": "node --use-system-ca ../../node_modules/next/dist/bin/next start",
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
     "@types/node": "20.17.6",
     "typescript": "5.8.2"
+  },
+  "dependencies": {
+    "jspdf": "4.2.1",
+    "jspdf-autotable": "5.0.8"
   }
 }

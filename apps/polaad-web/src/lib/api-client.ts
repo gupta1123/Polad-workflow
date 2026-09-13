@@ -1,22 +1,12 @@
 "use client";
 
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
+import { tallyBrowserStorage, setTallyStorageUser, clearTallyBrowserCredentials } from "@/lib/tally-browser-storage";
 
 const API_BASE_URL = (process.env.NEXT_PUBLIC_API_BASE_URL || "").replace(/\/+$/, "");
-const PRODUCTION_API_BASE_URL = "https://polaad-workflow-6127a3ee98e5.herokuapp.com";
+const USE_CROSS_ORIGIN_API =
+  process.env.NEXT_PUBLIC_USE_DIRECT_API_BASE_URL === "true" && API_BASE_URL.length > 0;
 const ACCESS_TOKEN_EXPIRY_SAFETY_MS = 30_000;
-
-function directApiBaseUrl() {
-  if (process.env.NEXT_PUBLIC_USE_DIRECT_API_BASE_URL === "false") return "";
-  if (API_BASE_URL) return API_BASE_URL;
-  if (
-    typeof window !== "undefined" &&
-    !["localhost", "127.0.0.1"].includes(window.location.hostname)
-  ) {
-    return PRODUCTION_API_BASE_URL;
-  }
-  return "";
-}
 
 function isLocalDbMode() {
   return process.env.NEXT_PUBLIC_LOCAL_DB_MODE === "true";
@@ -34,7 +24,11 @@ function clearCachedAccessToken() {
 function getBrowserClient() {
   if (!browserClient) {
     browserClient = createSupabaseBrowserClient();
-    browserClient.auth.onAuthStateChange(clearCachedAccessToken);
+    browserClient.auth.onAuthStateChange((event, session) => {
+      clearCachedAccessToken();
+      if (event === "SIGNED_OUT") clearTallyBrowserCredentials();
+      else setTallyStorageUser(session?.user.id || null);
+    });
   }
 
   return browserClient;
@@ -42,6 +36,7 @@ function getBrowserClient() {
 
 async function readAccessToken() {
   if (isLocalDbMode()) {
+    setTallyStorageUser("local-dev-user");
     return null;
   }
 
@@ -56,6 +51,7 @@ async function readAccessToken() {
   pendingAccessToken = getBrowserClient()
     .auth.getSession()
     .then(({ data: { session } }) => {
+      setTallyStorageUser(session?.user.id || null);
       const token = session?.access_token ?? null;
       const expiresAtSeconds = session?.expires_at;
 
@@ -101,26 +97,41 @@ async function refreshAccessToken() {
 
 export function buildApiUrl(path: string) {
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
-  const baseUrl = directApiBaseUrl();
 
-  if (!baseUrl) {
+  if (!USE_CROSS_ORIGIN_API) {
     return normalizedPath;
   }
 
-  return `${baseUrl}${normalizedPath}`;
+  return `${API_BASE_URL}${normalizedPath}`;
 }
 
 export async function getApiAccessToken() {
   return readAccessToken();
 }
 
+export function getTallyBrowserBinding() {
+  if (typeof window === "undefined") return "";
+  const id = tallyBrowserStorage.getItem("polaad:selected-tally-connection");
+  return id ? tallyBrowserStorage.getItem(`polaad:tally-connection-control:${id}`) || "" : "";
+}
+
+export function getSelectedTallyDatasetId() {
+  try {
+    const selected = JSON.parse(tallyBrowserStorage.getItem("polaad.bankStatements.selectedCompany.v1") || "{}");
+    return /^[0-9a-f-]{36}$/i.test(selected.id || "") ? selected.id as string : "";
+  } catch { return ""; }
+}
+
 export async function apiFetch(path: string, init?: RequestInit) {
   const accessToken = await readAccessToken();
   const apiUrl = buildApiUrl(path);
-  const crossOrigin = Boolean(directApiBaseUrl());
 
   async function sendRequest(token: string | null) {
     const headers = new Headers(init?.headers);
+    const binding = getTallyBrowserBinding();
+    if (binding) headers.set("x-tally-browser-binding", binding);
+    const datasetId = getSelectedTallyDatasetId();
+    if (datasetId && path.startsWith("/api/bank-statements")) headers.set("x-tally-dataset-id", datasetId);
     if (token) {
       headers.set("Authorization", `Bearer ${token}`);
     }
@@ -128,7 +139,7 @@ export async function apiFetch(path: string, init?: RequestInit) {
     return fetch(apiUrl, {
       ...init,
       headers,
-      credentials: crossOrigin ? "omit" : (init?.credentials ?? "same-origin"),
+      credentials: USE_CROSS_ORIGIN_API ? "omit" : (init?.credentials ?? "same-origin"),
     });
   }
 
