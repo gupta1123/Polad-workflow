@@ -1,0 +1,11 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="polaad" x1="20" y1="18" x2="238" y2="242" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#E89A78"/>
+      <stop offset="0.48" stop-color="#B36BD4"/>
+      <stop offset="1" stop-color="#5E7BEA"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="60" fill="url(#polaad)"/>
+  <path d="M78 190V66h54c36 0 57 17 57 45s-21 45-57 45h-22v34H78Zm32-61h20c17 0 26-6 26-18s-9-18-26-18h-20v36Z" fill="white"/>
+</svg>
