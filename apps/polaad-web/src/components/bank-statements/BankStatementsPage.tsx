@@ -8379,12 +8379,15 @@ export function BankStatementsPage() {
                                   }`}
                                   onClick={() => {
                                     setReviewActionStage("ledger");
-                                    setEditingLedgerIds((current) => {
-                                      const next = new Set(current);
-                                      if (next.has(transaction.id)) next.delete(transaction.id);
-                                      else return new Set([transaction.id]);
-                                      return next;
-                                    });
+                                    if (isEditingLedger) {
+                                      setEditingLedgerIds((current) => {
+                                        const next = new Set(current);
+                                        next.delete(transaction.id);
+                                        return next;
+                                      });
+                                    } else {
+                                      setEditingLedgerIds(new Set([transaction.id]));
+                                    }
                                   }}
                                   disabled={statementReviewLocked}
                                   title={isEditingLedger ? "Close ledger selection" : "Change ledger"}
