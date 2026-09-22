@@ -516,6 +516,7 @@ type StatementDoneSummary = {
 type TallyPostingStatus = {
   connectionId: string;
   commandIds: string[];
+  commands: TallyCommand[];
   total: number;
   waiting: number;
   sent: number;
@@ -2893,6 +2894,10 @@ function buildTallyPostingStatus(
   return {
     connectionId,
     commandIds,
+    commands: commandIds.flatMap((commandId) => {
+      const command = commandById.get(commandId);
+      return command ? [command] : [];
+    }),
     total: commandIds.length,
     waiting,
     sent,
@@ -3328,6 +3333,7 @@ export function BankStatementsPage() {
   const [ledgerCatalogueError, setLedgerCatalogueError] = useState("");
   const [pendingBankLedgerName, setPendingBankLedgerName] = useState("");
   const [ledgerMasters, setLedgerMasters] = useState<TallyMaster[]>([]);
+  const [bankLedgerCatalogue, setBankLedgerCatalogue] = useState<TallyMaster[]>([]);
   const [tallyBankLedgersByCompany, setTallyBankLedgersByCompany] = useState<Record<string, LocalBankLedger[]>>({});
   const [transactions, setTransactions] = useState<ReviewTransaction[]>([]);
   const [editingLedgerIds, setEditingLedgerIds] = useState<Set<string>>(new Set());
@@ -3381,6 +3387,7 @@ export function BankStatementsPage() {
   const reviewPeriodInputRef = useRef<HTMLInputElement>(null);
   const ledgerLoadSeqRef = useRef(0);
   const fullLedgerCatalogueConnectionRef = useRef("");
+  const nonEmptyLedgerCataloguesRef = useRef<Map<string, TallyMaster[]>>(new Map());
   const bankLedgerLoadKeyRef = useRef("");
   const initialSummaryLoadStartedRef = useRef(false);
   const tallyStatusStartedAtRef = useRef(Date.now());
@@ -3578,7 +3585,9 @@ export function BankStatementsPage() {
       billWiseEnabled: null,
       ledgerType: "other",
     } satisfies TallyMaster));
-    const merged = [...localBankLedgers, ...ledgerMasters.filter(isBankLedgerMaster)];
+    // Transaction vector candidates also live in `ledgerMasters`; they are not
+    // a bank-ledger catalogue and must never flash in the account selector.
+    const merged = [...localBankLedgers, ...bankLedgerCatalogue.filter(isBankLedgerMaster)];
     const seen = new Set<string>();
     return merged.filter((ledger) => {
       const key = ledger.name.trim().toLowerCase();
@@ -3586,7 +3595,7 @@ export function BankStatementsPage() {
       seen.add(key);
       return true;
     });
-  }, [ledgerMasters, selectedCompany, selectedCompanyName, tallyBankLedgersByCompany]);
+  }, [bankLedgerCatalogue, selectedCompany, selectedCompanyName, tallyBankLedgersByCompany]);
   const bankLedgerPickerGroups = useMemo<LedgerSearchGroup[]>(() => {
     const identifiedNames = new Set(bankLedgerOptions.map((ledger) => normalizeName(ledger.name)));
     const identifiedBankLedgers = [...bankLedgerOptions]
@@ -3599,7 +3608,7 @@ export function BankStatementsPage() {
         ].filter(Boolean).join(" - "),
         ...ledgerBalanceFields(ledger),
       }));
-    const allOtherLedgers = ledgerMasters
+    const allOtherLedgers = bankLedgerCatalogue
       .filter((ledger) => ledger.name.trim() && !identifiedNames.has(normalizeName(ledger.name)))
       .sort((left, right) => left.name.localeCompare(right.name))
       .map((ledger) => ({
@@ -3612,7 +3621,7 @@ export function BankStatementsPage() {
       { label: "Identified bank account ledgers", options: identifiedBankLedgers },
       { label: "All other Tally ledgers", options: allOtherLedgers },
     ];
-  }, [bankLedgerOptions, ledgerMasters]);
+  }, [bankLedgerCatalogue, bankLedgerOptions]);
   const exactBankLedgerMatch = useMemo(() => {
     const statementAccountNumber = normalizeBankAccountNumber(account.accountNumber);
     if (!statementAccountNumber) return null;
@@ -4423,6 +4432,7 @@ export function BankStatementsPage() {
       if (loadSeq === ledgerLoadSeqRef.current) {
         fullLedgerCatalogueConnectionRef.current = "";
         setLedgerMasters([]);
+        setBankLedgerCatalogue([]);
       }
       return [];
     }
@@ -4432,6 +4442,12 @@ export function BankStatementsPage() {
     try {
       const connectionCompany = companyOptions.find((option) => option.connectionId === connectionId);
       const liveCompanyName = selectedCompanyName || connectionCompany?.companyName || "";
+      const catalogueKey = `${connectionId}:${normalizeName(liveCompanyName)}`;
+      const cachedCatalogue = nonEmptyLedgerCataloguesRef.current.get(catalogueKey) ?? [];
+      if (cachedCatalogue.length > 0 && loadSeq === ledgerLoadSeqRef.current) {
+        setLedgerMasters(cachedCatalogue);
+        setBankLedgerCatalogue(cachedCatalogue);
+      }
       // This catalogue comes from the connector's local database only when the
       // user opens a manual picker. Matching uses the local vector index; never
       // mirror the complete ledger list into Supabase from this page.
@@ -4447,8 +4463,14 @@ export function BankStatementsPage() {
         },
       });
       const masters = normalizeLiveLedgerMasters(payload.ledgers ?? [], payload.groups ?? []);
+      if (masters.length === 0) {
+        throw new Error("The connector returned an empty ledger catalogue. Open Ledger matching and update ledgers, then retry.");
+      }
+      nonEmptyLedgerCataloguesRef.current.set(catalogueKey, masters);
       if (loadSeq === ledgerLoadSeqRef.current) {
         setLedgerMasters(masters);
+        setBankLedgerCatalogue(masters);
+        setLedgerCatalogueError("");
       }
       return masters;
     } finally {
@@ -4553,11 +4575,11 @@ export function BankStatementsPage() {
     return null;
   }, []);
 
-  async function fetchTallyBankLedgersForCompanies(
+  const fetchTallyBankLedgersForCompanies = useCallback(async (
     connectionId: string,
     companyNames: string[],
     options?: { quiet?: boolean }
-  ) {
+  ) => {
     const cleanCompanyNames = Array.from(
       new Set(companyNames.map((name) => name.trim()).filter(Boolean))
     );
@@ -4808,30 +4830,38 @@ export function BankStatementsPage() {
   }, [loadCompanyOptions, loadLedgerMasters, loadTallyConnections, selectedCompanyId, tallyConnectionId]);
 
   useEffect(() => {
-    // The connector already returned the relevant vector candidates. Fetch its
-    // complete local catalogue only when a user opens either manual ledger picker.
-    if (
-      (!bankLedgerChangeMode && editingLedgerIds.size === 0) ||
-      !tallyConnectionId ||
-      fullLedgerCatalogueConnectionRef.current === tallyConnectionId
-    ) return;
+    // Preload the connector-local catalogue as soon as the company is verified.
+    // Vector suggestions remain usable while this runs. Supabase masters are not
+    // involved in this path.
+    if (!tallyCompanyContextVerified || !tallyConnectionId || !selectedCompanyName) return;
+    const catalogueKey = `${tallyConnectionId}:${normalizeName(selectedCompanyName)}`;
+    if (fullLedgerCatalogueConnectionRef.current === catalogueKey) return;
 
     let cancelled = false;
-    loadLedgerMasters(tallyConnectionId)
-      .then(() => {
-        if (!cancelled) fullLedgerCatalogueConnectionRef.current = tallyConnectionId;
-      })
-      .catch((error) => {
-        if (!cancelled) {
-          setLedgerCatalogueError(
-            error instanceof Error ? error.message : "Could not load the connector ledger catalogue."
-          );
+    let retryTimer: number | null = null;
+    let attempt = 0;
+    const preload = async () => {
+      attempt += 1;
+      try {
+        const masters = await loadLedgerMasters(tallyConnectionId);
+        if (cancelled) return;
+        if (masters.length > 0) fullLedgerCatalogueConnectionRef.current = catalogueKey;
+      } catch (error) {
+        if (cancelled) return;
+        setLedgerCatalogueError(
+          error instanceof Error ? error.message : "Could not load the connector ledger catalogue."
+        );
+        if (attempt < 3) {
+          retryTimer = window.setTimeout(preload, attempt * 1500);
         }
-      });
+      }
+    };
+    void preload();
     return () => {
       cancelled = true;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
     };
-  }, [bankLedgerChangeMode, editingLedgerIds.size, loadLedgerMasters, tallyConnectionId]);
+  }, [bankLedgerChangeMode, editingLedgerIds.size, loadLedgerMasters, selectedCompanyName, tallyCompanyContextVerified, tallyConnectionId]);
 
   useEffect(() => {
     if ((loading || sending || matchingBills || syncingMasters || postUploadSyncImportId) && selectedCompanyId) {
@@ -4942,7 +4972,38 @@ export function BankStatementsPage() {
     setTallyBalanceProof(null);
     setBillAllocationReviewTransactionId((current) => (current === id ? null : current));
     setOutgoingReviewTransactionId((current) => (current === id ? null : current));
-  }
+  }, [selectedCompanyName]);
+
+  useEffect(() => {
+    if (!tallyCompanyContextVerified || !tallyConnectionId || !selectedCompanyName) {
+      bankLedgerLoadKeyRef.current = "";
+      return;
+    }
+
+    const loadKey = `${tallyConnectionId}:${normalizeName(selectedCompanyName)}`;
+    const alreadyLoaded = Object.prototype.hasOwnProperty.call(
+      tallyBankLedgersByCompany,
+      selectedCompanyName
+    );
+    if (bankLedgerLoadKeyRef.current === loadKey || alreadyLoaded) return;
+
+    bankLedgerLoadKeyRef.current = loadKey;
+    void fetchTallyBankLedgersForCompanies(
+      tallyConnectionId,
+      [selectedCompanyName],
+      { quiet: true }
+    ).then((result) => {
+      if (!result && bankLedgerLoadKeyRef.current === loadKey) {
+        bankLedgerLoadKeyRef.current = "";
+      }
+    });
+  }, [
+    fetchTallyBankLedgersForCompanies,
+    selectedCompanyName,
+    tallyBankLedgersByCompany,
+    tallyCompanyContextVerified,
+    tallyConnectionId,
+  ]);
 
   function updateManualBillAmount(transaction: ReviewTransaction, referenceName: string, value: string) {
     const currentDraft = billAllocationsByTransactionId[transaction.id];
@@ -5156,7 +5217,6 @@ export function BankStatementsPage() {
         bankLedgerLoadKeyRef.current = "";
         ledgerLoadSeqRef.current += 1;
         fullLedgerCatalogueConnectionRef.current = "";
-        setLedgerMasters([]);
       }
       showToast("success", "Tally connection refreshed.");
     } catch (error) {
@@ -5178,6 +5238,7 @@ export function BankStatementsPage() {
       setAccount(EMPTY_ACCOUNT);
       fullLedgerCatalogueConnectionRef.current = "";
       setLedgerMasters([]);
+      setBankLedgerCatalogue([]);
       clearStatementReview();
       return;
     }
@@ -5193,6 +5254,7 @@ export function BankStatementsPage() {
     setAccount(EMPTY_ACCOUNT);
     fullLedgerCatalogueConnectionRef.current = "";
     setLedgerMasters([]);
+    setBankLedgerCatalogue([]);
     clearStatementReview();
   }
 
@@ -6667,6 +6729,41 @@ export function BankStatementsPage() {
             if (finalStatus.failed > 0 || finalStatus.canceled > 0 || !commandConnection) return;
             setBanner({ tone: "info", text: "Tally actions completed. Verifying the statement against live Tally..." });
             const { drafts, balanceProof } = await verifyBankStatementPresence(commandConnection, validTransactions);
+            // A successful post command already includes the connector's per-voucher
+            // Tally read-back. A bulk lookup can lag and must not create a false failure.
+            const connectorVerifiedPosts = finalStatus.commands.flatMap((command) => {
+              if (
+                command.status !== "succeeded" ||
+                (command.commandType || command.command_type) !== "post_bank_voucher"
+              ) return [];
+              const result = command.result ?? {};
+              const transactionId = typeof result.transactionId === "string" ? result.transactionId : "";
+              const verificationStatus = String(result.verificationStatus ?? "").toLowerCase();
+              const duplicateCheck = result.duplicateCheck && typeof result.duplicateCheck === "object"
+                ? result.duplicateCheck as Record<string, unknown>
+                : null;
+              const duplicateStatus = String(duplicateCheck?.verificationStatus ?? "").toLowerCase();
+              const verified = verificationStatus === "verified" || ["found", "matched", "verified"].includes(duplicateStatus);
+              if (!transactionId || !verified) return [];
+              const voucherNumber = typeof result.voucherNumber === "string"
+                ? result.voucherNumber
+                : typeof duplicateCheck?.voucherNumber === "string"
+                  ? duplicateCheck.voucherNumber
+                  : null;
+              return [[transactionId, voucherNumber] as const];
+            });
+            for (const [transactionId, voucherNumber] of connectorVerifiedPosts) {
+              drafts[transactionId] = {
+                ...drafts[transactionId],
+                status: "found",
+                label: "Posted and verified",
+                reason: "The connector created this voucher and verified it by reading it back from Tally.",
+                voucherNumber: voucherNumber ?? drafts[transactionId]?.voucherNumber ?? null,
+              };
+            }
+            setTallyPresenceByTransactionId(drafts);
+            setTallyBalanceProof(balanceProof);
+            setTallyCheckAttempted(true);
             const selectedIds = new Set(selectedTallyWorkTransactions.map((transaction) => transaction.id));
             if (finalStatus.voucherTotal > 0) {
               setPostedTransactionIds((current) => {

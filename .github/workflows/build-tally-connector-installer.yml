@@ -69,10 +69,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "polaad-tally-connector-v0.1.71"
+          $tag = "polaad-tally-connector-v0.1.73"
           $installer = "installer\tally-bridge\output\PolaadTallyConnectorSetup.exe"
           gh release view $tag *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --target $env:GITHUB_SHA --title "Polaad Tally Connector v0.1.71" --notes "Windows installer for the Polaad Tally Connector."
+            gh release create $tag --target $env:GITHUB_SHA --title "Polaad Tally Connector v0.1.73" --notes "Windows installer for the Polaad Tally Connector."
           }
           gh release upload $tag $installer --clobber
