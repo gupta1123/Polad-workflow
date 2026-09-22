@@ -4627,7 +4627,7 @@ export function BankStatementsPage() {
     } finally {
       setLoadingBankLedgers(false);
     }
-  }
+  }, [selectedCompanyName]);
 
   const clearStatementReview = useCallback((options?: { preserveSelectedFile?: boolean }) => {
     setPreview(null);
@@ -4972,7 +4972,7 @@ export function BankStatementsPage() {
     setTallyBalanceProof(null);
     setBillAllocationReviewTransactionId((current) => (current === id ? null : current));
     setOutgoingReviewTransactionId((current) => (current === id ? null : current));
-  }, [selectedCompanyName]);
+  }
 
   useEffect(() => {
     if (!tallyCompanyContextVerified || !tallyConnectionId || !selectedCompanyName) {
