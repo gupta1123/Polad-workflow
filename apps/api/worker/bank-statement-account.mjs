@@ -28,6 +28,10 @@ function normalizeHeader(value) {
   return cleanText(value).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
 
+function isAccountFieldLabel(value) {
+  return /^(account holder|account holder name|customer name|account name|bank name|bank|account number|account no|a c number|a c no|ifsc|ifsc code|statement account|bank account|account)$/.test(normalizeHeader(value));
+}
+
 function cleanAccountNumber(value) {
   const compact = cleanText(value).replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
   return /\d/.test(compact) && compact.length >= 6 && compact.length <= 34 ? compact : "";
@@ -89,6 +93,8 @@ function bankNameFromHeader(markdown) {
   };
   if (ifsc && bankByIfscPrefix[ifsc.slice(0, 4)]) return bankByIfscPrefix[ifsc.slice(0, 4)];
 
+  // Some HDFC exports render the logo as an image and expose the bank's name
+  // only in the legal footer after the transaction table.
   if (/\bHDFC BANK LIMITED\b/i.test(plainMarkdownText(markdown))) return "HDFC Bank";
   return "";
 }
@@ -106,30 +112,24 @@ export function extractAccountFromBankStatementMarkdown(markdown) {
     const headers = markdownCells(lines[index]);
     if (headers.length === 0 || isMarkdownSeparator(lines[index])) continue;
 
-    // A separator on the following line means this is a conventional header
-    // row; its adjacent cells are labels, not key/value pairs.
-    if (!isMarkdownSeparator(lines[index + 1])) {
-      for (let cellIndex = 0; cellIndex < headers.length - 1; cellIndex += 2) {
-        const normalized = normalizeHeader(headers[cellIndex]);
-        const value = headers[cellIndex + 1];
-        if (!value) continue;
-        const normalizedValue = normalizeHeader(value);
-        if (/^(account holder|account holder name|customer name|account name|bank name|bank|account number|account no|a c number|a c no|ifsc|ifsc code|statement account|bank account|account)$/.test(normalizedValue)) {
-          continue;
-        }
-        if (/^(account holder|account holder name|customer name|account name)$/.test(normalized)) {
-          result.accountHolderName ||= cleanText(value);
-        } else if (/^(bank name|bank)$/.test(normalized)) {
-          result.bankName ||= cleanText(value);
-        } else if (/^(account number|account no|a c number|a c no)$/.test(normalized)) {
-          result.accountNumber ||= cleanAccountNumber(value);
-        } else if (/^(ifsc|ifsc code)$/.test(normalized)) {
-          result.ifscCode ||= cleanText(value).toUpperCase().replace(/\s+/g, "");
-        } else if (/^(statement account|bank account|account)$/.test(normalized)) {
-          const statementAccount = parseStatementAccount(value);
-          result.bankName ||= statementAccount.bankName;
-          result.accountNumber ||= statementAccount.accountNumber || cleanAccountNumber(value);
-        }
+    for (let cellIndex = 0; cellIndex < headers.length - 1; cellIndex += 1) {
+      const normalized = normalizeHeader(headers[cellIndex]);
+      const value = headers[cellIndex + 1];
+      // Adjacent labels belong to a column-header row, not a key/value row.
+      // Let the row below supply values instead of saving another field name.
+      if (!value || isAccountFieldLabel(value)) continue;
+      if (/^(account holder|account holder name|customer name|account name)$/.test(normalized)) {
+        result.accountHolderName ||= cleanText(value);
+      } else if (/^(bank name|bank)$/.test(normalized)) {
+        result.bankName ||= cleanText(value);
+      } else if (/^(account number|account no|a c number|a c no)$/.test(normalized)) {
+        result.accountNumber ||= cleanAccountNumber(value);
+      } else if (/^(ifsc|ifsc code)$/.test(normalized)) {
+        result.ifscCode ||= cleanText(value).toUpperCase().replace(/\s+/g, "");
+      } else if (/^(statement account|bank account|account)$/.test(normalized)) {
+        const statementAccount = parseStatementAccount(value);
+        result.bankName ||= statementAccount.bankName;
+        result.accountNumber ||= statementAccount.accountNumber || cleanAccountNumber(value);
       }
     }
 
@@ -143,7 +143,7 @@ export function extractAccountFromBankStatementMarkdown(markdown) {
     headers.forEach((header, cellIndex) => {
       const normalized = normalizeHeader(header);
       const value = values[cellIndex];
-      if (!value) return;
+      if (!value || isAccountFieldLabel(value)) return;
 
       if (/^(account holder|account holder name|customer name|account name)$/.test(normalized)) {
         result.accountHolderName ||= cleanText(value);

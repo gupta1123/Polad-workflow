@@ -1,3 +1,4 @@
+import { loadStatementPostingRows, isExistingStatementPosting } from "@/lib/bank-statement-linked-transactions";
 import { browserDatasetIds } from "@/lib/tally/browser-scope";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
@@ -217,11 +218,11 @@ function serializePreviewTransaction(row: Record<string, unknown>) {
   };
 }
 
-function readPostedVoucherNumber(result: unknown, fallback: unknown) {
+function readPostedVoucherNumber(result: unknown) {
   const record = readRecord(result);
   const duplicateCheck = readRecord(record.duplicateCheck);
   return String(
-    record.voucherNumber ?? duplicateCheck.voucherNumber ?? fallback ?? ""
+    record.voucherNumber ?? duplicateCheck.voucherNumber ?? ""
   ).trim();
 }
 
@@ -339,15 +340,7 @@ export async function GET(
     const publicJobStatus =
       jobStatus === "succeeded" && requiresManualExtraction ? "partial" : jobStatus;
 
-    const { data: postedRows, error: postedRowsError } = await supabase
-      .from("bank_transactions")
-      .select("id,fingerprint,transaction_date,description,reference_number,debit_amount,credit_amount,confirmed_ledger_name,suggested_ledger_name,tally_voucher_id,tally_posted_at")
-      .eq("statement_import_id", id)
-      .eq("owner_user_id", user.id)
-      .eq("company_dataset_id", importRow.company_dataset_id)
-      .eq("tally_status", "verified")
-      .order("transaction_date", { ascending: true });
-    if (postedRowsError) throw postedRowsError;
+    const postedRows = await loadStatementPostingRows(supabase, importRow, user.id);
 
     const postedFingerprints = (postedRows ?? [])
       .map((row) => String(row.fingerprint ?? "").trim())
@@ -355,10 +348,9 @@ export async function GET(
     const { data: postedLogs, error: postedLogsError } = postedFingerprints.length
       ? await supabase
           .from("bank_transaction_posting_log")
-          .select("fingerprint,result,tally_voucher_id,tally_posted_at")
+          .select("fingerprint,result,tally_voucher_id,tally_posted_at,status,command_id,voucher_type,source_transaction_id")
           .eq("owner_user_id", user.id)
           .eq("company_dataset_id", importRow.company_dataset_id)
-          .eq("status", "verified")
           .in("fingerprint", postedFingerprints)
       : { data: [], error: null };
     if (postedLogsError) throw postedLogsError;
@@ -374,9 +366,15 @@ export async function GET(
         referenceNumber: row.reference_number ? String(row.reference_number) : null,
         debitAmount: row.debit_amount ?? null,
         creditAmount: row.credit_amount ?? null,
-        ledgerName: String(row.confirmed_ledger_name ?? row.suggested_ledger_name ?? "").trim(),
-        voucherNumber: readPostedVoucherNumber(log?.result, log?.tally_voucher_id ?? row.tally_voucher_id),
+        balanceAmount: row.balance_amount ?? null,
+        ledgerName: String(log?.result?.reviewLedgerName ?? row.confirmed_ledger_name ?? row.suggested_ledger_name ?? "").trim(),
+        voucherNumber: row.tally_status === "verified" ? readPostedVoucherNumber(log?.result) : "",
         postedAt: log?.tally_posted_at ?? row.tally_posted_at ?? null,
+        postingStatus: log?.status ?? row.tally_status,
+        postingCommandId: log?.command_id ?? null,
+        postingResult: isExistingStatementPosting(row, log, id)
+          ? { ...log?.result, alreadyInTally: true } : log?.result ?? null,
+        voucherType: log?.voucher_type ?? null,
       };
     });
 
