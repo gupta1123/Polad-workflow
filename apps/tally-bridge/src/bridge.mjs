@@ -30,7 +30,7 @@ const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
 
-const BRIDGE_VERSION = "0.1.79";
+const BRIDGE_VERSION = "0.1.81";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -2607,6 +2607,22 @@ async function invokeTallyXml(tallyUrl, xml) {
   }
 }
 
+async function probeTallyResponsive(tallyUrl, companyName, timeoutMs = 8_000) {
+  const startedAt = Date.now();
+  try {
+    await exportTallyCollection(tallyUrl, {
+      collectionName: "Polaad Responsiveness Probe",
+      tallyType: "Company",
+      fetchFields: "Name",
+      companyName: null,
+      timeoutMs,
+    });
+    return { ok: true, ms: Date.now() - startedAt, timeoutMs };
+  } catch (error) {
+    return { ok: false, ms: Date.now() - startedAt, timeoutMs, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 function previewXml(xml) {
   return xml.replace(/\s+/g, " ").trim().slice(0, 4000);
 }
@@ -4531,7 +4547,12 @@ async function matchBankStatementInTally(config, commandPayload = {}, dependenci
   };
 }
 
-const VOUCHER_CACHE_FULL_REFRESH_MS = 7 * 24 * 60 * 60 * 1_000;
+// The click path reads only the statement window (plus a small buffer), in
+// bounded chunks. A whole-financial-year snapshot made the first click the
+// slowest and let one Tally stall fail it, so it is no longer attempted here.
+const VOUCHER_WINDOW_BUFFER_DAYS = 7;
+const VOUCHER_CHUNK_DAYS = 31;
+const REFERENCE_LOOKUP_BUDGET_MS = 10_000;
 const CACHED_VOUCHER_FETCH_FIELDS =
   "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,AlterID,GUID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.*,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.BillDate,AllLedgerEntries.BillAllocations.Amount";
 
@@ -4539,9 +4560,26 @@ function isCompleteVoucherEnvelope(xml) {
   return /<\/ENVELOPE\s*>/i.test(xml) && /<(?:COLLECTION|VOUCHER)(?:\s|\/?>)/i.test(xml);
 }
 
+function shiftIsoDate(iso, days) {
+  const date = new Date(`${iso}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function splitDateRange(dateFrom, dateTo, maxDays) {
+  const ranges = [];
+  let start = dateFrom;
+  while (start <= dateTo) {
+    const end = shiftIsoDate(start, maxDays - 1);
+    ranges.push({ dateFrom: start, dateTo: end < dateTo ? end : dateTo });
+    start = shiftIsoDate(start, maxDays);
+  }
+  return ranges;
+}
+
 async function refreshCachedBankVouchers(
   tallyUrl,
-  { companyName, dateFrom, dateTo, bankLedgerName, transactions },
+  { companyName, dateFrom: requestedFrom, dateTo: requestedTo, bankLedgerName, transactions },
   dependencies = {}
 ) {
   const startedAt = Date.now();
@@ -4550,7 +4588,7 @@ async function refreshCachedBankVouchers(
     baseDir: dependencies.localMatchingBaseDir,
   };
   const db = loadOperationalCache(options);
-  const fy = financialYearRange(dateFrom);
+  const fy = financialYearRange(requestedFrom);
   const { key, partition } = ensureVoucherPartition(db, {
     companyGuid: dependencies.companyGuid || null,
     companyName,
@@ -4558,47 +4596,47 @@ async function refreshCachedBankVouchers(
     bankLedgerName,
     financialYear: fy.key,
   });
-  const lastFullAt = Date.parse(partition.lastFullRefreshAt || "") || 0;
-  let fullRefresh = !partition.lastFullRefreshAt || Date.now() - lastFullAt >= VOUCHER_CACHE_FULL_REFRESH_MS;
-  let mode = fullRefresh ? "full_snapshot" : "scoped_snapshot";
+  const dateFrom = shiftIsoDate(normalizeDateForCompare(requestedFrom), -VOUCHER_WINDOW_BUFFER_DAYS);
+  const dateTo = shiftIsoDate(normalizeDateForCompare(requestedTo), VOUCHER_WINDOW_BUFFER_DAYS);
+  const mode = "scoped_snapshot";
   partition.status = "refreshing";
   saveOperationalCache(db, options);
 
   const exportStartedAt = Date.now();
   const exportCollection = dependencies.exportCollection || exportTallyCollection;
-  const exportVouchers = (full) => exportCollection(tallyUrl, {
-    collectionName: full
-      ? "Polaad Cached Bank Vouchers"
-      : "Polaad Statement Bank Vouchers",
-    tallyType: "Vouchers : Ledger",
-    childOf: tallyFormulaString(bankLedgerName),
-    fetchFields: CACHED_VOUCHER_FETCH_FIELDS,
-    companyName,
-    dateFrom: full ? fy.dateFrom : dateFrom,
-    dateTo: full ? fy.dateTo : dateTo,
-    timeoutMs: BANK_MATCH_READ_TIMEOUT_MS,
-    maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
-  });
-  let fullSnapshotTimedOut = false;
-  try {
-    let xml;
+  const exportRange = async (range) => {
+    const read = () => exportCollection(tallyUrl, {
+      collectionName: "Polaad Statement Bank Vouchers",
+      tallyType: "Vouchers : Ledger",
+      childOf: tallyFormulaString(bankLedgerName),
+      fetchFields: CACHED_VOUCHER_FETCH_FIELDS,
+      companyName,
+      dateFrom: range.dateFrom,
+      dateTo: range.dateTo,
+      timeoutMs: BANK_MATCH_READ_TIMEOUT_MS,
+      maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
+    });
     try {
-      xml = await exportVouchers(fullRefresh);
+      return await read();
     } catch (error) {
-      // A large financial year can exceed the read budget, and a failed full
-      // snapshot never records lastFullRefreshAt, so every retry would time out
-      // the same way. Read only the statement period instead; the full snapshot
-      // is attempted again on the next check.
-      if (!fullRefresh || !/timed out after/i.test(error instanceof Error ? error.message : "")) throw error;
-      fullSnapshotTimedOut = true;
-      fullRefresh = false;
-      mode = "scoped_snapshot";
-      xml = await exportVouchers(false);
+      // One retry for a transient stall; any other failure surfaces as-is.
+      if (!/timed out after/i.test(error instanceof Error ? error.message : "")) throw error;
+      return read();
     }
-    if (!isCompleteVoucherEnvelope(xml)) {
-      throw new Error("Tally did not return a complete voucher collection for the local index.");
+  };
+  try {
+    const changedVouchers = [];
+    const chunkTimings = [];
+    for (const range of splitDateRange(dateFrom, dateTo, VOUCHER_CHUNK_DAYS)) {
+      const chunkStartedAt = Date.now();
+      const xml = await exportRange(range);
+      if (!isCompleteVoucherEnvelope(xml)) {
+        throw new Error("Tally did not return a complete voucher collection for the local index.");
+      }
+      const parsed = parseVoucherCollection(xml);
+      changedVouchers.push(...parsed);
+      chunkTimings.push({ ...range, ms: Date.now() - chunkStartedAt, vouchers: parsed.length });
     }
-    const changedVouchers = parseVoucherCollection(xml);
     const update = upsertVoucherPartition(partition, changedVouchers, {
       mode, bankLedgerName, dateFrom, dateTo,
     });
@@ -4607,18 +4645,71 @@ async function refreshCachedBankVouchers(
     dependencies.operationalContext = { db, key, partition, options };
 
     const strongReferences = (transactions || []).map(bankTransactionReferences)
-      .map(({ bankReference }) => bankReference).filter(isStrongBankReference);
-    const vouchers = activeVouchers(partition).filter((voucher) => {
+      .map(({ bankReference }) => bankReference).filter(isStrongBankReference)
+      .filter((reference) => !/^\d+$/.test(normalizeExactReference(reference)));
+    const inWindow = (voucher) => {
       const date = normalizeDateForCompare(voucher.effectiveDate || voucher.date);
-      return (date >= dateFrom && date <= dateTo) ||
-        strongReferences.some((reference) => !/^\d+$/.test(normalizeExactReference(reference)) &&
-          voucherHasExactReference(voucher, reference));
+      return date >= dateFrom && date <= dateTo;
+    };
+    const vouchers = activeVouchers(partition).filter((voucher) => inWindow(voucher) ||
+      strongReferences.some((reference) => voucherHasExactReference(voucher, reference)));
+
+    // Best effort: rows with a UTR that is not in the window may be dated
+    // elsewhere in the year. Look them up by amount within a short budget; on
+    // failure the rows are simply reported as checked within the window only.
+    const unresolved = (transactions || []).filter((row) => {
+      const { bankReference } = bankTransactionReferences(row);
+      return isStrongBankReference(bankReference) && !/^\d+$/.test(normalizeExactReference(bankReference)) &&
+        !vouchers.some((voucher) => voucherHasExactReference(voucher, bankReference));
     });
+    let referenceLookup = unresolved.length === 0 ? "not_needed" : "skipped";
+    let referenceLookupMs = 0;
+    let referenceLookupError = null;
+    const financialYear = financialYearBounds(requestedFrom);
+    if (unresolved.length > 0 && financialYear) {
+      const lookupStartedAt = Date.now();
+      try {
+        const entryFilterName = "PolaadBankIdentityAmount";
+        const filterName = "PolaadBankReferenceIdentity";
+        const amountFormula = Array.from(new Set(unresolved.map((row) => Number(row.amount))))
+          .map((amount) => `($Amount = ${amount} OR $Amount = ${-amount})`).join(" OR ");
+        const xml = await exportCollection(tallyUrl, {
+          collectionName: "Polaad Bank Reference Identity",
+          tallyType: "Vouchers : Ledger",
+          childOf: tallyFormulaString(bankLedgerName),
+          fetchFields: CACHED_VOUCHER_FETCH_FIELDS,
+          companyName,
+          dateFrom: financialYear.dateFrom,
+          dateTo: financialYear.dateTo,
+          formulae: [
+            { name: entryFilterName, formula: `($$IsEqual:$LedgerName:${tallyFormulaString(bankLedgerName)}) AND (${amountFormula})` },
+            { name: filterName, formula: `$$FilterCount:AllLedgerEntries:${entryFilterName} > 0` },
+          ],
+          filterNames: [filterName],
+          timeoutMs: REFERENCE_LOOKUP_BUDGET_MS,
+          maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
+        });
+        if (!isCompleteVoucherEnvelope(xml)) throw new Error("incomplete reference lookup response");
+        const idOf = (voucher) => voucher.guid || `${voucher.masterId}|${voucher.voucherNumber}`;
+        const seen = new Set(vouchers.map(idOf));
+        for (const voucher of parseVoucherCollection(xml)) {
+          if (/^yes$/i.test(String(voucher.isCancelled || "")) || seen.has(idOf(voucher))) continue;
+          seen.add(idOf(voucher));
+          vouchers.push(voucher);
+        }
+        referenceLookup = "completed";
+      } catch (error) {
+        referenceLookupError = error instanceof Error ? error.message : String(error);
+      }
+      referenceLookupMs = Date.now() - lookupStartedAt;
+    }
     return {
       vouchers,
       diagnostics: {
         source: "connector_voucher_index",
         refreshMode: mode,
+        window: { dateFrom, dateTo, bufferDays: VOUCHER_WINDOW_BUFFER_DAYS },
+        chunks: chunkTimings,
         exportMs: Date.now() - exportStartedAt,
         totalMs: Date.now() - startedAt,
         changedVoucherCount: changedVouchers.length,
@@ -4626,7 +4717,9 @@ async function refreshCachedBankVouchers(
         cachedVoucherCount: partition.voucherCount || 0,
         counts: update.counts,
         financialYear: fy.key,
-        fullSnapshotTimedOut,
+        referenceLookup,
+        referenceLookupMs,
+        referenceLookupError,
       },
     };
   } catch (error) {
@@ -6285,6 +6378,13 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
           return outcome.result || outcome;
         }
         if (operation === "match_bank_statement") {
+          // Cheap reachability probe first: a busy or closed Tally now fails in
+          // seconds with a clear reason instead of burning the 4-minute deadline.
+          const probe = await probeTallyResponsive(config.tallyUrl, message.companyName);
+          log("info", `Tally probe before match_bank_statement (${requestId}): ${probe.ok ? "responsive" : "NOT responsive"} in ${probe.ms} ms${probe.error ? ` (${probe.error})` : ""}.`);
+          if (!probe.ok) {
+            throw new Error(`Tally did not respond within ${Math.round(probe.timeoutMs / 1000)} seconds. Make sure Tally is open with the company loaded and not busy, then try again.`);
+          }
           const outcome = await matchBankStatementInTally(config, message.payload || {}, {
             signal: controller.signal,
             assertCompany,
@@ -6296,7 +6396,15 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
             companyGuid: message.target?.companyGuid || null,
           });
           await assertCompany();
-          return outcome.result || outcome;
+          const matchResult = outcome.result || outcome;
+          if (matchResult && typeof matchResult === "object") {
+            matchResult.matchDiagnostics = {
+              ...(matchResult.matchDiagnostics || {}),
+              tallyProbeMs: probe.ms,
+              connectorVersion: BRIDGE_VERSION,
+            };
+          }
+          return matchResult;
         }
         if (operation === "fetch_customer_open_bills") {
           const outcome = await fetchCustomerOpenBillsFromTally(config, message.payload || {}, { signal: controller.signal, onProgress });

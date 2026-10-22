@@ -89,62 +89,90 @@ test("stored '?' ledger name resolves by GUID to the exact live Unicode name", (
   assert.equal(resolved.counterpartyLedgerName, UNICODE_LEDGER_NAMES[0]);
 });
 
-test("operational voucher provider bootstraps once then requests a statement-scoped bank snapshot", async (t) => {
+const VOUCHER_XML = '<ENVELOPE><COLLECTION><VOUCHER><DATE>20260801</DATE><EFFECTIVEDATE>20260801</EFFECTIVEDATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME><VOUCHERNUMBER>1</VOUCHERNUMBER><REFERENCE>UTR-1</REFERENCE><PARTYLEDGERNAME>Customer</PARTYLEDGERNAME><MASTERID>10</MASTERID><ALTERID>20</ALTERID><GUID>v-1</GUID><ALLLEDGERENTRIES.LIST><LEDGERNAME>Bank</LEDGERNAME><AMOUNT>-100</AMOUNT><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST></VOUCHER></COLLECTION></ENVELOPE>';
+
+test("operational voucher provider reads only the statement window plus a buffer, never the full year", async (t) => {
   const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "polaad-voucher-provider-"));
   t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
   const calls = [];
-  const fullXml = '<ENVELOPE><COLLECTION><VOUCHER><DATE>20260801</DATE><EFFECTIVEDATE>20260801</EFFECTIVEDATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME><VOUCHERNUMBER>1</VOUCHERNUMBER><REFERENCE>UTR-1</REFERENCE><PARTYLEDGERNAME>Customer</PARTYLEDGERNAME><MASTERID>10</MASTERID><ALTERID>20</ALTERID><GUID>v-1</GUID><ALLLEDGERENTRIES.LIST><LEDGERNAME>Bank</LEDGERNAME><AMOUNT>-100</AMOUNT><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST></VOUCHER></COLLECTION></ENVELOPE>';
   const request = {
     companyName: "Company", bankLedgerName: "Bank", dateFrom: "2026-08-01", dateTo: "2026-08-01",
-    transactions: [{ referenceNumber: "UTR-1" }],
+    transactions: [{ referenceNumber: "UTR-1", amount: 100 }],
   };
   const dependencies = {
     localMatchingBaseDir: baseDir,
     companyGuid: "company-guid",
-    exportCollection: async (_url, options) => { calls.push(options); return fullXml; },
-  };
-  const first = await refreshCachedBankVouchers("http://tally", request, dependencies);
-  assert.equal(first.diagnostics.refreshMode, "full_snapshot");
-  assert.equal(first.vouchers.length, 1);
-  const second = await refreshCachedBankVouchers("http://tally", request, dependencies);
-  assert.equal(second.diagnostics.refreshMode, "scoped_snapshot");
-  assert.equal(calls[1].tallyType, "Vouchers : Ledger");
-  assert.equal(calls[1].dateFrom, request.dateFrom);
-  assert.equal(calls[1].dateTo, request.dateTo);
-  assert.equal(calls[1].formulae, undefined);
-});
-
-test("operational voucher provider falls back to the statement period when the full-year snapshot times out", async (t) => {
-  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "polaad-voucher-timeout-"));
-  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
-  const calls = [];
-  const scopedXml = '<ENVELOPE><COLLECTION><VOUCHER><DATE>20260801</DATE><EFFECTIVEDATE>20260801</EFFECTIVEDATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME><VOUCHERNUMBER>1</VOUCHERNUMBER><REFERENCE>UTR-1</REFERENCE><PARTYLEDGERNAME>Customer</PARTYLEDGERNAME><MASTERID>10</MASTERID><ALTERID>20</ALTERID><GUID>v-1</GUID><ALLLEDGERENTRIES.LIST><LEDGERNAME>Bank</LEDGERNAME><AMOUNT>-100</AMOUNT><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST></VOUCHER></COLLECTION></ENVELOPE>';
-  const request = {
-    companyName: "Company", bankLedgerName: "Bank", dateFrom: "2026-08-01", dateTo: "2026-08-01",
-    transactions: [{ referenceNumber: "UTR-1" }],
-  };
-  const dependencies = {
-    localMatchingBaseDir: baseDir,
-    companyGuid: "company-guid",
-    exportCollection: async (_url, options) => {
-      calls.push(options);
-      if (options.collectionName === "Polaad Cached Bank Vouchers") {
-        throw new Error("Polaad Cached Bank Vouchers timed out after 20 seconds.");
-      }
-      return scopedXml;
-    },
+    exportCollection: async (_url, options) => { calls.push(options); return VOUCHER_XML; },
   };
   const first = await refreshCachedBankVouchers("http://tally", request, dependencies);
   assert.equal(first.diagnostics.refreshMode, "scoped_snapshot");
-  assert.equal(first.diagnostics.fullSnapshotTimedOut, true);
   assert.equal(first.vouchers.length, 1);
-  assert.equal(calls[1].collectionName, "Polaad Statement Bank Vouchers");
-  assert.equal(calls[1].dateFrom, request.dateFrom);
-  assert.equal(calls[1].dateTo, request.dateTo);
-  // The timeout must not be recorded as a completed full refresh.
-  const second = await refreshCachedBankVouchers("http://tally", request, dependencies);
-  assert.equal(calls[2].collectionName, "Polaad Cached Bank Vouchers");
-  assert.equal(second.diagnostics.fullSnapshotTimedOut, true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].collectionName, "Polaad Statement Bank Vouchers");
+  assert.equal(calls[0].dateFrom, "2026-07-25");
+  assert.equal(calls[0].dateTo, "2026-08-08");
+  assert.equal(first.diagnostics.referenceLookup, "not_needed");
+});
+
+test("operational voucher provider splits long statements into bounded monthly reads", async (t) => {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "polaad-voucher-chunks-"));
+  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+  const calls = [];
+  const result = await refreshCachedBankVouchers("http://tally", {
+    companyName: "Company", bankLedgerName: "Bank", dateFrom: "2026-04-01", dateTo: "2026-06-30", transactions: [],
+  }, {
+    localMatchingBaseDir: baseDir,
+    companyGuid: "company-guid",
+    exportCollection: async (_url, options) => { calls.push(options); return VOUCHER_XML; },
+  });
+  assert.ok(calls.length >= 3);
+  for (const call of calls) {
+    const days = (Date.parse(call.dateTo) - Date.parse(call.dateFrom)) / 86_400_000 + 1;
+    assert.ok(days <= 31);
+  }
+  assert.equal(result.diagnostics.chunks.length, calls.length);
+});
+
+test("operational voucher provider retries a stalled window read once and then fails fast", async (t) => {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "polaad-voucher-timeout-"));
+  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+  let attempts = 0;
+  const request = { companyName: "Company", bankLedgerName: "Bank", dateFrom: "2026-08-01", dateTo: "2026-08-01", transactions: [] };
+  const ok = await refreshCachedBankVouchers("http://tally", request, {
+    localMatchingBaseDir: baseDir, companyGuid: "company-guid",
+    exportCollection: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("Polaad Statement Bank Vouchers timed out after 20 seconds.");
+      return VOUCHER_XML;
+    },
+  });
+  assert.equal(attempts, 2);
+  assert.equal(ok.vouchers.length, 1);
+  await assert.rejects(
+    refreshCachedBankVouchers("http://tally", request, {
+      localMatchingBaseDir: baseDir, companyGuid: "company-guid",
+      exportCollection: async () => { throw new Error("Polaad Statement Bank Vouchers timed out after 20 seconds."); },
+    }),
+    /timed out/
+  );
+});
+
+test("a UTR missing from the window is looked up best-effort and never fails the check", async (t) => {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "polaad-voucher-utr-"));
+  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+  const request = {
+    companyName: "Company", bankLedgerName: "Bank", dateFrom: "2026-08-01", dateTo: "2026-08-01",
+    transactions: [{ referenceNumber: "UTRABC123456", amount: 555 }],
+  };
+  const result = await refreshCachedBankVouchers("http://tally", request, {
+    localMatchingBaseDir: baseDir, companyGuid: "company-guid",
+    exportCollection: async (_url, options) => {
+      if (options.collectionName === "Polaad Bank Reference Identity") throw new Error("Polaad Bank Reference Identity timed out after 10 seconds.");
+      return VOUCHER_XML;
+    },
+  });
+  assert.equal(result.diagnostics.referenceLookup, "skipped");
+  assert.match(result.diagnostics.referenceLookupError, /timed out/);
 });
 
 test("operational voucher provider does not mask non-timeout export errors", async (t) => {
