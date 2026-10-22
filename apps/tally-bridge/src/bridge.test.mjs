@@ -114,6 +114,54 @@ test("operational voucher provider bootstraps once then requests a statement-sco
   assert.equal(calls[1].formulae, undefined);
 });
 
+test("operational voucher provider falls back to the statement period when the full-year snapshot times out", async (t) => {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "polaad-voucher-timeout-"));
+  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+  const calls = [];
+  const scopedXml = '<ENVELOPE><COLLECTION><VOUCHER><DATE>20260801</DATE><EFFECTIVEDATE>20260801</EFFECTIVEDATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME><VOUCHERNUMBER>1</VOUCHERNUMBER><REFERENCE>UTR-1</REFERENCE><PARTYLEDGERNAME>Customer</PARTYLEDGERNAME><MASTERID>10</MASTERID><ALTERID>20</ALTERID><GUID>v-1</GUID><ALLLEDGERENTRIES.LIST><LEDGERNAME>Bank</LEDGERNAME><AMOUNT>-100</AMOUNT><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST></VOUCHER></COLLECTION></ENVELOPE>';
+  const request = {
+    companyName: "Company", bankLedgerName: "Bank", dateFrom: "2026-08-01", dateTo: "2026-08-01",
+    transactions: [{ referenceNumber: "UTR-1" }],
+  };
+  const dependencies = {
+    localMatchingBaseDir: baseDir,
+    companyGuid: "company-guid",
+    exportCollection: async (_url, options) => {
+      calls.push(options);
+      if (options.collectionName === "Polaad Cached Bank Vouchers") {
+        throw new Error("Polaad Cached Bank Vouchers timed out after 20 seconds.");
+      }
+      return scopedXml;
+    },
+  };
+  const first = await refreshCachedBankVouchers("http://tally", request, dependencies);
+  assert.equal(first.diagnostics.refreshMode, "scoped_snapshot");
+  assert.equal(first.diagnostics.fullSnapshotTimedOut, true);
+  assert.equal(first.vouchers.length, 1);
+  assert.equal(calls[1].collectionName, "Polaad Statement Bank Vouchers");
+  assert.equal(calls[1].dateFrom, request.dateFrom);
+  assert.equal(calls[1].dateTo, request.dateTo);
+  // The timeout must not be recorded as a completed full refresh.
+  const second = await refreshCachedBankVouchers("http://tally", request, dependencies);
+  assert.equal(calls[2].collectionName, "Polaad Cached Bank Vouchers");
+  assert.equal(second.diagnostics.fullSnapshotTimedOut, true);
+});
+
+test("operational voucher provider does not mask non-timeout export errors", async (t) => {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "polaad-voucher-error-"));
+  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+  await assert.rejects(
+    refreshCachedBankVouchers("http://tally", {
+      companyName: "Company", bankLedgerName: "Bank", dateFrom: "2026-08-01", dateTo: "2026-08-01", transactions: [],
+    }, {
+      localMatchingBaseDir: baseDir,
+      companyGuid: "company-guid",
+      exportCollection: async () => { throw new Error("Tally is not reachable"); },
+    }),
+    /not reachable/
+  );
+});
+
 test("Tally response decoding preserves Unicode ledger punctuation", () => {
   const xml = '<LEDGER NAME="Task Metcorp Global (Opc) Private Limited – Jalna"></LEDGER>';
   assert.equal(decodeTallyResponseBytes(Buffer.from(xml, "utf8")), xml);

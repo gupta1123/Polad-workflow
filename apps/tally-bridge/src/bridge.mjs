@@ -4559,26 +4559,42 @@ async function refreshCachedBankVouchers(
     financialYear: fy.key,
   });
   const lastFullAt = Date.parse(partition.lastFullRefreshAt || "") || 0;
-  const fullRefresh = !partition.lastFullRefreshAt || Date.now() - lastFullAt >= VOUCHER_CACHE_FULL_REFRESH_MS;
-  const mode = fullRefresh ? "full_snapshot" : "scoped_snapshot";
+  let fullRefresh = !partition.lastFullRefreshAt || Date.now() - lastFullAt >= VOUCHER_CACHE_FULL_REFRESH_MS;
+  let mode = fullRefresh ? "full_snapshot" : "scoped_snapshot";
   partition.status = "refreshing";
   saveOperationalCache(db, options);
 
   const exportStartedAt = Date.now();
+  const exportCollection = dependencies.exportCollection || exportTallyCollection;
+  const exportVouchers = (full) => exportCollection(tallyUrl, {
+    collectionName: full
+      ? "Polaad Cached Bank Vouchers"
+      : "Polaad Statement Bank Vouchers",
+    tallyType: "Vouchers : Ledger",
+    childOf: tallyFormulaString(bankLedgerName),
+    fetchFields: CACHED_VOUCHER_FETCH_FIELDS,
+    companyName,
+    dateFrom: full ? fy.dateFrom : dateFrom,
+    dateTo: full ? fy.dateTo : dateTo,
+    timeoutMs: BANK_MATCH_READ_TIMEOUT_MS,
+    maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
+  });
+  let fullSnapshotTimedOut = false;
   try {
-    const xml = await (dependencies.exportCollection || exportTallyCollection)(tallyUrl, {
-      collectionName: fullRefresh
-        ? "Polaad Cached Bank Vouchers"
-        : "Polaad Statement Bank Vouchers",
-      tallyType: "Vouchers : Ledger",
-      childOf: tallyFormulaString(bankLedgerName),
-      fetchFields: CACHED_VOUCHER_FETCH_FIELDS,
-      companyName,
-      dateFrom: fullRefresh ? fy.dateFrom : dateFrom,
-      dateTo: fullRefresh ? fy.dateTo : dateTo,
-      timeoutMs: BANK_MATCH_READ_TIMEOUT_MS,
-      maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
-    });
+    let xml;
+    try {
+      xml = await exportVouchers(fullRefresh);
+    } catch (error) {
+      // A large financial year can exceed the read budget, and a failed full
+      // snapshot never records lastFullRefreshAt, so every retry would time out
+      // the same way. Read only the statement period instead; the full snapshot
+      // is attempted again on the next check.
+      if (!fullRefresh || !/timed out after/i.test(error instanceof Error ? error.message : "")) throw error;
+      fullSnapshotTimedOut = true;
+      fullRefresh = false;
+      mode = "scoped_snapshot";
+      xml = await exportVouchers(false);
+    }
     if (!isCompleteVoucherEnvelope(xml)) {
       throw new Error("Tally did not return a complete voucher collection for the local index.");
     }
@@ -4610,6 +4626,7 @@ async function refreshCachedBankVouchers(
         cachedVoucherCount: partition.voucherCount || 0,
         counts: update.counts,
         financialYear: fy.key,
+        fullSnapshotTimedOut,
       },
     };
   } catch (error) {
