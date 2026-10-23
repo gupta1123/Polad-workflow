@@ -1,6 +1,7 @@
 
 import { getLocalDbPaths, loadLocalDb } from "./store.mjs";
 import { isZvecAvailable, queryZvec, queryZvecBatch } from "./vector.mjs";
+import { fuseCandidates, textMatchLedgers } from "./text-match.mjs";
 
 const DEFAULT_TOP_K = 5;
 const MAX_TOP_K = 20;
@@ -82,29 +83,41 @@ function emptyResult({ query, companyId = null, companyName = null, reason, erro
 }
 
 function resultFromDocuments({ searchQuery, company, activeLedgers, documents, limit }) {
-  const suggestions = (Array.isArray(documents) ? documents : [])
+  const vectorHits = (Array.isArray(documents) ? documents : [])
     .map((document) => ({ document, ledger: findLedger(document, activeLedgers) }))
     .filter((item) => item.ledger)
-    .slice(0, limit)
-    .map(({ document, ledger }, index) => {
-      const confidence = normalizeVectorScore(document);
-      return {
-        ledgerId: ledger.master_key,
-        ledgerName: ledger.tally_name,
-        parentGroup: ledger.parent_name || null,
-        rank: index + 1,
-        localScore: 0,
-        vectorScore: Number(confidence.toFixed(4)),
-        aiScore: null,
-        confidence: Number(confidence.toFixed(4)),
-        source: "zvec",
-        retrievalSource: "zvec",
-        reasons: ["vector similarity"],
-        needsReview: confidence < 0.6,
-        isActive: true,
-        tallyGuid: ledger.tally_guid || null,
-      };
-    });
+    .map(({ document, ledger }) => ({ ledger, vectorScore: normalizeVectorScore(document) }));
+  // Name search runs locally on the same ledger set; it only adds to and
+  // re-ranks what the vector search returned. It is never used on its own.
+  const textHits = textMatchLedgers({
+    query: searchQuery,
+    activeLedgers,
+    cacheKey: `${company.key}:${company.entry.lastSyncAt || ""}`,
+    limit,
+  });
+  const suggestions = fuseCandidates({ vectorHits, textHits, limit }).map((item, index) => {
+    const confidence = Math.max(item.vectorScore ?? 0, item.textScore ?? 0);
+    const reasons = [];
+    if (item.vectorScore !== null) reasons.push("vector similarity");
+    if (item.textScore !== null) reasons.push("name text match");
+    const ledger = item.ledger;
+    return {
+      ledgerId: ledger.master_key,
+      ledgerName: ledger.tally_name,
+      parentGroup: ledger.parent_name || null,
+      rank: index + 1,
+      localScore: item.textScore ?? 0,
+      vectorScore: item.vectorScore === null ? null : Number(item.vectorScore.toFixed(4)),
+      aiScore: null,
+      confidence: Number(confidence.toFixed(4)),
+      source: "zvec",
+      retrievalSource: item.vectorScore !== null && item.textScore !== null ? "zvec+text" : item.vectorScore !== null ? "zvec" : "text",
+      reasons,
+      needsReview: confidence < 0.6,
+      isActive: true,
+      tallyGuid: ledger.tally_guid || null,
+    };
+  });
 
   return {
     query: searchQuery,
@@ -119,7 +132,7 @@ function resultFromDocuments({ searchQuery, company, activeLedgers, documents, l
       totalActive: activeLedgers.length,
       retrieved: suggestions.length,
       vectorEngine: "zvec",
-      searchMode: "vector_only",
+      searchMode: "vector_text_hybrid",
       usedAI: true,
       embeddingModel: "openai/text-embedding-3-small",
       vectorError: null,
