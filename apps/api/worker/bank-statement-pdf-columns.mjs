@@ -220,7 +220,7 @@ export function extractBankStatementPhysicalColumns(pages) {
       .map((item) => ({ text: normalizedText(item.str), x: item.transform[4], y: item.transform[5], width: item.width }));
     // Statement footers ("*Closing balance includes …") sit under the last row
     // and would otherwise be read as part of its narration.
-    const footerY = Math.max(-Infinity, ...allItems.filter((item) => /^\*?closing balance includes/i.test(item.text)).map((item) => item.y));
+    const footerY = Math.max(-Infinity, ...allItems.filter((item) => /^(?:\*?closing balance includes|statement summary)/i.test(item.text)).map((item) => item.y));
     const items = Number.isFinite(footerY) ? allItems.filter((item) => item.y > footerY + 2) : allItems;
     const detectedLayout = detectPnbLayout(items, page) || detectCentralBankLayout(items, page);
     if (detectedLayout) {
