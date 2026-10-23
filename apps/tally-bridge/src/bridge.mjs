@@ -30,7 +30,7 @@ const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
 
-const BRIDGE_VERSION = "0.1.83";
+const BRIDGE_VERSION = "0.1.84";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -4625,16 +4625,32 @@ async function refreshCachedBankVouchers(
       return read();
     }
   };
+  // A busy ledger can exceed the response cap for a whole chunk; halve the
+  // range until it fits (down to a single day) instead of failing the match.
+  const readParsedRange = async (range) => {
+    try {
+      const xml = await exportRange(range);
+      if (!isCompleteVoucherEnvelope(xml)) {
+        throw new Error("Tally did not return a complete voucher collection for the local index.");
+      }
+      return parseVoucherCollection(xml);
+    } catch (error) {
+      if (!/exceeded the safe response size/i.test(error instanceof Error ? error.message : "") || range.dateFrom >= range.dateTo) throw error;
+      const days = Math.round((Date.parse(`${range.dateTo}T00:00:00Z`) - Date.parse(`${range.dateFrom}T00:00:00Z`)) / 86_400_000) + 1;
+      const firstHalf = Math.ceil(days / 2);
+      const middle = shiftIsoDate(range.dateFrom, firstHalf - 1);
+      return [
+        ...(await readParsedRange({ dateFrom: range.dateFrom, dateTo: middle })),
+        ...(await readParsedRange({ dateFrom: shiftIsoDate(middle, 1), dateTo: range.dateTo })),
+      ];
+    }
+  };
   try {
     const changedVouchers = [];
     const chunkTimings = [];
     for (const range of splitDateRange(dateFrom, dateTo, VOUCHER_CHUNK_DAYS)) {
       const chunkStartedAt = Date.now();
-      const xml = await exportRange(range);
-      if (!isCompleteVoucherEnvelope(xml)) {
-        throw new Error("Tally did not return a complete voucher collection for the local index.");
-      }
-      const parsed = parseVoucherCollection(xml);
+      const parsed = await readParsedRange(range);
       changedVouchers.push(...parsed);
       chunkTimings.push({ ...range, ms: Date.now() - chunkStartedAt, vouchers: parsed.length });
     }

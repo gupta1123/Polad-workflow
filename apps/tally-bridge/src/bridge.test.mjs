@@ -157,6 +157,25 @@ test("operational voucher provider retries a stalled window read once and then f
   );
 });
 
+test("an oversized voucher read is halved until it fits instead of failing", async (t) => {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "polaad-voucher-size-"));
+  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+  const calls = [];
+  const result = await refreshCachedBankVouchers("http://tally", {
+    companyName: "Company", bankLedgerName: "Bank", dateFrom: "2026-08-01", dateTo: "2026-08-01", transactions: [],
+  }, {
+    localMatchingBaseDir: baseDir, companyGuid: "company-guid",
+    exportCollection: async (_url, options) => {
+      calls.push(options);
+      const days = (Date.parse(options.dateTo) - Date.parse(options.dateFrom)) / 86_400_000 + 1;
+      if (days > 4) throw new Error("Polaad Statement Bank Vouchers exceeded the safe response size. Narrow the statement period or review this ledger separately.");
+      return VOUCHER_XML;
+    },
+  });
+  assert.ok(calls.length > 1);
+  assert.ok(result.vouchers.length >= 1);
+});
+
 test("a UTR missing from the window is looked up best-effort and never fails the check", async (t) => {
   const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "polaad-voucher-utr-"));
   t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
