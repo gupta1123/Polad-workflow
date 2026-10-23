@@ -48,13 +48,14 @@ export function summarizeBankPostings(commands: BankPostingCommand[]) {
   return summary;
 }
 
-export function bankPostingMessage(summary: ReturnType<typeof summarizeBankPostings>) {
+// `idle`: nothing is being sent right now, so a pending row is not posted yet rather than "still processing".
+export function bankPostingMessage(summary: ReturnType<typeof summarizeBankPostings>, options: { idle?: boolean } = {}) {
   const progress = [`${summary.confirmed - summary.alreadyExisting} newly posted`, `${summary.alreadyExisting} already entered in Tally`];
   if (summary.held) progress.push(`${summary.held} not posted: possible duplicates need review`);
   if (summary.confirmationPending) progress.push(`${summary.confirmationPending} accepted by Tally: confirmation pending`);
   if (summary.outcomeUnknown) progress.push(`${summary.outcomeUnknown} posting ${summary.outcomeUnknown === 1 ? "outcome" : "outcomes"} unknown: check Tally before retrying`);
   if (summary.failed) progress.push(`${summary.failed} couldn't be posted`);
-  if (summary.pending) progress.push(`${summary.pending} still processing`);
+  if (summary.pending) progress.push(options.idle ? `${summary.pending} not posted yet` : `${summary.pending} still processing`);
   if (summary.pending || summary.needsCheck || summary.failed) return `${progress.join("; ")}.`;
   if (!summary.total) return "No entries were posted.";
   if (summary.alreadyExisting === summary.total && summary.total > 0) return `${summary.alreadyExisting} ${summary.alreadyExisting === 1 ? "entry was" : "entries were"} already entered in Tally. No new entries were posted.`;

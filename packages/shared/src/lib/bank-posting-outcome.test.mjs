@@ -73,3 +73,11 @@ test('empty work and pending work never claim a completed posting', () => {
   assert.match(bankPostingMessage(pending), /1 still processing/);
   assert.equal(bankPostingTitle(pending), 'Processing entries in Tally');
 });
+
+test('an idle re-upload reports unsent rows as not posted yet, not still processing', () => {
+  const existing = { status: 'succeeded', result: { alreadyInTally: true, verificationStatus: 'verified' } };
+  const unsent = { status: 'pending' };
+  const summary = summarizeBankPostings([...Array(26).fill(existing), ...Array(4).fill(unsent)]);
+  assert.equal(bankPostingMessage(summary, { idle: true }), '0 newly posted; 26 already entered in Tally; 4 not posted yet.');
+  assert.equal(bankPostingMessage(summary), '0 newly posted; 26 already entered in Tally; 4 still processing.');
+});
