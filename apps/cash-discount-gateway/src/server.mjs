@@ -144,7 +144,10 @@ async function authenticate(socket, message) {
 
   if (role === "connector") {
     const previous = connectors.get(connectionId);
-    if (previous && previous !== socket) closeWithError(previous, "A newer connector live session replaced this one.", 1000);
+    if (previous && previous !== socket) {
+      console.log(`[cash-discount-gateway] connector session replaced connection=${connectionId}`);
+      closeWithError(previous, "A newer connector live session replaced this one.", 1000);
+    }
     connectors.set(connectionId, socket);
   }
   send(socket, { type: "authenticated", role, connectionId });
@@ -432,9 +435,10 @@ export function startCashDiscountGateway(options = {}) {
     }
   });
 
-  socket.on("close", () => {
+  socket.on("close", (code, reason) => {
     clearTimeout(authTimer);
     const meta = metadata.get(socket);
+    console.log(`[cash-discount-gateway] ${meta?.role || "unauthenticated"} socket closed code=${code} reason=${String(reason || "").slice(0, 80) || "-"} connection=${meta?.connectionId || "-"} pending=${Array.from(pending.values()).filter((item) => item.browser === socket || item.connector === socket).length}`);
     if (meta?.role === "connector" && connectors.get(meta.connectionId) === socket) connectors.delete(meta.connectionId);
     for (const [requestId, item] of pending) {
       if (item.browser === socket && item.operation !== "create_debit_note") failPending(requestId, new Error("Browser disconnected."));
@@ -447,6 +451,7 @@ export function startCashDiscountGateway(options = {}) {
     for (const socket of server.clients) {
       const meta = metadata.get(socket);
       if (meta?.alive === false) {
+        console.log(`[cash-discount-gateway] terminating unresponsive ${meta?.role || "unauthenticated"} socket connection=${meta?.connectionId || "-"} (no pong in 30s)`);
         socket.terminate();
         continue;
       }

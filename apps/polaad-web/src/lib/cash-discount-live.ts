@@ -237,7 +237,48 @@ async function getLiveSession(request: LiveRequest) {
   return cachedSession;
 }
 
-export async function runCashDiscountLiveRequest<T>(request: LiveRequest) {
+// Read-only operations are safe to repeat. A dropped socket (network switch,
+// Wi-Fi blip, gateway restart) then recovers on a fresh session instead of
+// surfacing "channel closed" to the user. Posting operations are never retried.
+const RETRYABLE_OPERATIONS = new Set<LiveRequest["operation"]>([
+  "bank_ledgers", "ledger_masters", "local_ledger_catalogue", "verify_bank_transaction",
+  "match_bank_statement", "fetch_customer_open_bills",
+]);
+const RETRYABLE_CHANNEL_ERROR = /channel closed|Could not connect to the live|live Tally session was replaced|Browser disconnected|live Tally channel disconnected/i;
+// The same catalogue/bank-ledger read requested twice at once (page effects
+// re-running) used to queue duplicate heavy reads in the single-threaded Tally.
+const DEDUPED_OPERATIONS = new Set<LiveRequest["operation"]>(["bank_ledgers", "local_ledger_catalogue"]);
+const inFlightLiveRequests = new Map<string, Promise<unknown>>();
+
+export async function runCashDiscountLiveRequest<T>(request: LiveRequest): Promise<T> {
+  const dedupeKey = DEDUPED_OPERATIONS.has(request.operation) && !request.onPartialResult
+    ? JSON.stringify([request.connectionId, request.companyName, request.companyNames ?? null, request.operation, request.financialYear ?? null, request.payload ?? null])
+    : null;
+  if (dedupeKey) {
+    const existing = inFlightLiveRequests.get(dedupeKey);
+    if (existing) return existing as Promise<T>;
+  }
+  const run = (async () => {
+    try {
+      return await runLiveRequestOnce<T>(request);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!RETRYABLE_OPERATIONS.has(request.operation) || !RETRYABLE_CHANNEL_ERROR.test(message) || request.signal?.aborted) throw error;
+      console.warn(`[cash-discount-live] ${request.operation} lost its channel (${message}); retrying once on a new session.`);
+      await new Promise((resolve) => window.setTimeout(resolve, 1_000));
+      request.signal?.throwIfAborted();
+      return runLiveRequestOnce<T>(request);
+    }
+  })();
+  if (dedupeKey) {
+    inFlightLiveRequests.set(dedupeKey, run);
+    const clear = () => { if (inFlightLiveRequests.get(dedupeKey) === run) inFlightLiveRequests.delete(dedupeKey); };
+    run.then(clear, clear);
+  }
+  return run;
+}
+
+async function runLiveRequestOnce<T>(request: LiveRequest) {
   request.signal?.throwIfAborted();
   const deadlineAt = Date.now() + (request.operation === "company_check" ? 15_000 : 240_000);
   let authenticationTimer: number | undefined;

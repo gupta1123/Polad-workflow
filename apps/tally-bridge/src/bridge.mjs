@@ -30,7 +30,7 @@ const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
 
-const BRIDGE_VERSION = "0.1.81";
+const BRIDGE_VERSION = "0.1.82";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
@@ -417,6 +417,7 @@ function buildCollectionExportXml({
   fetchFields,
   companyName,
   childOf,
+  belongsTo = false,
   dateFrom,
   dateTo,
   formulae = [],
@@ -430,7 +431,7 @@ function buildCollectionExportXml({
     dateTo ? `<SVTODATE TYPE="Date">${escapeXml(String(dateTo).replaceAll("-", ""))}</SVTODATE>` : "",
   ].filter(Boolean);
   const childOfFilter = childOf
-    ? `<ADD>CHILD OF : ${escapeXml(childOf)}</ADD>`
+    ? `<ADD>CHILD OF : ${escapeXml(childOf)}</ADD>${belongsTo ? "<ADD>BELONGS TO : Yes</ADD>" : ""}`
     : "";
   const safeFormulae = formulae.filter(
     (formula) => formula && /^[A-Za-z][A-Za-z0-9_]*$/.test(String(formula.name || "")) && String(formula.formula || "").trim()
@@ -4963,12 +4964,30 @@ async function fetchBankLedgersFromTally(config, commandPayload = {}) {
   for (const companyName of targets) {
     const key = companyName || "Current company";
     try {
-      const [ledgerXml, groupXml] = await Promise.all([
-        exportTallyCollection(tallyUrl, {
+      // Fast path: only ledgers under the Bank Accounts group tree. A company
+      // with thousands of ledgers made the all-ledger scan time out while Tally
+      // was busy. Fall back to the full scan only when the group yields nothing.
+      const bankFetchFields =
+        "Name,Parent,GUID,ClosingBalance,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BranchName,BankBranchName,Branch,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName";
+      let scopedLedgerXml = null;
+      try {
+        const xml = await exportTallyCollection(tallyUrl, {
           collectionName: "Polaad Bank Ledger Discovery",
           tallyType: "Ledger",
-          fetchFields:
-            "Name,Parent,GUID,ClosingBalance,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BranchName,BankBranchName,Branch,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName",
+          fetchFields: bankFetchFields,
+          companyName,
+          childOf: "Bank Accounts",
+          belongsTo: true,
+        });
+        if (parseMasterCollection(xml, "LEDGER").length > 0) scopedLedgerXml = xml;
+      } catch {
+        scopedLedgerXml = null;
+      }
+      const [ledgerXml, groupXml] = await Promise.all([
+        scopedLedgerXml ?? exportTallyCollection(tallyUrl, {
+          collectionName: "Polaad Bank Ledger Discovery",
+          tallyType: "Ledger",
+          fetchFields: bankFetchFields,
           companyName,
         }),
         exportTallyCollection(tallyUrl, {
@@ -6189,8 +6208,8 @@ function createExclusiveScheduler(options = {}) {
         const index = queue.indexOf(entry);
         if (index < 0) return;
         queue.splice(index, 1);
-        entry.reject(new Error("Tally is busy. This request waited 15 seconds; try again when the current operation finishes."));
-      }, Math.min(15_000, Math.max(1, (lifecycle.deadlineAt || Infinity) - Date.now())));
+        entry.reject(new Error("Tally is busy. This request waited 60 seconds; try again when the current operation finishes."));
+      }, Math.min(60_000, Math.max(1, (lifecycle.deadlineAt || Infinity) - Date.now())));
     }
     queue.push(entry);
     scheduleNext();
