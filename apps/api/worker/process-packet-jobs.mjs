@@ -26,6 +26,7 @@ import {
 } from "./bank-statement-account.mjs";
 import {
   correctRowsFromRunningBalance,
+  correctBalanceSignFlips,
   validateRunningBalanceContinuity,
 } from "./bank-statement-running-balance.mjs";
 import { extractBankStatementMarkdownAmounts, reconcileBankStatementMarkdownAmounts, restoreSourceBankReferences } from "./bank-statement-markdown-amounts.mjs";
@@ -2761,7 +2762,17 @@ async function runBankStatementJob(job) {
     needsReview: parsed.transactions.filter(row => row.raw_payload?.referenceNeedsReview === true).length,
   };
   extractionDiagnostics.extractionMs = Date.now() - workerStartedAt;
-  const balanceValidation = validateRunningBalanceContinuity(parsed.transactions, parsed.openingBalance);
+  let balanceValidation = validateRunningBalanceContinuity(parsed.transactions, parsed.openingBalance);
+  if (balanceValidation.status === "failed") {
+    const signRepair = correctBalanceSignFlips(parsed.transactions, parsed.openingBalance);
+    if (signRepair.repairedCount > 0) {
+      const repairedValidation = validateRunningBalanceContinuity(signRepair.transactions, parsed.openingBalance);
+      if (repairedValidation.breaks.length < balanceValidation.breaks.length) {
+        parsed.transactions = signRepair.transactions;
+        balanceValidation = { ...repairedValidation, signRepairedRows: signRepair.repairedCount };
+      }
+    }
+  }
   extractionDiagnostics.balanceValidation = balanceValidation;
   if (balanceValidation.status === "failed") {
     extractionDiagnostics.coverageComplete = false;

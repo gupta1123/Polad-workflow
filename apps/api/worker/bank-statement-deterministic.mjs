@@ -120,13 +120,13 @@ const HEADER_PATTERNS = [
   ["bank reference number", "reference"], ["bank reference no.", "reference"], ["bank reference no", "reference"], ["bank reference", "reference"],
   ["transaction reference number", "reference"], ["transaction reference no.", "reference"], ["transaction reference", "reference"],
   ["transaction id", "reference"], ["utr number", "reference"], ["utr no.", "reference"], ["utr no", "reference"], ["utr", "reference"],
-  ["transaction date", "date"], ["txn date", "date"], ["post date", "date"], ["posting date", "date"], ["value date", "value_date"], ["date", "date"],
-  ["transaction description", "description"], ["description / particulars", "description"], ["transaction details", "description"], ["narration / description", "description"], ["narration", "description"], ["description", "description"], ["particulars", "description"],
+  ["transaction date", "date"], ["tran date", "date"], ["txn date", "date"], ["post date", "date"], ["posting date", "date"], ["value date", "value_date"], ["date", "date"],
+  ["transaction description", "description"], ["description / particulars", "description"], ["transaction details", "description"], ["transaction particulars", "description"], ["narration / description", "description"], ["narration", "description"], ["description", "description"], ["particulars", "description"],
   ["reference / utr", "reference"], ["reference no.", "reference"], ["reference no", "reference"], ["reference", "reference"], ["cheque number", "reference"], ["cheque no.", "reference"], ["cheque no", "reference"],
   ["txn no.", "txn_no"], ["txn no", "txn_no"], ["transaction no.", "txn_no"], ["transaction no", "txn_no"],
   ["debit amount", "debit"], ["dr amount", "debit"], ["debit (inr)", "debit"], ["withdrawal", "debit"], ["paid out", "debit"], ["debit", "debit"],
   ["credit amount", "credit"], ["cr amount", "credit"], ["credit (inr)", "credit"], ["deposit", "credit"], ["paid in", "credit"], ["credit", "credit"],
-  ["closing balance", "balance"], ["balance (inr)", "balance"], ["balance", "balance"],
+  ["available balance", "balance"], ["closing balance", "balance"], ["balance (inr)", "balance"], ["balance", "balance"],
 ];
 
 function headerPart(value) {
@@ -229,6 +229,10 @@ function normalizeTableTransactions(table, fallbackYear, startIndex) {
   if (indexes.date < 0 || indexes.description < 0) return [];
   const rows = source.recoveredHeaderRow ? [source.recoveredHeaderRow, ...source.rows] : source.rows;
   const output = [];
+  // Layouts with a single unlabeled amount column (amount + "Available Balance
+  // 123.00 CR") carry no debit/credit marker; the balance movement decides.
+  const singleAmountColumn = indexes.debit < 0 && indexes.credit < 0 && indexes.balance >= 0;
+  const singleMeta = [];
   for (const row of rows) {
     const transactionDate = parseDateValue(row[indexes.date], fallbackYear);
     const description = String(row[indexes.description] || "").replace(/\s+/g, " ").trim();
@@ -281,6 +285,9 @@ function normalizeTableTransactions(table, fallbackYear, startIndex) {
     const amountIssue = Boolean(debitAmount) === Boolean(creditAmount)
       ? (debitAmount ? "both_debit_and_credit" : "missing_debit_and_credit")
       : null;
+    if (singleAmountColumn) {
+      singleMeta.push({ amount: available.length === 1 ? Math.abs(available[0].amount) : null, direction });
+    }
     output.push({
       row_index: startIndex + output.length + 1,
       transaction_date: transactionDate,
@@ -302,7 +309,47 @@ function normalizeTableTransactions(table, fallbackYear, startIndex) {
       raw_payload: { rowNumber: startIndex + output.length + 1, source: "deterministic_anydoc_normalized", ...(amountIssue ? { amountValidationIssue: amountIssue } : {}) },
     });
   }
+  if (singleAmountColumn) resolveSingleAmountDirections(output, singleMeta);
   return output;
+}
+
+function applySingleAmount(row, direction, amount) {
+  row.debit_amount = direction === "debit" ? amount : null;
+  row.credit_amount = direction === "credit" ? amount : null;
+  row.category = direction === "credit" ? "receipt" : "payment";
+  row.confidence = 0.9;
+  if (row.raw_payload?.amountValidationIssue) delete row.raw_payload.amountValidationIssue;
+}
+
+function resolveSingleAmountDirections(output, metas) {
+  const unresolved = [];
+  output.forEach((row, index) => {
+    const meta = metas[index];
+    const previous = index > 0 ? output[index - 1].balance_amount : null;
+    const balance = row.balance_amount;
+    if (previous !== null && balance !== null && previous !== undefined) {
+      const delta = Math.round((balance - previous) * 100) / 100;
+      const moved = Math.abs(delta);
+      if (moved > 0 && (meta.amount === null || Math.abs(meta.amount - moved) <= 0.01)) {
+        applySingleAmount(row, delta > 0 ? "credit" : "debit", moved);
+        row.raw_payload.directionSource = "balance_movement";
+        return;
+      }
+      if (moved > 0) return; // amount disagrees with the balance: leave for validation
+    }
+    unresolved.push(index);
+  });
+  if (!unresolved.length) return;
+  const credits = output.filter((row) => row.raw_payload?.directionSource === "balance_movement" && row.credit_amount).length;
+  const debits = output.filter((row) => row.raw_payload?.directionSource === "balance_movement" && row.debit_amount).length;
+  for (const index of unresolved) {
+    const meta = metas[index];
+    if (meta.amount === null) continue;
+    const direction = meta.direction || (credits >= debits ? "credit" : "debit");
+    applySingleAmount(output[index], direction, meta.amount);
+    output[index].raw_payload.directionSource = meta.direction ? "description" : "majority_of_statement";
+    if (!meta.direction) output[index].confidence = 0.7;
+  }
 }
 
 export function deterministicTransactionsFromAnydoc(markdown) {

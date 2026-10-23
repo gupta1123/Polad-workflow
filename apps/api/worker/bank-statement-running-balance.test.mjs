@@ -74,3 +74,18 @@ test("reports manual review when neither order reconciles", () => {
   assert.equal(validation.valid, false);
   assert.ok(validation.breaks.length > 0);
 });
+
+test("a pure balance sign flip is repaired and flagged", async () => {
+  const { correctBalanceSignFlips } = await import("./bank-statement-running-balance.mjs");
+  const rows = [
+    { debit_amount: null, credit_amount: 100, balance_amount: 1100 },
+    { debit_amount: 50, credit_amount: null, balance_amount: -1050 },
+    { debit_amount: null, credit_amount: 25, balance_amount: 1075 },
+  ];
+  const fixed = correctBalanceSignFlips(rows, 1000);
+  assert.equal(fixed.repairedCount, 1);
+  assert.equal(fixed.transactions[1].balance_amount, 1050);
+  assert.ok(fixed.transactions[1].raw_payload.balanceSignCorrection);
+  const wrong = correctBalanceSignFlips([{ debit_amount: 50, credit_amount: null, balance_amount: -900 }], 1000);
+  assert.equal(wrong.repairedCount, 0);
+});

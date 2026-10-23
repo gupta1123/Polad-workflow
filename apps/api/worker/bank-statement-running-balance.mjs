@@ -133,3 +133,36 @@ export function correctRowsFromRunningBalance(
   }
   return corrected;
 }
+
+// An extractor can read "111854768.56 CR" as a negative balance. When the
+// magnitude is exactly what the debit/credit movement predicts and only the sign
+// is wrong, the row is repaired and flagged instead of failing the statement.
+export function correctBalanceSignFlips(transactions, openingBalance = null) {
+  const analysis = analyzeRunningBalanceOrder(transactions, openingBalance);
+  if (analysis.orientation === "unknown") return { transactions, repairedCount: 0 };
+  const indexes = transactions.map((_transaction, index) => index);
+  if (analysis.orientation === "reverse") indexes.reverse();
+  const corrected = [...transactions];
+  let previousBalance = toMoneyNumber(openingBalance);
+  let repairedCount = 0;
+  for (const index of indexes) {
+    const transaction = transactions[index];
+    let balance = toMoneyNumber(transaction.balance_amount);
+    const debit = positiveMoney(transaction.debit_amount);
+    const credit = positiveMoney(transaction.credit_amount);
+    if (previousBalance !== null && balance !== null && balance < 0 && (debit > 0 || credit > 0)) {
+      const expected = roundMoney(previousBalance - debit + credit);
+      if (!sameMoney(expected, balance) && sameMoney(expected, -balance)) {
+        corrected[index] = {
+          ...transaction,
+          balance_amount: -balance,
+          raw_payload: { ...(transaction.raw_payload ?? {}), balanceSignCorrection: { originalBalanceAmount: balance, previousBalance } },
+        };
+        balance = -balance;
+        repairedCount += 1;
+      }
+    }
+    if (balance !== null) previousBalance = balance;
+  }
+  return { transactions: corrected, repairedCount };
+}

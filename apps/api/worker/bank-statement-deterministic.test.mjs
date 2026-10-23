@@ -100,3 +100,21 @@ test("accepts a valid HDFC timestamp contaminated by a repeated bank footer", ()
   assert.equal(rows[0].transaction_date, "2026-09-02");
   assert.equal(rows[0].credit_amount, 1131857);
 });
+
+test("single unlabeled amount column takes direction from the balance movement", () => {
+  const md = [
+    "|Tran Date|Transaction Particulars||Available Balance|",
+    "|---|---|---|---|",
+    "|Value Date||||",
+    "|22/10/2026 22/10/2026|IMPS/P2A/1/PAYER|75000.00|1075000.00 CR|",
+    "|22/10/2026 22/10/2026|TO DR SOMEONE||1066000.00 CR|",
+    "|22/10/2026 22/10/2026|NEFT:ANIL TRADERS|204000.00|1270000.00 CR|",
+    "**Cheque No. Withdrawal Deposit**",
+  ].join("\n");
+  const rows = deterministicTransactionsFromAnydoc(md).transactions;
+  assert.equal(rows.length, 3);
+  assert.equal(rows[0].credit_amount, 75000);
+  assert.equal(rows[1].debit_amount, 9000);
+  assert.equal(rows[2].credit_amount, 204000);
+  assert.equal(rows[2].balance_amount, 1270000);
+});
