@@ -7,7 +7,7 @@ const source = await readFile(new URL("./bank-statement-posting-readiness.ts", i
 const code = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText;
-const { isReadyForTallyPosting } = await import("data:text/javascript;base64," + Buffer.from(code).toString("base64"));
+const { isReadyForTallyPosting, hasUsableBillAllocation } = await import("data:text/javascript;base64," + Buffer.from(code).toString("base64"));
 const ready = (overrides = {}) => ({
   ledgerName: "Customer A", ledgerNeedsReview: false,
   presence: { status: "missing" }, billRequired: false, amount: 20000,
@@ -20,7 +20,7 @@ const allocation = (overrides = {}) => ({
   ...overrides,
 });
 
-test("mixed 30-row batch posts 25 ready rows and retains 5 blocked rows", () => {
+test("bill-review rows post directly, so only rows with a ledger problem are held (27 of 30)", () => {
   const rows = Array.from({ length: 30 }, (_, id) => ({ id, ...ready() }));
   for (const id of [0, 1]) Object.assign(rows[id], {
     billRequired: true,
@@ -28,8 +28,8 @@ test("mixed 30-row batch posts 25 ready rows and retains 5 blocked rows", () => 
   });
   for (const id of [27, 28, 29]) rows[id].ledgerName = "";
   const selected = rows.filter(isReadyForTallyPosting);
-  assert.equal(selected.length, 25);
-  assert.deepEqual(selected.map((row) => row.id), Array.from({ length: 25 }, (_, i) => i + 2));
+  assert.equal(selected.length, 27);
+  assert.deepEqual(selected.map((row) => row.id), Array.from({ length: 27 }, (_, i) => i));
   assert.equal(rows.length, 30, "filtering must not discard held rows from the statement");
 });
 
@@ -51,13 +51,12 @@ test("direct posting permits unchecked normal, party and Suspense vouchers witho
   }
 });
 
-test("direct posting never bypasses known duplicates, failed checks or allocation review", () => {
+test("direct posting never bypasses known duplicates or failed checks", () => {
   for (const status of ["checking", "failed", "found", "ambiguous"]) {
     assert.equal(isReadyForTallyPosting(ready({ directPosting: true, presence: { status } })), false);
   }
   for (const overrides of [
     { ledgerName: "" }, { ledgerNeedsReview: true }, { amount: 0 }, { amount: NaN },
-    { allocation: allocation() }, { allocation: allocation({status: "stale_data"}) },
     { presence: {status: "missing", duplicateInTally: true} },
   ]) assert.equal(isReadyForTallyPosting(ready({directPosting: true, ...overrides})), false);
 });
@@ -139,8 +138,7 @@ test("close-match Suspense and plain Suspense have distinct labels and colors", 
   assert.match(page, /return "bg-amber-500"/);
 });
 
-test("bill-wise rows require a completed, balanced reviewed allocation", () => {
-  assert.equal(isReadyForTallyPosting(ready({ billRequired: true })), false);
+test("an incomplete, stale or unbalanced bill allocation never blocks posting but is not used", () => {
   for (const overrides of [
     { status: "stale_data" }, { status: "needs_review" },
     { requiresUserReview: true }, { isEligibleForPosting: false },
@@ -149,8 +147,20 @@ test("bill-wise rows require a completed, balanced reviewed allocation", () => {
     { allocations: [{ referenceName: "INV-1", allocatedAmount: 19000 }] },
     { allocations: [{ referenceName: "", allocatedAmount: 20000 }] },
     { allocations: [{ referenceName: "INV-1", allocatedAmount: NaN }] },
-  ]) assert.equal(isReadyForTallyPosting(ready({ billRequired: true, allocation: allocation(overrides) })), false);
-  assert.equal(isReadyForTallyPosting(ready({ billRequired: true, allocation: allocation() })), true);
+  ]) {
+    const row = ready({ billRequired: true, allocation: allocation(overrides) });
+    assert.equal(isReadyForTallyPosting(row), true, "row still posts");
+    assert.equal(hasUsableBillAllocation(row.allocation, row.amount), false, "allocation is not applied");
+  }
+  assert.equal(isReadyForTallyPosting(ready({ billRequired: true })), true);
+  assert.equal(hasUsableBillAllocation(allocation(), 20000), true);
+  assert.equal(hasUsableBillAllocation(undefined, 20000), false);
+});
+
+test("after Check Tally a row must still be found missing, so a failed check does not post", () => {
+  for (const status of [undefined, "failed", "ambiguous", "found"]) {
+    assert.equal(isReadyForTallyPosting(ready({ billRequired: true, presence: status ? { status } : undefined })), false);
+  }
 });
 
 test("reviewed advances and split allocations remain eligible", () => {
@@ -185,10 +195,12 @@ test("UI and submission use ready scopes, with no unresolved advance fallback", 
   assert.match(page, /need review/);
   assert.doesNotMatch(page, /Direct vouchers · No bill allocation or Advance/);
   assert.match(page, /const directPosting = !billMatchingRequested/);
-  assert.match(page, /async function matchPendingBills\(\) \{\s*if \(!postWithoutAllocation\) setBillMatchingRequested\(true\)/);
-  assert.match(page, /!directPosting && billAllocation\?\.status === "ready_to_post"/);
-  assert.equal((page.match(/setBillMatchingRequested\(false\)/g) || []).length, 3,
-    "only clearing or loading a statement, or switching on post-without-allocation, resets direct mode; failed checks must not reset it");
+  assert.match(page, /async function matchPendingBills\(\) \{\s*setBillMatchingRequested\(true\)/);
+  assert.doesNotMatch(page, /postWithoutAllocation/);
+  assert.match(page, /hasUsableBillAllocation\(billAllocation, transactionAmount\(reviewedTransaction\)\)/);
+  assert.match(page, /directPosting: postingBillAllocations\.length === 0/);
+  assert.equal((page.match(/setBillMatchingRequested\(false\)/g) || []).length, 2,
+    "only clearing or loading a statement resets direct mode; failed checks must not reset it");
 });
 
 test("missing and failed bill buckets never become empty-ledger Advance candidates", async () => {

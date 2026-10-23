@@ -40,7 +40,7 @@ import { buildStatementBankBook, savedPostingOutcome, savedPostingPresence, stat
 import { isPreviewExtractionIncomplete } from "@/lib/bank-statement-extraction-state";
 import { createPdfPreviewRequestGate, pdfPreviewNotice } from "@/lib/pdf-preview-state";
 import { allocateReceiptByFifo, applyFifoAllocationsToBills } from "@/lib/bank-statement-bill-allocation";
-import { isReadyForTallyPosting } from "@/lib/bank-statement-posting-readiness";
+import { hasUsableBillAllocation, isReadyForTallyPosting } from "@/lib/bank-statement-posting-readiness";
 import { runCashDiscountLiveRequest } from "@/lib/cash-discount-live";
 import { readPreferredTallyConnectionId } from "@/lib/tally-company-selection";
 import { pdfToImagePages } from "@/services/pdf";
@@ -3396,23 +3396,6 @@ export function BankStatementsPage() {
   // Unlike tallyCheckAttempted, this remains true after a failed/stale check.
   // A failed review must never silently switch the statement to direct posting.
   const [billMatchingRequested, setBillMatchingRequested] = useState(false);
-  // Some clients post payments and receipts straight to the party ledger and
-  // never allocate bills. With this on, Check Tally still runs the duplicate
-  // check but never switches the statement into bill-matching mode.
-  const [postWithoutAllocation, setPostWithoutAllocation] = useState(false);
-  useEffect(() => {
-    try {
-      if (window.localStorage.getItem("polaad:bank-statements:post-without-allocation") === "1") setPostWithoutAllocation(true);
-    } catch { /* storage can be unavailable */ }
-  }, []);
-  function changePostWithoutAllocation(next: boolean) {
-    setPostWithoutAllocation(next);
-    try { window.localStorage.setItem("polaad:bank-statements:post-without-allocation", next ? "1" : "0"); } catch { /* ignore */ }
-    if (next) {
-      setBillMatchingRequested(false);
-      setBillAllocationsByTransactionId({});
-    }
-  }
   const [syncingMasters, setSyncingMasters] = useState(false);
   const [loadingBankLedgers, setLoadingBankLedgers] = useState(false);
   const [refreshingConnections, setRefreshingConnections] = useState(false);
@@ -6340,7 +6323,7 @@ export function BankStatementsPage() {
   }
 
   async function matchPendingBills() {
-    if (!postWithoutAllocation) setBillMatchingRequested(true);
+    setBillMatchingRequested(true);
     if (previewExtractionIncomplete) {
       const unresolvedPages = preview?.extractionDiagnostics?.unresolvedPages ?? [];
       showToast(
@@ -6369,7 +6352,7 @@ export function BankStatementsPage() {
     try {
       setMatchingBills(true);
       setBanner({ tone: "info", text: "Checking the full statement against live Tally vouchers..." });
-      const billEligibleTransactionIds = postWithoutAllocation ? [] : pendingBillEligibleTransactions.map((transaction) => transaction.id);
+      const billEligibleTransactionIds = pendingBillEligibleTransactions.map((transaction) => transaction.id);
       const asOfDate = pendingBillEligibleTransactions
         .map(getEffectiveTransactionDate)
         .filter(Boolean)
@@ -6386,7 +6369,7 @@ export function BankStatementsPage() {
         billEligibleTransactionIds,
         asOfDate,
       });
-      const receiptTransactionsToMatch = postWithoutAllocation ? [] : pendingBillEligibleTransactions.filter(
+      const receiptTransactionsToMatch = pendingBillEligibleTransactions.filter(
         (transaction) => presenceDrafts[transaction.id]?.status === "missing"
       );
       const nextDrafts: Record<string, BillAllocationDraft> = {};
@@ -6472,34 +6455,35 @@ export function BankStatementsPage() {
       const missingOutgoingRows = validTransactions.filter(
         (transaction) => isOutgoingPaymentRow(transaction) && presenceDrafts[transaction.id]?.status === "missing"
       ).length;
-      const outgoingBillReviews = postWithoutAllocation ? 0 : validTransactions.filter((transaction) => {
+      const outgoingBillReviews = validTransactions.filter((transaction) => {
         if (!isOutgoingPaymentRow(transaction) || presenceDrafts[transaction.id]?.status !== "missing") return false;
         if (!isBillMatchEligibleTransaction(transaction, ledgerMasters)) return false;
         const draft = nextDrafts[transaction.id];
         return !draft || draft.requiresUserReview || !draft.isEligibleForPosting;
       }).length;
-      const incomingBillReviews = postWithoutAllocation ? 0 : validTransactions.filter((transaction) => {
+      const incomingBillReviews = validTransactions.filter((transaction) => {
         if (!isIncomingReceiptRow(transaction) || presenceDrafts[transaction.id]?.status !== "missing") return false;
         if (!isBillMatchEligibleTransaction(transaction, ledgerMasters)) return false;
         const draft = nextDrafts[transaction.id];
         return !draft || draft.requiresUserReview || !draft.isEligibleForPosting;
       }).length;
-      const readyIncomingRows = Math.max(0, missingReceiptRows - incomingBillReviews);
-      const readyOutgoingRows = Math.max(0, missingOutgoingRows - outgoingBillReviews);
+      // Bill allocation never blocks posting: rows without a complete allocation
+      // are posted straight to the party ledger, so every missing row is ready.
+      const readyIncomingRows = missingReceiptRows;
+      const readyOutgoingRows = missingOutgoingRows;
+      const directBillRows = incomingBillReviews + outgoingBillReviews;
       const uncheckedRows = validTransactions.length - foundCount - ambiguousCount - missingReceiptRows - missingOutgoingRows;
       const hasRowReviewIssues =
         duplicateCount > 0 ||
         ambiguousCount > 0 ||
-        uncheckedRows > 0 || incomingBillReviews > 0 || outgoingBillReviews > 0;
+        uncheckedRows > 0;
       setBanner({
         tone: hasRowReviewIssues ? "info" : "success",
         text: `Statement checked. ${readyIncomingRows > 0
           ? `${readyIncomingRows} receipt${readyIncomingRows === 1 ? " is" : "s are"} ready to post.`
           : "No new receipts to post."} ${readyOutgoingRows > 0
             ? `${readyOutgoingRows} outgoing payment${readyOutgoingRows === 1 ? " is" : "s are"} ready to post.`
-            : missingOutgoingRows > 0
-              ? `${missingOutgoingRows} outgoing payment${missingOutgoingRows === 1 ? " needs" : "s need"} review.`
-              : "No new outgoing payments to post."}${incomingBillReviews > 0 ? ` ${incomingBillReviews} receipt${incomingBillReviews === 1 ? " needs" : "s need"} bill review.` : ""}${hasRowReviewIssues ? " Review the highlighted rows." : ""}${
+            : "No new outgoing payments to post."}${directBillRows > 0 ? ` ${directBillRows} row${directBillRows === 1 ? " has" : "s have"} no complete bill allocation and will post straight to the party ledger.` : ""}${hasRowReviewIssues ? " Review the highlighted rows." : ""}${
             balanceProof?.balancesMatch === false
               ? " Balance differs from Tally, but this does not block posting."
               : ""
@@ -6580,15 +6564,19 @@ export function BankStatementsPage() {
       showToast("error", "The selected Tally connection is not live. Refresh it and try again.");
       return;
     }
+    const transactionAmount = (transaction: ReviewTransaction) =>
+      Math.max(parseNumber(transaction.creditAmount) ?? 0, parseNumber(transaction.debitAmount) ?? 0);
     const billEligibleTransactions = selectedTallyWorkTransactions.filter((transaction) => {
-      if (directPosting) return false;
       const draft = billAllocationsByTransactionId[transaction.id];
       return (
         isBillMatchEligibleTransaction(transaction, ledgerMasters) &&
-        draft?.status === "ready_to_post" &&
+        hasUsableBillAllocation(draft, transactionAmount(transaction)) &&
         draft.allocations.some((allocation) => allocation.referenceType === "Agst Ref")
       );
     });
+    // Rows whose bill allocation cannot be trusted at post time. They are not
+    // held back: they post straight to the party ledger without bill references.
+    const directFallbackIds = new Set<string>();
     // Open bills are financial authorization, not display cache. Re-read them
     // immediately before queueing so a receipt or allocation entered directly
     // in Tally cannot make a two-minute-old draft over-allocate a bill.
@@ -6620,6 +6608,9 @@ export function BankStatementsPage() {
           return reason ? [{ transaction, reason }] : [];
         });
         if (staleAllocations.length > 0) {
+          // Bills changed in Tally since the check. Do not over-allocate and do
+          // not stop the post: these rows go out without bill references.
+          for (const { transaction } of staleAllocations) directFallbackIds.add(transaction.id);
           setBillAllocationsByTransactionId((current) => {
             const next = { ...current };
             for (const { transaction, reason } of staleAllocations) {
@@ -6636,26 +6627,12 @@ export function BankStatementsPage() {
             }
             return next;
           });
-          setOutgoingVerificationsByTransactionId({});
-          setTallyPresenceByTransactionId({});
-          setTallyBalanceProof(null);
-          setTallyCheckAttempted(false);
-          setBanner({
-            tone: "error",
-            text: `Tally bill data changed for ${staleAllocations.length} row(s). Check Tally matches again before posting.`,
-          });
-          showToast("error", staleAllocations[0].reason);
-          return;
+          showToast("info", `Tally bills changed for ${staleAllocations.length} row${staleAllocations.length === 1 ? "" : "s"}; posting ${staleAllocations.length === 1 ? "it" : "them"} without bill allocation.`);
         }
-      } catch (error) {
-        setTallyCheckAttempted(false);
-        setBanner({
-          tone: "error",
-          text: error instanceof Error
-            ? `Could not revalidate live Tally bills: ${error.message}`
-            : "Could not revalidate live Tally bills. Check Tally matches again.",
-        });
-        return;
+      } catch {
+        // Could not re-read open bills: never apply the old allocations, post directly.
+        for (const transaction of billEligibleTransactions) directFallbackIds.add(transaction.id);
+        showToast("info", "Could not refresh Tally bills; posting these rows without bill allocation.");
       }
     }
     try {
@@ -6799,7 +6776,10 @@ export function BankStatementsPage() {
               const billAllocation = reviewedTransaction
                 ? billAllocationsByTransactionId[reviewedTransaction.id]
                 : null;
-              const reviewedBillAllocations = !directPosting && billAllocation?.status === "ready_to_post"
+              const reviewedBillAllocations = reviewedTransaction &&
+                !directFallbackIds.has(reviewedTransaction.id) &&
+                billAllocation &&
+                hasUsableBillAllocation(billAllocation, transactionAmount(reviewedTransaction))
                 ? billAllocation.allocations
                 : [];
               const postingBillAllocations = reviewedBillAllocations.length > 0
@@ -6814,11 +6794,11 @@ export function BankStatementsPage() {
                 ledgerSelectionConfirmed: reviewedTransaction?.ledgerSelectionTouched === true,
                 createLedgerName: "",
                 createLedgerParentName: "",
-                directPosting,
-                billMatchingVerified:
-                  !reviewedTransaction ||
-                  !isBillMatchEligibleTransaction(reviewedTransaction, ledgerMasters) ||
-                  postingBillAllocations.length > 0,
+                // A row posts either with a complete bill allocation or straight
+                // to the party ledger; the connector's duplicate preflight runs
+                // for both.
+                directPosting: postingBillAllocations.length === 0,
+                billMatchingVerified: true,
                 duplicateCheckVerified:
                   reviewedTransaction != null &&
                   tallyPresenceByTransactionId[reviewedTransaction.id]?.status === "missing",
@@ -9159,7 +9139,7 @@ export function BankStatementsPage() {
                   </span>
                 ) : null}
               </div>
-              <div className="truncate text-[10px] font-medium text-slate-500" title={directPosting ? "Direct vouchers. Duplicate checks run before posting; bill allocation is optional." : undefined}>
+              <div className="truncate text-[10px] font-medium text-slate-500" title="Duplicate checks run before posting. Rows without a complete bill allocation post straight to the party ledger.">
                 {footerSecondaryStatus}
               </div>
               {!statementCompletedCleanly && tallyPostingStatus ? (
@@ -9241,18 +9221,6 @@ export function BankStatementsPage() {
               ) : null}
               {!statementDoneSummary ? (
                 <>
-                  <label
-                    className="flex h-8 cursor-pointer items-center gap-1.5 rounded-lg border border-[#ddd3c5] bg-white px-2 text-[10px] font-bold text-[#5a5046]"
-                    title="Post straight to the party ledger without bill allocation. Duplicate checks still run."
-                  >
-                    <input
-                      type="checkbox"
-                      checked={postWithoutAllocation}
-                      disabled={sending || matchingBills || tallyPostingInProgress}
-                      onChange={(event) => changePostWithoutAllocation(event.target.checked)}
-                    />
-                    Post without bill allocation
-                  </label>
                   <Button
                     className="h-8 flex-1 rounded-lg border-[#ddd3c5] bg-white px-3 text-[10px] font-bold text-[#5a5046] shadow-sm transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a] sm:flex-none"
                     onClick={matchPendingBills}
