@@ -126,11 +126,15 @@ const HEADER_PATTERNS = [
   ["txn no.", "txn_no"], ["txn no", "txn_no"], ["transaction no.", "txn_no"], ["transaction no", "txn_no"],
   ["debit amount", "debit"], ["dr amount", "debit"], ["debit (inr)", "debit"], ["withdrawal", "debit"], ["paid out", "debit"], ["debit", "debit"],
   ["credit amount", "credit"], ["cr amount", "credit"], ["credit (inr)", "credit"], ["deposit", "credit"], ["paid in", "credit"], ["credit", "credit"],
+  ["to/by", "toby"], ["to / by", "toby"], ["vch type", "vchtype"], ["voucher type", "vchtype"],
+  ["vch no.", "txn_no"], ["vch no", "txn_no"], ["voucher no.", "txn_no"], ["voucher no", "txn_no"],
+  ["amount (inr)", "amount"], ["amount", "amount"],
+  ["debit/credit", "drcr"], ["debit / credit", "drcr"], ["dr/cr", "drcr"], ["cr/dr", "drcr"], ["dr / cr", "drcr"],
   ["available balance", "balance"], ["closing balance", "balance"], ["balance (inr)", "balance"], ["balance", "balance"],
 ];
 
 function headerPart(value) {
-  const raw = String(value ?? "").replace(/\s+/g, " ").trim();
+  const raw = String(value ?? "").replace(/(\S)\(/g, "$1 (").replace(/\s+/g, " ").trim();
   const lower = raw.toLowerCase();
   // Some PDF converters collapse adjacent withdrawal/deposit columns into one
   // generic amount column. Preserve that ambiguity here and infer direction
@@ -160,8 +164,14 @@ function inferStatementYear(markdown) {
   return dated?.[1] || null;
 }
 
+function signedAmountText(value) {
+  // Some banks print a negative balance as "-,20,19,31,323.90"; the sign and
+  // the first digit group are separated by a stray comma.
+  return String(value ?? "").replace(/(^|[\s(])-,(?=\d)/g, "$1-");
+}
+
 function strictAmount(value) {
-  const raw = String(value ?? "").replace(/\.\s+(?=\d)/g, ".").replace(/(?<=\d)\s+(?=\d)/g, "").trim();
+  const raw = signedAmountText(value).replace(/\.\s+(?=\d)/g, ".").replace(/(?<=\d)\s+(?=\d)/g, "").trim();
   if (!raw || raw === "-") return null;
   const matches = raw.match(/(?:\(?-?[₹$€£]?\s*\d[\d,]*(?:\.\d+)?\)?\s*(?:DR|CR)?\.?)/gi) || [];
   if (matches.length !== 1) return null;
@@ -169,7 +179,7 @@ function strictAmount(value) {
 }
 
 function cellAmounts(value) {
-  const raw = String(value ?? "").replace(/\.\s+(?=\d)/g, ".").replace(/(?<=\d)\s+(?=\d)/g, "").trim();
+  const raw = signedAmountText(value).replace(/\.\s+(?=\d)/g, ".").replace(/(?<=\d)\s+(?=\d)/g, "").trim();
   if (!raw || raw === "-") return [];
   return (raw.match(/\(?-?[₹$€£]?\s*\d[\d,]*(?:\.\d+)?\)?\s*(?:DR|CR)?\.?/gi) || [])
     .map(parseAmountValue)
@@ -204,12 +214,12 @@ function normalizedTableSource(table) {
 function semanticIndexes(headers) {
   const kinds = headers.map((header) => {
     const text = String(header || "").toLowerCase().trim();
-    return ["date", "value_date", "description", "reference", "txn_no", "debit", "credit", "amount", "balance"].includes(text)
+    return ["date", "value_date", "description", "reference", "txn_no", "debit", "credit", "amount", "drcr", "toby", "vchtype", "balance"].includes(text)
       ? text
       : headerPart(header).kind;
   });
   const first = (kind) => kinds.indexOf(kind);
-  return { kinds, date: first("date") >= 0 ? first("date") : first("value_date"), valueDate: first("value_date"), description: first("description"), reference: first("reference"), txnNo: first("txn_no"), debit: first("debit"), credit: first("credit"), balance: first("balance") };
+  return { kinds, date: first("date") >= 0 ? first("date") : first("value_date"), valueDate: first("value_date"), description: first("description"), reference: first("reference"), txnNo: first("txn_no"), debit: first("debit"), credit: first("credit"), amount: first("amount"), drcr: first("drcr"), toBy: first("toby"), vchType: first("vchtype"), balance: first("balance") };
 }
 
 function nearestAmount(row, index, excluded) {
@@ -223,6 +233,27 @@ function nearestAmount(row, index, excluded) {
   return null;
 }
 
+// A converter can fuse the "TRANSACTION TOTAL DR/CR" line into the last
+// transaction row. Keep the transaction's own text and first amount only.
+function stripFusedTotals(row) {
+  if (!row.some((cell) => /transaction total/i.test(String(cell)))) return row;
+  return row.map((cell) => {
+    const text = String(cell ?? "");
+    const marker = text.search(/\s*transaction total/i);
+    if (marker >= 0) return text.slice(0, marker).trim();
+    const amounts = text.match(/\d[\d,]*\.\d{2}/g) || [];
+    return amounts.length > 1 ? amounts[0] : text;
+  });
+}
+
+function bookDirection(row, indexes) {
+  const voucherType = indexes.vchType >= 0 ? String(row[indexes.vchType] ?? "") : "";
+  const toBy = indexes.toBy >= 0 ? String(row[indexes.toBy] ?? "").trim() : "";
+  if (/\b(?:receipt|rcpt)\b/i.test(voucherType) || /^to$/i.test(toBy)) return "credit";
+  if (/\b(?:payment|pymt)\b/i.test(voucherType) || /^by$/i.test(toBy)) return "debit";
+  return null;
+}
+
 function normalizeTableTransactions(table, fallbackYear, startIndex, carriedBalance = null) {
   const source = normalizedTableSource(table);
   const indexes = semanticIndexes(source.headers);
@@ -231,9 +262,11 @@ function normalizeTableTransactions(table, fallbackYear, startIndex, carriedBala
   const output = [];
   // Layouts with a single unlabeled amount column (amount + "Available Balance
   // 123.00 CR") carry no debit/credit marker; the balance movement decides.
-  const singleAmountColumn = indexes.debit < 0 && indexes.credit < 0 && indexes.balance >= 0;
+  const flaggedAmountColumn = indexes.debit < 0 && indexes.credit < 0 && indexes.amount >= 0 && indexes.drcr >= 0;
+  const singleAmountColumn = indexes.debit < 0 && indexes.credit < 0 && indexes.balance >= 0 && !flaggedAmountColumn;
   const singleMeta = [];
-  for (const row of rows) {
+  for (const rawRow of rows) {
+    const row = stripFusedTotals(rawRow);
     const transactionDate = parseDateValue(row[indexes.date], fallbackYear);
     const description = String(row[indexes.description] || "").replace(/\s+/g, " ").trim();
     if (!transactionDate || !description || headerScore(row) >= 3) continue;
@@ -261,8 +294,28 @@ function normalizeTableTransactions(table, fallbackYear, startIndex, carriedBala
     const exactCredit = indexes.credit >= 0 ? transactionAmount(row[indexes.credit]) : null;
     let debitMatch = exactDebit !== null ? { amount: Math.abs(exactDebit), index: indexes.debit } : null;
     let creditMatch = exactCredit !== null ? { amount: Math.abs(exactCredit), index: indexes.credit } : null;
-    const available = row.map((cell, index) => ({ amount: transactionAmount(cell), index }))
+    // One "Amount" column plus a Dr/Cr flag column: the flag gives the direction.
+    if (flaggedAmountColumn && !debitMatch && !creditMatch) {
+      const amount = transactionAmount(row[indexes.amount]);
+      const flag = String(row[indexes.drcr] ?? "").trim();
+      if (amount !== null && /^(?:dr|debit|d)\b\.?$/i.test(flag)) debitMatch = { amount: Math.abs(amount), index: indexes.amount };
+      else if (amount !== null && /^(?:cr|credit|c)\b\.?$/i.test(flag)) creditMatch = { amount: Math.abs(amount), index: indexes.amount };
+    }
+    let available = row.map((cell, index) => ({ amount: transactionAmount(cell), index }))
       .filter((item) => item.amount !== null && !excluded.has(item.index));
+    // Tally-style bank books list Receipt/Payment (To/By) and put a voucher
+    // number next to the amount. The voucher type decides the direction and a
+    // decimal amount beats a bare integer.
+    const book = bookDirection(row, indexes);
+    if (book) {
+      const money = available.filter((item) => /\d\.\d{1,2}\b/.test(String(row[item.index])));
+      if (money.length > 0) available = money;
+      if (available.length > 0) {
+        const candidate = { amount: Math.abs(available[0].amount), index: available[0].index };
+        debitMatch = book === "debit" ? candidate : null;
+        creditMatch = book === "credit" ? candidate : null;
+      }
+    }
     const direction = directionFromDescription(description);
     if (!debitMatch && !creditMatch && available.length > 0) {
       if (direction) {
@@ -372,5 +425,8 @@ export function deterministicTransactionsFromAnydoc(markdown) {
   for (const table of rawTx) transactions.push(...normalizeTableTransactions(table, year, transactions.length, transactions.at(-1)?.balance_amount ?? null));
 
   if (transactions.length === 0) return null;
+  // A row with neither a debit nor a credit means the amount columns were not
+  // understood; let the caller fall back instead of publishing empty rows.
+  if (transactions.some((row) => row.raw_payload?.amountValidationIssue === "missing_debit_and_credit")) return null;
   return { headers: rawTx.flatMap((table) => table.headers), transactions };
 }

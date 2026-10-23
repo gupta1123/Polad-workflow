@@ -127,3 +127,35 @@ test("a page fused into one table row is rejected instead of published as one tr
   ].join("\n");
   assert.equal(deterministicTransactionsFromAnydoc(md), null);
 });
+
+test("Amount + Dr/Cr flag layout reads direction from the flag and signed Indian balances", () => {
+  const markdown = `|Tran Date|Particulars|Amount(INR)|Debit/Credit|Balance(INR)|
+|---|---|---|---|---|
+|11/08/2026|RTGS PAYMENT VENDOR|39,56,375.00|DR|-,20,22,31,323.90|
+|11/08/2026|TRF/CUSTOMER RECEIPT|3,50,000.00|CR|-,16,72,31,323.90|`;
+  const rows = deterministicTransactionsFromAnydoc(markdown).transactions;
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].debit_amount, 3956375);
+  assert.equal(rows[0].credit_amount, null);
+  assert.equal(rows[1].credit_amount, 350000);
+  assert.equal(rows[1].balance_amount, -167231323.9);
+});
+
+test("fused transaction-total text does not become part of the last row's amount", () => {
+  const markdown = `|Tran Date|Particulars|Amount(INR)|Debit/Credit|Balance(INR)|
+|---|---|---|---|---|
+|11/08/2026|TRF/CUSTOMER RECEIPT TRANSACTION TOTAL DR/CR|3,50,000.00 5,10,59,250.00/ 32,23,500.00|CR|1,00,000.00|`;
+  const rows = deterministicTransactionsFromAnydoc(markdown).transactions;
+  assert.equal(rows[0].credit_amount, 350000);
+});
+
+test("Tally bank-book To/By with Vch No keeps voucher numbers out of the amounts", () => {
+  const markdown = `|Date|Particulars|Vch Type|Vch No.|Debit|Credit|
+|---|---|---|---|---|---|
+|9-Oct-26|To Deccan Sponge and Minerals|Payment|5273|770.77||
+|9-Oct-26|To Bank Commission|Payment|5274|20.05||
+|9-Oct-26|By Arvind Industrial Components|Receipt|2742||473.59|`;
+  const rows = deterministicTransactionsFromAnydoc(markdown)?.transactions ?? [];
+  const bank = rows.find((row) => /Commission/.test(row.description));
+  assert.equal(bank.debit_amount ?? bank.credit_amount, 20.05);
+});

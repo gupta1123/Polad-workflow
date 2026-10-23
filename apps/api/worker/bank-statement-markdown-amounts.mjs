@@ -53,7 +53,8 @@ function columnIndex(headers, patterns) {
 }
 
 export function parseBankStatementMoney(value) {
-  const raw = cleanMarkdownCell(value);
+  // A negative balance can be printed as "-,20,19,31,323.90".
+  const raw = cleanMarkdownCell(value).replace(/(^|[\s(])-,(?=\d)/g, "$1-");
   if (!raw || /^(?:-|--|—|–|nil|n\/a)$/i.test(raw)) return null;
   const match = raw.match(/\(?\s*-?\s*(?:INR|Rs\.?|₹|\$|€|£)?\s*\d[\d,]*(?:\.\d+)?\s*(?:DR|CR)?\s*\)?/i);
   if (!match) return null;
