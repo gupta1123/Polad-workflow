@@ -159,3 +159,16 @@ test("Tally bank-book To/By with Vch No keeps voucher numbers out of the amounts
   const bank = rows.find((row) => /Commission/.test(row.description));
   assert.equal(bank.debit_amount ?? bank.credit_amount, 20.05);
 });
+
+test("a Tally bank-book totals block fused into the last voucher row is cut off", () => {
+  const markdown = `|Date|To/By|Particulars|Vch Type|Vch No.|Debit|Credit|
+|---|---|---|---|---|---|---|
+|2026-08-31|To|Customer A|Receipt|2418||319846.75|
+|2026-08-31|By To By|Suspense Total Opening Balance Closing Balance Grand Total|Payment|2497|224777.50 78661542.50 13619288.50 55100000.00 65042254.00 78661542.50 78661542.50||`;
+  const rows = deterministicTransactionsFromAnydoc(markdown).transactions;
+  assert.equal(rows.length, 2);
+  assert.equal(rows[1].description, "Suspense");
+  assert.equal(rows[1].debit_amount, 224777.5);
+  assert.equal(rows[1].credit_amount, null);
+  assert.equal(rows[1].reference_number, "2497");
+});

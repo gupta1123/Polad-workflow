@@ -235,12 +235,24 @@ function nearestAmount(row, index, excluded) {
 
 // A converter can fuse the "TRANSACTION TOTAL DR/CR" line into the last
 // transaction row. Keep the transaction's own text and first amount only.
+// The converter sometimes fuses the last transaction with the statement's totals
+// block ("... Total Opening Balance Closing Balance Grand Total" with every
+// total's amount in the amount cell). Keep only the transaction part.
+const TOTALS_MARKER = /\s*(?:transaction total|grand total|opening balance|closing balance|\btotal\b)/i;
+
+function hasFusedTotals(cell) {
+  const text = String(cell ?? "");
+  if (/transaction total/i.test(text)) return true;
+  const markers = text.match(/\b(?:grand total|opening balance|closing balance|total)\b/gi) || [];
+  return markers.length >= 2 && /(?:opening|closing) balance|grand total/i.test(text);
+}
+
 function stripFusedTotals(row) {
-  if (!row.some((cell) => /transaction total/i.test(String(cell)))) return row;
+  if (!row.some(hasFusedTotals)) return row;
   return row.map((cell) => {
     const text = String(cell ?? "");
-    const marker = text.search(/\s*transaction total/i);
-    if (marker >= 0) return text.slice(0, marker).trim();
+    const marker = hasFusedTotals(text) ? text.search(TOTALS_MARKER) : -1;
+    if (marker > 0) return text.slice(0, marker).trim();
     const amounts = text.match(/\d[\d,]*\.\d{2}/g) || [];
     return amounts.length > 1 ? amounts[0] : text;
   });
