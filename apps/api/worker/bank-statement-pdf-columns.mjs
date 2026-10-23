@@ -82,8 +82,8 @@ function detectCentralBankLayout(items, page) {
   const debit = header(items, "debit", "debit (inr)", "dr amount", "withdrawal", "withdrawal amt.", "paid out");
   const credit = header(items, "credit", "credit (inr)", "cr amount", "deposit", "deposit amt.", "paid in");
   const balance = header(items, "balance", "balance (inr)", "closing balance");
-  const reference = header(items, "bank reference", "reference", "reference no.", "utr", "chq./ref.no.", "chq/ref no");
-  const description = header(items, "transaction description", "description", "particular", "particulars", "narration", "details");
+  const reference = header(items, "bank reference", "reference", "reference no.", "utr", "chq./ref.no.", "chq/ref no", "reference / utr");
+  const description = header(items, "transaction description", "description", "particular", "particulars", "narration", "narration / description", "details");
   if (!postDate || !debit || !credit || !balance || !description) return null;
   const headerY = [postDate, debit, credit, balance, description].map((item) => item.y);
   if (Math.max(...headerY) - Math.min(...headerY) > 20) return null;
@@ -220,7 +220,7 @@ export function extractBankStatementPhysicalColumns(pages) {
       .map((item) => ({ text: normalizedText(item.str), x: item.transform[4], y: item.transform[5], width: item.width }));
     // Statement footers ("*Closing balance includes …") sit under the last row
     // and would otherwise be read as part of its narration.
-    const footerY = Math.max(-Infinity, ...allItems.filter((item) => /^(?:\*?closing balance includes|statement summary)/i.test(item.text)).map((item) => item.y));
+    const footerY = Math.max(-Infinity, ...allItems.filter((item) => /^(?:\*?closing balance includes|statement summary|transaction totals?)/i.test(item.text)).map((item) => item.y));
     const items = Number.isFinite(footerY) ? allItems.filter((item) => item.y > footerY + 2) : allItems;
     const detectedLayout = detectPnbLayout(items, page) || detectCentralBankLayout(items, page);
     if (detectedLayout) {

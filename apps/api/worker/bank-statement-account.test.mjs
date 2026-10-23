@@ -101,3 +101,39 @@ Branch Name: AURANGABAD IFSC Code: PUNB0098100
   assert.equal(result.bankName, "Punjab National Bank");
   assert.equal(result.accountNumber, "0981008700020850");
 });
+
+test("holder, IFSC and bank are recovered from the layouts real statements use", () => {
+  const cosmos = extractAccountFromBankStatementMarkdown(
+    "**BANK DETAILS** **IFSC :** COSB0000074 **MICR code :** 431164001 **Account Number :** 0746001037 **Account Holder Name :** BHAGYALAXMI ROLLING MILL PVT LTD **Account Type :** CASH CREDIT ACCOUNTS\n\n|Tran Date|Particulars|Withdrawal|Deposit|Available Balance|"
+  );
+  assert.deepEqual([cosmos.bankName, cosmos.accountNumber, cosmos.accountHolderName, cosmos.ifscCode],
+    ["Cosmos Co-operative Bank", "0746001037", "BHAGYALAXMI ROLLING MILL PVT LTD", "COSB0000074"]);
+
+  const axis = extractAccountFromBankStatementMarkdown(
+    "## Account Statement Report\n\n**BHAGYALAXMI ROLLING MILL PRIVATE LIMITED**\n\nJoint Holder :- F N -602, VERSOVA\n\nCustomer No : 839981865 IFSC Code : UTIB0000487\n\n**Statement of Axis Bank Account No : 922030016788974 for the period**"
+  );
+  assert.equal(axis.accountHolderName, "BHAGYALAXMI ROLLING MILL PRIVATE LIMITED");
+  assert.equal(axis.ifscCode, "UTIB0000487");
+
+  const central = extractAccountFromBankStatementMarkdown(
+    "Central Bank of India Branch Code :03863 IFSC Code :CBIN0283863 Account Number : 5417940923\n\n|Post Date|Value Date|Debit|Credit|Balance|\n|---|---|---|---|---|\n* Statement Downloaded By GAJKESARI STEELS AND ALLOYS PRIVATE on Wed Jul 29 17:18:39 IST 2026"
+  );
+  assert.equal(central.accountHolderName, "GAJKESARI STEELS AND ALLOYS PRIVATE");
+
+  const hdfc = extractAccountFromBankStatementMarkdown(
+    "M/S. NYX SOLUTION C/O R K PAPER PRODUCTS A23/3 MIDC AREA JALNA 431203 MAHARASHTRA JOINT HOLDERS :\n|Nomination : Registered Statement From : 01/04/2026|"
+  );
+  assert.equal(hdfc.accountHolderName, "NYX SOLUTION");
+
+  const kotak = extractAccountFromBankStatementMarkdown("Account No: 1234567890 IFSC: KKBK0001234");
+  assert.equal(kotak.bankName, "Kotak Mahindra Bank");
+});
+
+test("a table label next to IFSC is never taken as the code", () => {
+  const found = extractAccountFromBankStatementMarkdown(
+    "|BRANCH|IFSC|CURRENCY|OPENING BALANCE|\n|---|---|---|---|\n|Industrial Estate|HDFC0007000|INR|968,585.90|"
+  );
+  assert.equal(found.ifscCode, "HDFC0007000");
+  const label = extractAccountFromBankStatementMarkdown("|IFSC|CURRENCY|\n|---|---|\n|CURRENCY|INR|");
+  assert.equal(label.ifscCode, "");
+});

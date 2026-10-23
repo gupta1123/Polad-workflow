@@ -81,3 +81,14 @@ test('HDFC layout keeps wrapped narrations with their row and drops the page foo
   ['08/08/26','NEFT CR-ACME','AXISCN1',null,2999,282715.94],
  ]);
 });
+test('Narration/Description + Reference/UTR layout stops before the totals line',()=>{
+ const head=[item('Date',50,397,16),item('Narration / Description',118,397,78),item('Reference / UTR',391,397,56),item('Withdrawal',569,397,38),item('Deposit',669,397,26),item('Balance',764,397,28)];
+ const physical=extractBankStatementPhysicalColumns([{pageNumber:1,width:842,items:[
+  ...head,
+  item('12 Jul 2026',50,372,40),item('RTGS CR FRM VARDHN',118,372,120),item('HDFX260712901',391,372,59),item('-',605,373,2),item('118,000.00',658,373,38),item('1,086,585.90',748,373,44),
+  item('12 Jul 2026',50,348,40),item('ATM CASH WDL',118,348,59),item('MCB-ATM-909',391,348,116),item('10,000.00',574,349,33),item('-',693,349,2),item('1,076,585.90',748,349,44),
+  item('Transaction totals',118,324,66),item('85,826.00',574,325,33),item('310,250.00',658,325,38),
+ ]}]);
+ assert.deepEqual(physical.rows.map(r=>[r.narration,r.debitAmount,r.creditAmount,r.balanceAmount]),[
+  ['RTGS CR FRM VARDHN',null,118000,1086585.9],['ATM CASH WDL',10000,null,1076585.9]]);
+});

@@ -251,6 +251,16 @@ export async function processBankStatementMarkdownLocal(markdown, { pageCount = 
       normalized.transactions = transactionsFromPhysicalRows(physical.rows);
       pipeline = "physical_pdf_columns";
       balanceValidation = runningBalance.validateRunningBalanceContinuity(normalized.transactions, source.openingBalance);
+    } else if (physical.detected && physical.rows.length) {
+      // The converter garbled some rows, so the two sources disagree. The
+      // physical rows are adopted only when they pass the balance check alone.
+      const candidate = transactionsFromPhysicalRows(physical.rows);
+      const candidateValidation = runningBalance.validateRunningBalanceContinuity(candidate, source.openingBalance);
+      if (candidateValidation.status === "verified") {
+        normalized.transactions = candidate;
+        pipeline = "physical_pdf_columns";
+        balanceValidation = candidateValidation;
+      }
     }
   }
   if (balanceValidation.status === "failed") {

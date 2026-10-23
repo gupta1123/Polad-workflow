@@ -32,6 +32,11 @@ function isAccountFieldLabel(value) {
   return /^(account holder|account holder name|customer name|account name|bank name|bank|account number|account no|a c number|a c no|ifsc|ifsc code|statement account|bank account|account)$/.test(normalizeHeader(value));
 }
 
+function cleanIfsc(value) {
+  const compact = cleanText(value).toUpperCase().replace(/\s+/g, "");
+  return /^[A-Z]{4}0[A-Z0-9]{6}$/.test(compact) ? compact : "";
+}
+
 function cleanAccountNumber(value) {
   const compact = cleanText(value).replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
   return /\d/.test(compact) && compact.length >= 6 && compact.length <= 34 ? compact : "";
@@ -61,6 +66,31 @@ function headerMarkdown(markdown) {
   return lines.slice(0, transactionHeaderIndex >= 0 ? transactionHeaderIndex : Math.min(lines.length, 30)).join("\n");
 }
 
+const OTHER_IFSC_BANKS = {
+  KKBK: "Kotak Mahindra Bank", YESB: "Yes Bank", IDIB: "Indian Bank", UBIN: "Union Bank of India",
+  BKID: "Bank of India", MAHB: "Bank of Maharashtra", IBKL: "IDBI Bank", INDB: "IndusInd Bank",
+  FDRL: "Federal Bank", CNRB: "Canara Bank", UCBA: "UCO Bank", IOBA: "Indian Overseas Bank",
+  KARB: "Karnataka Bank", SIBL: "South Indian Bank", RATN: "RBL Bank", AUBL: "AU Small Finance Bank",
+  DCBL: "DCB Bank", CIUB: "City Union Bank", TMBL: "Tamilnad Mercantile Bank", JAKA: "Jammu & Kashmir Bank",
+  CSBK: "CSB Bank", SCBL: "Standard Chartered Bank", DBSS: "DBS Bank", HSBC: "HSBC",
+  MAHG: "Maharashtra Gramin Bank", SRCB: "Saraswat Co-operative Bank", JSBP: "Janata Sahakari Bank",
+  ABHY: "Abhyudaya Co-operative Bank", NKGS: "NKGSB Co-operative Bank", TJSB: "TJSB Sahakari Bank",
+  MSNU: "Mehsana Urban Co-operative Bank", BDBL: "Bandhan Bank", ESFB: "Equitas Small Finance Bank",
+  UJVN: "Ujjivan Small Finance Bank", PSIB: "Punjab & Sind Bank", KVBL: "Karur Vysya Bank",
+  GSCB: "Gujarat State Co-operative Bank", MSCI: "Maharashtra State Co-operative Bank",
+};
+
+const IFSC_BANK_NAMES = {
+  PUNB: "Punjab National Bank", CBIN: "Central Bank of India", SBIN: "State Bank of India",
+  BARB: "Bank of Baroda", ICIC: "ICICI Bank", HDFC: "HDFC Bank", UTIB: "Axis Bank",
+  COSB: "Cosmos Co-operative Bank", ...OTHER_IFSC_BANKS,
+};
+
+function ifscPrefixForBank(bankName) {
+  const name = cleanText(bankName).toLowerCase();
+  return Object.entries(IFSC_BANK_NAMES).find(([, bank]) => bank.toLowerCase() === name)?.[0] ?? "";
+}
+
 function bankNameFromHeader(markdown) {
   const header = plainMarkdownText(headerMarkdown(markdown));
   if (!header) return "";
@@ -77,6 +107,18 @@ function bankNameFromHeader(markdown) {
     [/\bHDFC Bank\b/i, "HDFC Bank"],
     [/\bAxis Bank\b/i, "Axis Bank"],
     [/\bCosmos Co-?operative Bank\b/i, "Cosmos Co-operative Bank"],
+    [/\bKotak Mahindra Bank\b/i, "Kotak Mahindra Bank"],
+    [/\bYes Bank\b/i, "Yes Bank"],
+    [/\bUnion Bank of India\b/i, "Union Bank of India"],
+    [/\bIndian Bank\b/i, "Indian Bank"],
+    [/\bBank of Maharashtra\b/i, "Bank of Maharashtra"],
+    [/\bIDBI Bank\b/i, "IDBI Bank"],
+    [/\bIndusInd Bank\b/i, "IndusInd Bank"],
+    [/\bFederal Bank\b/i, "Federal Bank"],
+    [/\bCanara Bank\b/i, "Canara Bank"],
+    [/\bUCO Bank\b/i, "UCO Bank"],
+    [/\bRBL Bank\b/i, "RBL Bank"],
+    [/\bBank of India\b/i, "Bank of India"],
   ];
   for (const [pattern, bankName] of knownBanks) {
     if (pattern.test(header)) return bankName;
@@ -92,12 +134,61 @@ function bankNameFromHeader(markdown) {
     HDFC: "HDFC Bank",
     UTIB: "Axis Bank",
     COSB: "Cosmos Co-operative Bank",
+    ...OTHER_IFSC_BANKS,
   };
   if (ifsc && bankByIfscPrefix[ifsc.slice(0, 4)]) return bankByIfscPrefix[ifsc.slice(0, 4)];
 
   // Some HDFC exports render the logo as an image and expose the bank's name
   // only in the legal footer after the transaction table.
   if (/\bHDFC BANK LIMITED\b/i.test(plainMarkdownText(markdown))) return "HDFC Bank";
+  return "";
+}
+
+const HOLDER_STOP = String.raw`(?=\s+(?:statement ledger|account|a\/c|customer|cust|ifsc|currency|statement|page|branch|joint|nomination|address|mobile|email|pan|city|date)\b|$)`;
+
+function plausibleHolder(value) {
+  const name = cleanText(value).replace(/^[:\-\s]+|[:\-\s]+$/g, "");
+  if (name.length < 3 || name.length > 80 || !/[A-Za-z]{3}/.test(name)) return "";
+  if (/\d{5,}/.test(name) || /^(?:account|statement|page|date|name|n\/a|nil|none)\b/i.test(name)) return "";
+  return name;
+}
+
+function holderFromText(text) {
+  const patterns = [
+    new RegExp(String.raw`account holder(?: name)?s?\s*[:\-]?\s*(.+?)${HOLDER_STOP}`, "i"),
+    new RegExp(String.raw`(?:customer|account) name\s*[:\-]?\s*(.+?)${HOLDER_STOP}`, "i"),
+    /account statement\s+([A-Za-z][A-Za-z0-9 .&'-]{2,60}?)\s+a\/c\b/i,
+    /joint holders?\s*:\s*(?=\S)(?!nomination|statement)(.+?)(?=\s+(?:c\/o|nomination|statement from|a\d)\b|$)/i,
+    /\bM\/S\.?\s+([A-Za-z][A-Za-z0-9 .&'-]{2,60}?)\s+c\/o\b/i,
+  ];
+  for (const pattern of patterns) {
+    const name = plausibleHolder(text.match(pattern)?.[1]);
+    if (name) return name;
+  }
+  return "";
+}
+
+function holderFromLayouts(lines) {
+  // A bold name printed on its own line right above a "Joint Holder" line.
+  for (let index = 1; index < lines.length; index += 1) {
+    if (!/^\s*joint holder/i.test(plainMarkdownText(lines[index]))) continue;
+    for (let back = index - 1; back >= 0 && back >= index - 3; back -= 1) {
+      const name = plausibleHolder(plainMarkdownText(lines[back]));
+      if (name) return name;
+    }
+  }
+  // A two-column header table whose first column carries the holder's name
+  // across wrapped rows, ending at an ADDRESS row.
+  const rows = lines.map(markdownCells).filter((cells) => cells.length >= 2);
+  const addressRow = rows.findIndex((cells) => /^address$/i.test(cells[0]));
+  if (addressRow > 0) {
+    const parts = [];
+    for (let i = addressRow - 1; i >= 0 && parts.length < 4; i -= 1) {
+      if (/^:?-{3,}:?$/.test(rows[i][0]) || /^\d{6,}$/.test(rows[i][0])) break;
+      parts.unshift(rows[i][0]);
+    }
+    return plausibleHolder(parts.join(" ").replace(/\s+\d{1,2}$/, ""));
+  }
   return "";
 }
 
@@ -127,7 +218,7 @@ export function extractAccountFromBankStatementMarkdown(markdown) {
       } else if (/^(account number|account no|a c number|a c no)$/.test(normalized)) {
         result.accountNumber ||= cleanAccountNumber(value);
       } else if (/^(ifsc|ifsc code)$/.test(normalized)) {
-        result.ifscCode ||= cleanText(value).toUpperCase().replace(/\s+/g, "");
+        result.ifscCode ||= cleanIfsc(value);
       } else if (/^(statement account|bank account|account)$/.test(normalized)) {
         const statementAccount = parseStatementAccount(value);
         result.bankName ||= statementAccount.bankName;
@@ -154,7 +245,7 @@ export function extractAccountFromBankStatementMarkdown(markdown) {
       } else if (/^(account number|account no|a c number|a c no)$/.test(normalized)) {
         result.accountNumber ||= cleanAccountNumber(value);
       } else if (/^(ifsc|ifsc code)$/.test(normalized)) {
-        result.ifscCode ||= cleanText(value).toUpperCase().replace(/\s+/g, "");
+        result.ifscCode ||= cleanIfsc(value);
       } else if (/^(statement account|bank account|account)$/.test(normalized)) {
         const statementAccount = parseStatementAccount(value);
         result.bankName ||= statementAccount.bankName;
@@ -174,6 +265,19 @@ export function extractAccountFromBankStatementMarkdown(markdown) {
   );
   result.ifscCode ||= cleanText(fullText.match(/\bIFSC(?:\s+CODE)?\s*[:\-]?\s*([A-Z]{4}0[A-Z0-9]{6})\b/i)?.[1]).toUpperCase();
   result.bankName ||= bankNameFromHeader(markdown);
+
+  // Labelled values are read first. These fallbacks cover layouts where the
+  // label and value share a cell, sit in the page footer, or are bold text.
+  const headerText = plainMarkdownText(headerMarkdown(markdown).slice(0, 6000));
+  result.accountHolderName ||= holderFromText(headerText) || holderFromText(fullText.slice(-2500)) ||
+    plausibleHolder(fullText.match(/statement downloaded by\s+(.+?)\s+on\s+[a-z]{3}\b/i)?.[1]) || holderFromLayouts(lines);
+  if (!result.ifscCode) {
+    const labelled = cleanIfsc(headerText.match(/\bIFSC(?:\s+code)?\s*[:\-]?\s*([A-Z]{4}0[A-Z0-9]{6})\b/i)?.[1]);
+    const prefix = ifscPrefixForBank(result.bankName);
+    const sameBank = prefix && headerText.match(/\b[A-Z]{4}0[A-Z0-9]{6}\b/g)?.find((code) => code.startsWith(prefix));
+    result.ifscCode = labelled || cleanIfsc(sameBank);
+  }
+  if (!result.bankName && result.ifscCode) result.bankName = IFSC_BANK_NAMES[result.ifscCode.slice(0, 4)] || "";
 
   return result;
 }
