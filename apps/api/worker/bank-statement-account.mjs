@@ -76,6 +76,7 @@ function bankNameFromHeader(markdown) {
     [/\bICICI Bank\b/i, "ICICI Bank"],
     [/\bHDFC Bank\b/i, "HDFC Bank"],
     [/\bAxis Bank\b/i, "Axis Bank"],
+    [/\bCosmos Co-?operative Bank\b/i, "Cosmos Co-operative Bank"],
   ];
   for (const [pattern, bankName] of knownBanks) {
     if (pattern.test(header)) return bankName;
@@ -90,6 +91,7 @@ function bankNameFromHeader(markdown) {
     ICIC: "ICICI Bank",
     HDFC: "HDFC Bank",
     UTIB: "Axis Bank",
+    COSB: "Cosmos Co-operative Bank",
   };
   if (ifsc && bankByIfscPrefix[ifsc.slice(0, 4)]) return bankByIfscPrefix[ifsc.slice(0, 4)];
 
@@ -164,6 +166,11 @@ export function extractAccountFromBankStatementMarkdown(markdown) {
   const fullText = plainMarkdownText(markdown);
   result.accountNumber ||= cleanAccountNumber(
     fullText.match(/(?:account|a\/?c)\s*(?:(?:number|no\.?|#)\s*)?[:\-]?\s*([0-9*Xx][0-9*Xx .-]{5,33})/i)?.[1]
+  );
+  // Exported bank-book PDFs carry the account only in their title, e.g.
+  // "ICICI Bank - 8822014500 Statement Book".
+  result.accountNumber ||= cleanAccountNumber(
+    fullText.slice(0, 400).match(/\b(?:Bank|India)\s*[-–]\s*([0-9]{6,18})\b/i)?.[1]
   );
   result.ifscCode ||= cleanText(fullText.match(/\bIFSC(?:\s+CODE)?\s*[:\-]?\s*([A-Z]{4}0[A-Z0-9]{6})\b/i)?.[1]).toUpperCase();
   result.bankName ||= bankNameFromHeader(markdown);
