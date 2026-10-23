@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, net, ipcMain, safeStorage } from "electron";
+import { app, BrowserWindow, Menu, Tray, dialog, net, ipcMain, safeStorage } from "electron";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -481,6 +481,25 @@ function sendStatus(status) {
   }
 }
 
+let tray = null;
+// Closing the window only hides it, so the tray icon is the one visible sign
+// that the connector is still running, and the one deliberate way to quit it.
+function createTray() {
+  if (tray || !brandLogoPath) return;
+  try {
+    tray = new Tray(brandLogoPath);
+    tray.setToolTip(`${CONNECTOR_NAME} is running`);
+    tray.setContextMenu(Menu.buildFromTemplate([
+      { label: `Open ${CONNECTOR_NAME}`, click: () => showWindow() },
+      { type: "separator" },
+      { label: "Quit connector", click: () => { quitting = true; app.quit(); } },
+    ]));
+    tray.on("click", () => showWindow());
+  } catch (error) {
+    appendLog(errPath, `Tray icon could not be created: ${formatConnectorError(error)}`);
+  }
+}
+
 function showWindow() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   mainWindow.show();
@@ -838,7 +857,7 @@ function createWindow() {
           <div class="updateHero">
             <div class="updateTile" aria-hidden="true">✓</div>
             <div>
-              <p class="updateVersion">Current version 0.1.84</p>
+              <p class="updateVersion">Current version 0.1.85</p>
               <h2 id="updateTitle">You're up to date</h2>
               <p id="updateCopy">Last checked a few minutes ago.</p>
             </div>
@@ -1138,6 +1157,7 @@ if (!gotLock) {
 } else {
   app.setAsDefaultProtocolClient(PROTOCOL_NAME);
   app.on("second-instance", (_event, argv) => {
+    appendLog(errPath, "A second connector launch was blocked; the running connector was brought forward.");
     const protocolArg = argv.find((entry) => entry.startsWith(`${PROTOCOL_NAME}://`));
     if (protocolArg) handleProtocolUrl(protocolArg);
     if (argv.includes("--show-updates") && mainWindow && !mainWindow.isDestroyed()) {
@@ -1199,6 +1219,7 @@ if (!gotLock) {
       );
     } catch (e) { appendLog(errPath, `Local Matching IPC failed: ${formatConnectorError(e)}`); }
     createWindow();
+    createTray();
     const protocolArg =
       process.argv.find((entry) => entry.startsWith(`${PROTOCOL_NAME}://`)) || pendingProtocolUrl;
     if (protocolArg) {

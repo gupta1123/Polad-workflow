@@ -223,7 +223,7 @@ function nearestAmount(row, index, excluded) {
   return null;
 }
 
-function normalizeTableTransactions(table, fallbackYear, startIndex) {
+function normalizeTableTransactions(table, fallbackYear, startIndex, carriedBalance = null) {
   const source = normalizedTableSource(table);
   const indexes = semanticIndexes(source.headers);
   if (indexes.date < 0 || indexes.description < 0) return [];
@@ -309,7 +309,7 @@ function normalizeTableTransactions(table, fallbackYear, startIndex) {
       raw_payload: { rowNumber: startIndex + output.length + 1, source: "deterministic_anydoc_normalized", ...(amountIssue ? { amountValidationIssue: amountIssue } : {}) },
     });
   }
-  if (singleAmountColumn) resolveSingleAmountDirections(output, singleMeta);
+  if (singleAmountColumn) resolveSingleAmountDirections(output, singleMeta, carriedBalance);
   return output;
 }
 
@@ -321,11 +321,11 @@ function applySingleAmount(row, direction, amount) {
   if (row.raw_payload?.amountValidationIssue) delete row.raw_payload.amountValidationIssue;
 }
 
-function resolveSingleAmountDirections(output, metas) {
+function resolveSingleAmountDirections(output, metas, carriedBalance = null) {
   const unresolved = [];
   output.forEach((row, index) => {
     const meta = metas[index];
-    const previous = index > 0 ? output[index - 1].balance_amount : null;
+    const previous = index > 0 ? output[index - 1].balance_amount : carriedBalance;
     const balance = row.balance_amount;
     if (previous !== null && balance !== null && previous !== undefined) {
       const delta = Math.round((balance - previous) * 100) / 100;
@@ -362,7 +362,7 @@ export function deterministicTransactionsFromAnydoc(markdown) {
   if (broken.length) return null;
   const year = inferStatementYear(markdown);
   const transactions = [];
-  for (const table of rawTx) transactions.push(...normalizeTableTransactions(table, year, transactions.length));
+  for (const table of rawTx) transactions.push(...normalizeTableTransactions(table, year, transactions.length, transactions.at(-1)?.balance_amount ?? null));
 
   if (transactions.length === 0) return null;
   return { headers: rawTx.flatMap((table) => table.headers), transactions };
