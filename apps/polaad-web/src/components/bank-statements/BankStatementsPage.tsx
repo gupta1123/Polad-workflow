@@ -4141,7 +4141,7 @@ export function BankStatementsPage() {
         : statementDoneSummary
           ? "Processing finished"
         : uncheckedTallyPresenceCount > 0
-          ? `${readyPostingTransactions.length} prepared`
+          ? `${uncheckedTallyPresenceCount} not checked in Tally`
           : readyPostingTransactions.length > 0
             ? `${readyPostingTransactions.length} ready to post`
             : heldPostingRowCount > 0
