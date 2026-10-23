@@ -118,3 +118,12 @@ test("single unlabeled amount column takes direction from the balance movement",
   assert.equal(rows[2].credit_amount, 204000);
   assert.equal(rows[2].balance_amount, 1270000);
 });
+
+test("a page fused into one table row is rejected instead of published as one transaction", () => {
+  const md = [
+    "|Date|Narration|Withdrawal Amt.|Deposit Amt.|Closing Balance|",
+    "|---|---|---|---|---|",
+    "|07/08/26 07/08/26 08/08/26|ONE TWO THREE|100.00 200.00 300.00||1000.00 800.00 500.00|",
+  ].join("\n");
+  assert.equal(deterministicTransactionsFromAnydoc(md), null);
+});

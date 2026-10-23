@@ -360,6 +360,13 @@ export function deterministicTransactionsFromAnydoc(markdown) {
   // boundaries. Do not publish a partial deterministic result: the caller can
   // recover those pages with the existing page-recovery path.
   if (broken.length) return null;
+  // A converter can fuse a whole page of rows into one table row, leaving one
+  // cell with many dates. A transaction has at most a booking and a value date,
+  // so more than two in a cell means the rows were not separated; publishing
+  // that as one transaction would silently drop the rest of the statement.
+  const fusedRows = rawTx.some((table) => (table.rawRows || table.rows || []).some((row) =>
+    row.some((cell) => (String(cell).match(/\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4}/g) || []).length > 2)));
+  if (fusedRows) return null;
   const year = inferStatementYear(markdown);
   const transactions = [];
   for (const table of rawTx) transactions.push(...normalizeTableTransactions(table, year, transactions.length, transactions.at(-1)?.balance_amount ?? null));
