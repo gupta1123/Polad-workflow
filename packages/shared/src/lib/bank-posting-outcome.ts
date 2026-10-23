@@ -49,8 +49,10 @@ export function summarizeBankPostings(commands: BankPostingCommand[]) {
 }
 
 // `idle`: nothing is being sent right now, so a pending row is not posted yet rather than "still processing".
-export function bankPostingMessage(summary: ReturnType<typeof summarizeBankPostings>, options: { idle?: boolean } = {}) {
-  const progress = [`${summary.confirmed - summary.alreadyExisting} newly posted`, `${summary.alreadyExisting} already entered in Tally`];
+export function bankPostingMessage(summary: ReturnType<typeof summarizeBankPostings>, options: { idle?: boolean; fromSavedRecords?: boolean } = {}) {
+  // `fromSavedRecords`: counts come from our database, not a live Tally check, so do not claim Tally confirmed them.
+  const progress = [`${summary.confirmed - summary.alreadyExisting} newly posted`,
+    options.fromSavedRecords ? `${summary.alreadyExisting} posted earlier (saved record, not re-checked in Tally)` : `${summary.alreadyExisting} already entered in Tally`];
   if (summary.held) progress.push(`${summary.held} not posted: possible duplicates need review`);
   if (summary.confirmationPending) progress.push(`${summary.confirmationPending} accepted by Tally: confirmation pending`);
   if (summary.outcomeUnknown) progress.push(`${summary.outcomeUnknown} posting ${summary.outcomeUnknown === 1 ? "outcome" : "outcomes"} unknown: check Tally before retrying`);

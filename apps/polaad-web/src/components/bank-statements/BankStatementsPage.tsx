@@ -4045,7 +4045,7 @@ export function BankStatementsPage() {
     setStatementDoneSummary(null);
     const unmatchedRows = rows.filter(row => !saved.some(posting => statementRowKey(posting) === statementRowKey(row))).length;
     if (summary.pending > 0 || unmatchedRows > 0) {
-      if (summary.confirmed || summary.needsCheck) setBanner({ tone: "info", text: `${bankPostingMessage(summary, { idle: true })}${unmatchedRows ? ` ${unmatchedRows} statement entries have no saved posting result; check Tally before posting.` : ""}` });
+      if (summary.confirmed || summary.needsCheck) setBanner({ tone: "info", text: `${bankPostingMessage(summary, { idle: true, fromSavedRecords: true })}${unmatchedRows ? ` ${unmatchedRows} statement entries have no saved posting result; check Tally before posting.` : ""}` });
       return;
     }
     if (summary.confirmed || summary.needsCheck || summary.failed) {
@@ -6706,7 +6706,7 @@ export function BankStatementsPage() {
           setSelectedAccountId(confirmPayload.account.id);
           restorePostingState(savedResults);
           setBanner(null);
-          showToast("info", bankPostingMessage(summary, { idle: true }));
+          showToast("info", bankPostingMessage(summary, { idle: true, fromSavedRecords: true }));
           return;
         }
         if (confirmPayload.importedTransactionCount <= 0) {

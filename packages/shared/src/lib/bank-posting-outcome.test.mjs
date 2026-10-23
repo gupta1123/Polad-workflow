@@ -81,3 +81,10 @@ test('an idle re-upload reports unsent rows as not posted yet, not still process
   assert.equal(bankPostingMessage(summary, { idle: true }), '0 newly posted; 26 already entered in Tally; 4 not posted yet.');
   assert.equal(bankPostingMessage(summary), '0 newly posted; 26 already entered in Tally; 4 still processing.');
 });
+
+test('saved-record counts are not presented as a live Tally confirmation', () => {
+  const existing = { status: 'succeeded', result: { alreadyInTally: true, verificationStatus: 'verified' } };
+  const summary = summarizeBankPostings([...Array(26).fill(existing), ...Array(4).fill({ status: 'pending' })]);
+  assert.equal(bankPostingMessage(summary, { idle: true, fromSavedRecords: true }),
+    '0 newly posted; 26 posted earlier (saved record, not re-checked in Tally); 4 not posted yet.');
+});
