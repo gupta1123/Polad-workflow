@@ -78,17 +78,22 @@ function detectPnbLayout(items, page) {
 
 function detectCentralBankLayout(items, page) {
   const postDate = header(items, "post date", "posting date", "transaction date", "txn date", "date");
-  const valueDate = header(items, "value", "value date");
-  const debit = header(items, "debit", "debit (inr)", "dr amount", "withdrawal", "paid out");
-  const credit = header(items, "credit", "credit (inr)", "cr amount", "deposit", "paid in");
-  const balance = header(items, "balance", "balance (inr)");
-  const reference = header(items, "bank reference", "reference", "reference no.", "utr");
+  const valueDate = header(items, "value", "value date", "value dt");
+  const debit = header(items, "debit", "debit (inr)", "dr amount", "withdrawal", "withdrawal amt.", "paid out");
+  const credit = header(items, "credit", "credit (inr)", "cr amount", "deposit", "deposit amt.", "paid in");
+  const balance = header(items, "balance", "balance (inr)", "closing balance");
+  const reference = header(items, "bank reference", "reference", "reference no.", "utr", "chq./ref.no.", "chq/ref no");
   const description = header(items, "transaction description", "description", "particular", "particulars", "narration", "details");
   if (!postDate || !debit || !credit || !balance || !description) return null;
   const headerY = [postDate, debit, credit, balance, description].map((item) => item.y);
   if (Math.max(...headerY) - Math.min(...headerY) > 20) return null;
   if (!(center(debit) < center(credit) && center(credit) < center(balance))) return null;
+  // HDFC-style: value date sits right of the narration and long narrations wrap
+  // onto continuation lines below the dated line.
+  const wrapsBelow = Boolean(valueDate && reference && center(valueDate) > center(description));
   return {
+    wrapsBelow,
+    valueDateLeft: valueDate ? valueDate.x - 4 : null,
     type: /^(?:post|posting) date$/i.test(postDate.text) ? "central_bank" : "generic_statement",
     postDate: center(postDate),
     valueDate: valueDate ? center(valueDate) : null,
@@ -154,24 +159,33 @@ function extractPnbRows(items, page, layout) {
 
 function extractCentralBankRows(items, page, layout) {
   const dates = items
-    .filter((item) => /^(?:\d{2}[-/]\d{2}[-/]\d{4}|\d{1,2}[- ][A-Za-z]{3}[- ]\d{2,4})$/.test(item.text) && Math.abs(center(item) - layout.postDate) < 28)
+    .filter((item) => /^(?:\d{2}[-/]\d{2}[-/]\d{2,4}|\d{1,2}[- ][A-Za-z]{3}[- ]\d{2,4})$/.test(item.text) && Math.abs(center(item) - layout.postDate) < 28)
     .sort((left, right) => right.y - left.y);
   const debitCreditBoundary = (layout.debit + layout.credit) / 2;
   const creditBalanceBoundary = (layout.credit + layout.balance) / 2;
   const rows = [];
   for (let index = 0; index < dates.length; index += 1) {
-    const bounds = rowBounds(dates, index);
+    // Wrapped narrations hang below the dated line, so a row runs from its own
+    // date line down to the next one instead of splitting the gap evenly.
+    const bounds = layout.wrapsBelow
+      ? {
+        top: dates[index].y + 8,
+        bottom: dates[index + 1] ? dates[index + 1].y + 8 : dates[index].y - 80,
+      }
+      : rowBounds(dates, index);
     const debitAmount = money(columnCell(items, layout.debit, layout.debit - (layout.credit - layout.debit) / 2, debitCreditBoundary, bounds));
     const creditAmount = money(columnCell(items, layout.credit, debitCreditBoundary, creditBalanceBoundary, bounds));
     const balanceAmount = money(columnCell(items, layout.balance, creditBalanceBoundary, page.width + 1, bounds));
     const narration = columnCell(
       items,
       layout.description,
-      layout.valueDate
-        ? (layout.valueDate + layout.description) / 2
-        : (layout.postDate + layout.description) / 2,
+      layout.wrapsBelow
+        ? Math.max(...dates.map((date) => date.x + date.width)) + 2
+        : layout.valueDate
+          ? (layout.valueDate + layout.description) / 2
+          : (layout.postDate + layout.description) / 2,
       layout.descriptionRight ?? layout.debit - 20,
-      layout.reference ? { ...bounds, bottom: Math.max(bounds.bottom, dates[index].y - 20) } : bounds
+      layout.reference && !layout.wrapsBelow ? { ...bounds, bottom: Math.max(bounds.bottom, dates[index].y - 20) } : bounds
     )
       .sort((left, right) => right.y - left.y || left.x - right.x)
       .map((item) => item.text)
@@ -183,7 +197,7 @@ function extractCentralBankRows(items, page, layout) {
     }
     rows.push({
       reference: layout.reference ? items.filter(item => Math.abs(item.y - dates[index].y) < 4 &&
-        center(item) > layout.descriptionRight && center(item) < layout.debit - 20)
+        center(item) > layout.descriptionRight && center(item) < (layout.valueDateLeft ?? layout.debit - 20))
         .sort((left, right) => left.x - right.x).map(item => item.text).join('').replace(/^[-–—]+$/, '') : "",
       sourceDate: dates[index].text,
       narration,
@@ -201,9 +215,13 @@ export function extractBankStatementPhysicalColumns(pages) {
   let detected = false;
   const rows = [];
   for (const page of pages) {
-    const items = page.items
+    const allItems = page.items
       .filter((item) => item.str?.trim())
       .map((item) => ({ text: normalizedText(item.str), x: item.transform[4], y: item.transform[5], width: item.width }));
+    // Statement footers ("*Closing balance includes …") sit under the last row
+    // and would otherwise be read as part of its narration.
+    const footerY = Math.max(-Infinity, ...allItems.filter((item) => /^\*?closing balance includes/i.test(item.text)).map((item) => item.y));
+    const items = Number.isFinite(footerY) ? allItems.filter((item) => item.y > footerY + 2) : allItems;
     const detectedLayout = detectPnbLayout(items, page) || detectCentralBankLayout(items, page);
     if (detectedLayout) {
       if (layout && layout.type !== detectedLayout.type) throw new Error("Bank statement layout changed between pages");

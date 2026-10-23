@@ -67,3 +67,17 @@ test('generic statement headings get deterministic physical row evidence',()=>{
   ['05/09/2026','Customer receipt',null,1250,5000],
  ]);
 });
+test('HDFC layout keeps wrapped narrations with their row and drops the page footer',()=>{
+ const head=[item('Date',40,602,16),item('Narration',144,602,34),item('Chq./Ref.No.',284,602,45),item('Value Dt',362,602,30),item('Withdrawal Amt.',405,602,60),item('Deposit Amt.',491,602,45),item('Closing Balance',564,602,55)];
+ const physical=extractBankStatementPhysicalColumns([{pageNumber:1,width:638,items:[
+  ...head,
+  item('07/08/26',34,584,28),item('UPI-AUTOPAY-GOOGLE',68,584,89),item('0000750084052196',293,584,64),item('07/08/26',362,584,28),item('2.00',456,584,14),item('279,716.94',591,584,36),
+  item('WORKSPACE',68,567,60),item('MANDATEEXECUTE',68,550,80),
+  item('08/08/26',34,533,28),item('NEFT CR-ACME',68,533,70),item('AXISCN1',293,533,50),item('08/08/26',362,533,28),item('2,999.00',520,533,28),item('282,715.94',591,533,36),
+  item('*Closing balance includes funds earmarked for hold',34,500,200),
+ ]}]);
+ assert.deepEqual(physical.rows.map(r=>[r.sourceDate,r.narration,r.reference,r.debitAmount,r.creditAmount,r.balanceAmount]),[
+  ['07/08/26','UPI-AUTOPAY-GOOGLE WORKSPACE MANDATEEXECUTE','0000750084052196',2,null,279716.94],
+  ['08/08/26','NEFT CR-ACME','AXISCN1',null,2999,282715.94],
+ ]);
+});
