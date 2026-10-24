@@ -653,7 +653,7 @@ export async function POST(
           .select("fingerprint, status, tally_voucher_id, tally_posted_at")
           .eq("owner_user_id", user.id)
           .eq("bank_account_id", accountId)
-          .in("status", ["posted", "verified", "needs_tally_review", "queued"])
+          .in("status", reconcileAgainstLiveTally ? ["queued"] : ["posted", "verified", "needs_tally_review", "queued"])
           .in("fingerprint", submittedFingerprints)
       : Promise.resolve({ data: [], error: null });
 
@@ -675,7 +675,11 @@ export async function POST(
         row.id &&
         row.fingerprint &&
         (reconcileAgainstLiveTally || row.statement_import_id === id) &&
-        ["pending", "failed", "missing_in_tally", "verification_failed"].includes(row.tally_status || "")
+        // Live Tally is the only authority: a row saved as verified/posted earlier
+        // may have been deleted from Tally since, so it is re-opened for the
+        // connector's own Tally check instead of being skipped as a duplicate.
+        (["pending", "failed", "missing_in_tally", "verification_failed"].includes(row.tally_status || "") ||
+          (reconcileAgainstLiveTally && ["verified", "posted", "needs_tally_review"].includes(row.tally_status || "")))
     );
     const submittedRowsByFingerprint = new Map(rows.map((row) => [row.fingerprint, row]));
     const postedByFingerprint = new Map(
@@ -744,9 +748,13 @@ export async function POST(
           id: existingRow.id,
           ...matchingRow,
           statement_import_id: id,
-          // A re-analysis may refresh source fields, but it must never erase a
-          // posting checkpoint or make an uncertain/posted transaction retryable.
-          tally_status: existingRow.tally_status,
+          // A re-analysis may refresh source fields. Rows the page selected for
+          // posting after a live Tally check go back to pending; the connector
+          // re-checks Tally before it posts, so nothing is posted twice.
+          tally_status:
+            reconcileAgainstLiveTally && ["verified", "posted", "needs_tally_review"].includes(existingRow.tally_status || "")
+              ? "pending"
+              : existingRow.tally_status,
         }];
       });
       if (refreshRows.length > 0) {

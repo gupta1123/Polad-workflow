@@ -643,7 +643,7 @@ export async function POST(request: Request) {
         .eq("owner_user_id", user.id)
         .in("bank_account_id", accountIds)
         .in("fingerprint", fingerprints)
-        .in("status", ["queued", "posted", "verified", "needs_tally_review"]),
+        .in("status", ["queued"]),
     ]);
     const { data: accountRows, error: accountError } = accountResult;
     const { data: importRows, error: importRowsError } = importResult;
@@ -684,12 +684,10 @@ export async function POST(request: Request) {
     );
     const blockedFingerprints = new Set(
       postingLogs
-        .filter((row) =>
-          row.status === "posted" ||
-          row.status === "verified" ||
-          row.status === "needs_tally_review" ||
-          (row.command_id && activeCommandIds.has(row.command_id))
-        )
+        // Only an in-flight command blocks a row. Earlier posted/verified log
+        // entries do not: Tally is the authority and the connector skips a row
+        // whose voucher is really there.
+        .filter((row) => row.command_id && activeCommandIds.has(row.command_id))
         .map((row) => row.fingerprint)
     );
 
