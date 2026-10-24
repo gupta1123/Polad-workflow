@@ -5423,7 +5423,8 @@ export function BankStatementsPage() {
     const candidateMasters = connectorCandidateMasters(payload.transactions);
     const effectiveLedgerMasters = Array.from(
       new Map(
-        [...ledgerMastersForReview, ...candidateMasters].map((ledger) => [normalizeName(ledger.name), ledger])
+        // Candidates are bare names; the full catalogue entry (ledgerType, bill-wise) must win.
+        [...candidateMasters, ...ledgerMastersForReview].map((ledger) => [normalizeName(ledger.name), ledger])
       ).values()
     );
     if (candidateMasters.length > 0) {
