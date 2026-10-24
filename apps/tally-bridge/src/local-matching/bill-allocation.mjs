@@ -18,7 +18,16 @@ function preferredBillReference(bills, transaction) {
   }).sort((left, right) =>
     referenceToken(right.referenceName).length - referenceToken(left.referenceName).length
   );
-  if (matches.length === 0) return "";
+  if (matches.length === 0) {
+    // Narrations often carry only the invoice's own number ("...-55112"), not the full
+    // "INV/26-27/55112": accept a unique bill whose last segment is a whole word there.
+    const words = new Set(`${transaction.narration || ""} ${transaction.referenceNumber || ""}`.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean));
+    const tailMatches = (bills || []).filter((bill) => {
+      const tail = String(bill.referenceName || "").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).at(-1) || "";
+      return tail.length >= 4 && /\d/.test(tail) && words.has(tail);
+    });
+    return tailMatches.length === 1 ? normalized(tailMatches[0].referenceName) : "";
+  }
   const longestLength = referenceToken(matches[0].referenceName).length;
   const longestMatches = matches.filter(
     (bill) => referenceToken(bill.referenceName).length === longestLength
@@ -100,14 +109,24 @@ export function planChronologicalBillAllocations({ transactions, verificationRow
     const ledgerKey = normalized(ledgerName);
     const bills = working.get(ledgerKey) || (bucket.openBills || []).map((bill) => ({ ...bill }));
     const amount = amountFor(transaction);
-    if (amount <= 0 || (bucket.existingAdvances || []).length > 0) continue;
+    if (amount <= 0) continue;
+    let preferred = preferredBillReference(bills, transaction);
+    if ((bucket.existingAdvances || []).length > 0) {
+      // An existing advance needs a human unless one bill is clearly the target: the bill named
+      // in the narration (covering the amount), or the only bill with exactly this amount.
+      const named = bills.find((bill) => normalized(bill.referenceName) === preferred);
+      const exact = bills.filter((bill) => Math.abs((Number(bill.pendingAmount) || 0) - amount) < 0.005);
+      const target = named && (Number(named.pendingAmount) || 0) + 0.005 >= amount ? named : exact.length === 1 ? exact[0] : null;
+      if (!target) continue;
+      preferred = normalized(target.referenceName);
+    }
     const date = String(transaction.voucherDate || "").replace(/-/g, "");
     const suffix = referenceToken(transaction.referenceNumber || transactionId).slice(-8) || transactionId.slice(0, 8);
     const allocation = allocate(
       amount,
       bills,
       `ADV-${date}-${suffix}`.slice(0, 80),
-      preferredBillReference(bills, transaction)
+      preferred
     );
     const totalAllocatedAmount = Number(allocation.allocations.reduce((sum, item) => sum + item.allocatedAmount, 0).toFixed(2));
     plans[transactionId] = {
@@ -116,7 +135,7 @@ export function planChronologicalBillAllocations({ transactions, verificationRow
       newAdvanceAmount: allocation.newAdvanceAmount,
       unallocatedAmount: Number(Math.max(0, amount - totalAllocatedAmount).toFixed(2)),
       allocations: allocation.allocations,
-      candidateBills: orderBills(bills, preferredBillReference(bills, transaction)),
+      candidateBills: orderBills(bills, preferred),
       existingAdvances: bucket.existingAdvances || [],
       source: "connector_chronological_fifo",
     };

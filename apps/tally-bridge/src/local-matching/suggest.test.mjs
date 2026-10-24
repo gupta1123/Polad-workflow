@@ -117,3 +117,11 @@ test("batch vector search does not invoke embeddings when the index is unavailab
   assert.ok(results.every((result) => result.meta.searchMode === "vector_only"));
   clean(baseDir);
 });
+
+test("a bank-account ledger is excluded unless the narration carries its account number", async () => {
+  const { isForeignBankLedger } = await import("./suggest.mjs");
+  const bank = { tally_name: "HDFC Bank Current A/C No.50200057521595" };
+  assert.equal(isForeignBankLedger(bank, "UPI-HEROKU-PAYMENT"), true);
+  assert.equal(isForeignBankLedger(bank, "NEFT TO A/C 50200057521595"), false);
+  assert.equal(isForeignBankLedger({ tally_name: "Crystal Components LLP" }, "x"), false);
+});

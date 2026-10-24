@@ -53,6 +53,7 @@ function buildIndex(activeLedgers, cacheKey) {
   if (cached && cached.size === activeLedgers.length) return cached.entries;
   const entries = activeLedgers.map((ledger) => ({
     ledger,
+    full: normalize(ledger.tally_name),
     tokens: new Set(tokens(ledger.tally_name)),
     grams: trigrams(ledger.tally_name),
   }));
@@ -66,6 +67,8 @@ export function textMatchLedgers({ query, activeLedgers, cacheKey = "default", l
   const queryTokens = new Set(tokens(payee));
   if (!queryTokens.size) return [];
   const queryGrams = trigrams(payee);
+  const queryFull = normalize(payee);
+  const narration = ` ${normalize(query)} `;
   const scored = [];
 
   for (const entry of buildIndex(activeLedgers, cacheKey)) {
@@ -76,7 +79,13 @@ export function textMatchLedgers({ query, activeLedgers, cacheKey = "default", l
     const dice = (2 * sharedGrams) / (queryGrams.size + entry.grams.size || 1);
     const jaccard = shared / (queryTokens.size + entry.tokens.size - shared || 1);
     const coverage = shared / queryTokens.size;
-    const score = 0.5 * dice + 0.3 * jaccard + 0.2 * coverage;
+    let score = 0.5 * dice + 0.3 * jaccard + 0.2 * coverage;
+    // Stop-word stripping can make "X India LLP" and "X LLP" tie at 1; the ledger whose full name equals the payee wins.
+    // A distinctive ledger name sitting whole inside a noisy narration (card/UPI prefixes) is a strong hit.
+    const distinctive = entry.full.length >= 8 || entry.full.includes(" ");
+    if (entry.full === queryFull) score = 1;
+    else if (distinctive && narration.includes(` ${entry.full} `)) score = Math.max(score, 0.9);
+    else if (score > 0.97) score = 0.97;
     if (score >= MIN_SCORE) scored.push({ ledger: entry.ledger, score });
   }
 

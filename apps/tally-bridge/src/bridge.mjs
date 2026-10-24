@@ -30,8 +30,30 @@ const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
 
-const BRIDGE_VERSION = "0.1.88";
+const BRIDGE_VERSION = "0.1.92";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
+
+// Diagnostic lines for "Check Tally" and bank posting. They go to bridge.log
+// through the runner's console capture and never include tokens or passwords.
+function shortTxId(value) {
+  return String(value ?? "").slice(0, 8) || "-";
+}
+
+function describeBankRow(row = {}) {
+  const incoming = String(row.expectedDirection || "").toLowerCase() === "incoming" || /receipt/i.test(String(row.voucherType || ""));
+  return `row=${shortTxId(row.transactionId)} ${row.voucherDate || "-"} ${incoming ? "CR" : "DR"} ${Number(row.amount || 0).toFixed(2)} ref=${row.referenceNumber || "-"} party=${row.counterpartyLedgerName || "-"}`;
+}
+
+// The packaged app has no console; the running connector's onLog sink writes to bridge.log.
+let diagnosticLogOptions = null;
+
+function logTallyCheck(message) {
+  emitLog(diagnosticLogOptions, "info", `[tally-check] ${message}`);
+}
+
+function logTallyPost(message) {
+  emitLog(diagnosticLogOptions, "info", `[tally-post] ${message}`);
+}
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 3_000;
 const MAX_COMMANDS_PER_CYCLE = 50;
 const TALLY_IMPORT_TIMEOUT_MS = 30_000;
@@ -2307,6 +2329,7 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
       if (targets.size !== 1) throw new Error("A Tally batch cannot cross company or connector sessions.");
       await assertCommandTarget(config, group[0]);
       const firstPayload = group[0]?.payload || {};
+      logTallyPost(`batch start commands=${group.length} company=${firstPayload.companyName || config.companyName || "-"} bank="${firstPayload.bankLedgerName || "-"}" step=duplicate_preflight`);
       const batchPreflight = await reconcileBankTransactionsInTally(config, {
         companyName: firstPayload.companyName || config.companyName || null,
         bankLedgerName: firstPayload.bankLedgerName,
@@ -2323,6 +2346,11 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
       });
       preflightByTransactionId = new Map(
         (batchPreflight.result?.transactions || []).map((row) => [String(row.transactionId || ""), row])
+      );
+      logTallyPost(
+        `duplicate_preflight found=${[...preflightByTransactionId.values()].filter((row) => row.verificationStatus === "found").length} ` +
+        `ambiguous=${[...preflightByTransactionId.values()].filter((row) => row.verificationStatus === "ambiguous").length} ` +
+        `missing=${[...preflightByTransactionId.values()].filter((row) => row.verificationStatus === "missing").length}`
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -2362,6 +2390,7 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
               transactionId,
             },
           });
+          logTallyPost(`${describeBankRow(command.payload)} SKIPPED already in Tally basis=${preflight.matchBasis || "-"} voucher=${preflight.voucherNumber || preflight.voucherId || "-"}`);
           console.log(`Command ${command.id} completed: bank transaction already existed in Tally.`);
           continue;
         }
@@ -2375,11 +2404,13 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
               transactionId,
             },
           });
+          logTallyPost(`${describeBankRow(command.payload)} HELD possible duplicate matches=${preflight.matchCount ?? "-"} basis=${preflight.matchBasis || "-"}`);
           console.log(`Command ${command.id} needs review: possible duplicate bank transaction.`);
           continue;
         }
 
         if (preflight?.verificationStatus !== "missing") {
+          logTallyPost(`${describeBankRow(command.payload)} BLOCKED duplicate check returned status=${preflight?.verificationStatus || "none"}; nothing posted`);
           await sendCommandResult(config, command, {
             success: false,
             error: "Duplicate check returned an incomplete result. Nothing was posted.",
@@ -2398,6 +2429,7 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
     }
 
     if (pendingCommands.length === 0) continue;
+    logTallyPost(`posting ${pendingCommands.length} of ${group.length} voucher(s) in one Tally import`);
 
     const firstPayload = pendingCommands[0].payload || {};
     const companyName = firstPayload.companyName || config.companyName || null;
@@ -2420,6 +2452,11 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
     }
 
     const batchElapsedMs = Date.now() - batchStartedAt;
+    logTallyPost(
+      `tally import success=${batchOutcome.success} elapsedMs=${batchElapsedMs} xmlBytes=${batchXml ? batchXml.length : 0}` +
+      (batchOutcome.error ? ` error=${String(batchOutcome.error).slice(0, 300)}` : "") +
+      ` summary=${JSON.stringify(batchOutcome.result || {}).slice(0, 300)}`
+    );
     // Tally import counters acknowledge the envelope, not each voucher. Always
     // read every target back, even when CREATED equals the requested batch size.
     let postflightByTransactionId = null;
@@ -2450,6 +2487,7 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
     for (const command of pendingCommands) {
       const transactionId = String(command.payload?.transactionId || "");
       const postflight = postflightByTransactionId?.get(transactionId) || null;
+      logTallyPost(`${describeBankRow(command.payload)} read-back=${postflight?.verificationStatus || "unavailable"} voucher=${postflight?.voucherNumber || postflight?.voucherId || "-"}`);
       if (postflight?.verificationStatus === "found") {
         acknowledgementEntries.push({ command, outcome: {
           success: true,
@@ -2514,6 +2552,10 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
     // avoidable API round trips. Keep per-command state, but report it in bounded
     // concurrent groups so Supabase and the bridge remain protected.
     if (acknowledgementEntries.length > 0) {
+      logTallyPost(
+        `reporting ${acknowledgementEntries.length} result(s): posted=${acknowledgementEntries.filter((entry) => entry.outcome.success).length} ` +
+        `uncertain_or_failed=${acknowledgementEntries.filter((entry) => !entry.outcome.success).length}`
+      );
       await sendCommandResults(config, acknowledgementEntries, 10);
     }
   }
@@ -3551,9 +3593,20 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}, dep
   const dateFrom = dates[0];
   const dateTo = dates.at(-1);
   const voucherRequest = { companyName, dateFrom, dateTo, bankLedgerName, transactions: normalizedTransactions };
-  const { vouchers, diagnostics: queryDiagnostics } = dependencies.voucherProvider
-    ? await dependencies.voucherProvider(tallyUrl, voucherRequest, dependencies)
-    : await fetchBankReconciliationVouchers(tallyUrl, voucherRequest, dependencies);
+  const checkStartedAt = Date.now();
+  logTallyCheck(`start company=${companyName || "-"} bank="${bankLedgerName}" rows=${normalizedTransactions.length} range=${dateFrom}..${dateTo}`);
+  let fetched;
+  try {
+    fetched = dependencies.voucherProvider
+      ? await dependencies.voucherProvider(tallyUrl, voucherRequest, dependencies)
+      : await fetchBankReconciliationVouchers(tallyUrl, voucherRequest, dependencies);
+  } catch (error) {
+    const cause = error instanceof Error && error.cause instanceof Error ? ` (${error.cause.message || error.cause.code})` : "";
+    logTallyCheck(`FAILED reading vouchers from Tally at ${tallyUrl} after ${Date.now() - checkStartedAt}ms: ${error instanceof Error ? error.message : String(error)}${cause}`);
+    throw error;
+  }
+  const { vouchers, diagnostics: queryDiagnostics } = fetched;
+  logTallyCheck(`fetched vouchers=${vouchers.length} fetchMs=${Date.now() - checkStartedAt} diagnostics=${JSON.stringify(queryDiagnostics ?? {}).slice(0, 300)}`);
   const reservedVoucherIndexes = new Set();
   const vouchersByDate = indexBankVouchersByDate(vouchers);
   const results = normalizedTransactions.map((transaction) => {
@@ -3572,6 +3625,11 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}, dep
       indexesToReserve.forEach((index) => reservedVoucherIndexes.add(index));
     }
     const selectedCandidate = verificationStatus === "found" ? candidates[0] : null;
+    logTallyCheck(
+      `${describeBankRow(transaction)} -> ${verificationStatus} basis=${matchBasis || "none"} matches=${candidates.length} sameDateBankAmount=${baseCandidateCount}` +
+      (selectedCandidate ? ` voucher=${selectedCandidate.voucher.voucherNumber || selectedCandidate.voucher.masterId || "-"}` : "") +
+      (verificationStatus === "ambiguous" ? ` candidates=${JSON.stringify(candidates.slice(0, 2).map(serializeStrictVoucherMatch)).slice(0, 240)}` : "")
+    );
     return {
       transactionId: transaction.transactionId || null,
       verificationStatus,
@@ -3593,6 +3651,11 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}, dep
     };
   });
 
+  logTallyCheck(
+    `done rows=${results.length} found=${results.filter((row) => row.verificationStatus === "found").length} ` +
+    `ambiguous=${results.filter((row) => row.verificationStatus === "ambiguous").length} ` +
+    `missing=${results.filter((row) => row.verificationStatus === "missing").length} totalMs=${Date.now() - checkStartedAt}`
+  );
   const statementBalance = validateStatementBalanceSequence(normalizedTransactions);
   const periodBankEntries = vouchers.filter((voucher) => {
     const date = normalizeDateForCompare(voucher.effectiveDate || voucher.date);
@@ -3751,6 +3814,9 @@ async function verifyBankTransactionInTally(config, commandPayload = {}, depende
   const strictMatches = strictResult.candidates;
   const duplicateInTally = strictResult.matchBasis === "reference" && strictMatches.length > 1;
   const verificationStatus = bankCandidateVerificationStatus(strictResult);
+  logTallyCheck(
+    `single ${describeBankRow(normalizedTransaction)} bank="${bankLedgerName}" scanned=${vouchers.length} -> ${verificationStatus} basis=${strictResult.matchBasis || "none"} matches=${strictMatches.length}`
+  );
   const selectedVoucher = verificationStatus === "found" ? strictMatches[0].voucher : null;
 
   return {
@@ -6812,6 +6878,7 @@ function emitLog(options, level, message) {
 }
 
 function createBridgeRunner(options = {}) {
+  diagnosticLogOptions = options;
   const config = options.config ?? readConfig();
   if (!config) {
     throw new Error(`Bridge is not paired. Run pair first. Expected config at ${CONFIG_PATH}`);

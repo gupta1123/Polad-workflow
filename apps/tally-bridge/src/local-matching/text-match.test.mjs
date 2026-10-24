@@ -61,3 +61,26 @@ test("fusion ranks a ledger found by both searches first and keeps text-only hit
   assert.equal(fused[0].textScore, 0.9);
   assert.equal(fused[2].vectorScore, null);
 });
+
+test("an exact full-name ledger beats one that only ties after stop-word stripping", () => {
+  const ledgers = [
+    { master_key: "a", tally_name: "Crystal Components India LLP" },
+    { master_key: "b", tally_name: "Crystal Components LLP" },
+  ];
+  const hits = textMatchLedgers({ query: "NEFT CR-UTIB0001234-CRYSTAL COMPONENTS LLP-ADVANCE", activeLedgers: ledgers, cacheKey: "tie-test" });
+  assert.equal(hits[0].ledger.tally_name, "Crystal Components LLP");
+  assert.ok(hits[0].textScore > hits[1].textScore);
+});
+
+test("a distinctive ledger name inside a noisy narration scores as a strong match", () => {
+  const ledgers = [
+    { master_key: "s", tally_name: "Supabase" },
+    { master_key: "r", tally_name: "Rohit" },
+    { master_key: "x", tally_name: "Ac Drive Make : Fuji" },
+  ];
+  const hits = textMatchLedgers({ query: "ME DC SI 416021XXXXXX3033 SUPABASE", activeLedgers: ledgers, cacheKey: "contain-test" });
+  assert.equal(hits[0].ledger.tally_name, "Supabase");
+  assert.ok(hits[0].textScore >= 0.9);
+  const short = textMatchLedgers({ query: "UPI-ROHIT GORE-9307042816-2@AXL", activeLedgers: ledgers, cacheKey: "contain-test2" });
+  assert.ok(!short.some((hit) => hit.ledger.tally_name === "Rohit" && hit.textScore >= 0.9));
+});

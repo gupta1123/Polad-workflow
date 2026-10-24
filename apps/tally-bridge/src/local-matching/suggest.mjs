@@ -82,10 +82,19 @@ function emptyResult({ query, companyId = null, companyName = null, reason, erro
   };
 }
 
+// A bank-account ledger ("... A/C No.50200057521595") is the statement's own bank, not a counterparty,
+// unless the narration itself carries that account number (a transfer between own accounts).
+export function isForeignBankLedger(ledger, searchQuery) {
+  const digits = String(ledger.tally_name || "").match(/\d{8,}/g);
+  if (!digits) return false;
+  const narrationDigits = String(searchQuery || "").replace(/\D/g, "");
+  return !digits.some((run) => narrationDigits.includes(run) || narrationDigits.includes(run.slice(-6)));
+}
+
 function resultFromDocuments({ searchQuery, company, activeLedgers, documents, limit }) {
   const vectorHits = (Array.isArray(documents) ? documents : [])
     .map((document) => ({ document, ledger: findLedger(document, activeLedgers) }))
-    .filter((item) => item.ledger)
+    .filter((item) => item.ledger && !isForeignBankLedger(item.ledger, searchQuery))
     .map(({ document, ledger }) => ({ ledger, vectorScore: normalizeVectorScore(document) }));
   // Name search runs locally on the same ledger set; it only adds to and
   // re-ranks what the vector search returned. It is never used on its own.
@@ -93,8 +102,8 @@ function resultFromDocuments({ searchQuery, company, activeLedgers, documents, l
     query: searchQuery,
     activeLedgers,
     cacheKey: `${company.key}:${company.entry.lastSyncAt || ""}`,
-    limit,
-  });
+    limit: limit + 3,
+  }).filter((hit) => !isForeignBankLedger(hit.ledger, searchQuery)).slice(0, limit);
   const suggestions = fuseCandidates({ vectorHits, textHits, limit }).map((item, index) => {
     const confidence = Math.max(item.vectorScore ?? 0, item.textScore ?? 0);
     const reasons = [];

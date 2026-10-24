@@ -50,3 +50,39 @@ test("prefers the longest visible bill reference when another bill is its prefix
   });
   assert.equal(plans.t1.allocations[0].referenceName, "GKS-OB-SEP26-01-01");
 });
+
+test("narration with only the invoice number settles that bill, not the oldest", () => {
+  const plans = planChronologicalBillAllocations({
+    transactions: [{ transactionId: "t1", counterpartyLedgerName: "Arnav", voucherDate: "2026-10-22", creditAmount: 156409, narration: "NEFT CR-UTIB0001234-ARNAV BAJAJ INDUSTRIAL WORKS-55112" }],
+    verificationRows: [{ transactionId: "t1", verificationStatus: "missing" }],
+    openBillsByLedger: { Arnav: { openBills: [
+      { referenceName: "INV/26-27/11074", invoiceDate: "2026-04-01", pendingAmount: 94742 },
+      { referenceName: "INV/26-27/55112", invoiceDate: "2026-04-01", pendingAmount: 156409 },
+    ], existingAdvances: [] } },
+  });
+  assert.deepEqual(plans.t1.allocations.map((a) => [a.referenceName, a.allocatedAmount]), [["INV/26-27/55112", 156409]]);
+});
+
+test("an existing advance does not block an exact-amount bill", () => {
+  const plans = planChronologicalBillAllocations({
+    transactions: [{ transactionId: "t2", counterpartyLedgerName: "Neel", voucherDate: "2026-10-22", creditAmount: 326376, narration: "NEFT CR-NEELKANTH" }],
+    verificationRows: [{ transactionId: "t2", verificationStatus: "missing" }],
+    openBillsByLedger: { Neel: {
+      openBills: [
+        { referenceName: "INV/26-27/06269", invoiceDate: "2026-04-01", pendingAmount: 326376 },
+        { referenceName: "INV/26-27/26173", invoiceDate: "2026-04-04", pendingAmount: 83874 },
+      ],
+      existingAdvances: [{ referenceName: "Adv/20260424/14490", pendingAmount: 83300 }],
+    } },
+  });
+  assert.deepEqual(plans.t2.allocations.map((a) => [a.referenceName, a.allocatedAmount]), [["INV/26-27/06269", 326376]]);
+});
+
+test("an existing advance with no clear target still waits for review", () => {
+  const plans = planChronologicalBillAllocations({
+    transactions: [{ transactionId: "t3", counterpartyLedgerName: "X", voucherDate: "2026-10-22", creditAmount: 1000, narration: "NEFT" }],
+    verificationRows: [{ transactionId: "t3", verificationStatus: "missing" }],
+    openBillsByLedger: { X: { openBills: [{ referenceName: "A-1", pendingAmount: 5000 }], existingAdvances: [{ referenceName: "ADV", pendingAmount: 10 }] } },
+  });
+  assert.equal(plans.t3, undefined);
+});

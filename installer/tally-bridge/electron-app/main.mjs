@@ -2,6 +2,7 @@ import { app, BrowserWindow, Menu, Tray, dialog, net, ipcMain, safeStorage } fro
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFile } from "node:child_process";
 import { pairBridge, createBridgeRunner, disconnectBridge } from "./src/bridge.mjs";
 import { loadLocalDb, saveLocalDb, getLocalDbPaths, upsertLedgers, upsertGroups, getStatusForCompany, getAllCompaniesStatus, normalizeCompanyKey } from "./src/local-matching/store.mjs";
 import { vectoriseCompany, getVectorStatus, getVectorEngine, isZvecAvailable, closeZvecCollections } from "./src/local-matching/vector.mjs";
@@ -197,6 +198,58 @@ function formatConnectorError(error) {
 function appendLog(filePath, message) {
   const line = `[${new Date().toISOString()}] ${message}\n`;
   fs.appendFile(filePath, line, () => {});
+}
+
+// Lifecycle diagnostics: why a connector opened, which launch won the instance
+// lock, and what a connect link asked for. Pairing codes and control tokens are
+// never written to the log.
+function redactConnectorUrl(value) {
+  try {
+    const url = new URL(String(value));
+    const keep = new Set(["connectionId", "apiBase", "tallyUrl"]);
+    const parts = [];
+    for (const [key, val] of url.searchParams) parts.push(`${key}=${keep.has(key) ? val : "<redacted>"}`);
+    return `${url.protocol}//${url.host}${url.pathname}?${parts.join("&")}`;
+  } catch {
+    return String(value).replace(/(pairingCode|controlToken|pairing-code|control-token)=[^&\s]+/g, "$1=<redacted>");
+  }
+}
+
+function redactArgv(argv = []) {
+  return argv.map((entry) => (String(entry).startsWith(`${PROTOCOL_NAME}://`) ? redactConnectorUrl(entry) : String(entry)));
+}
+
+function logLifecycle(message) {
+  let windows = "-";
+  try { windows = String(BrowserWindow.getAllWindows().length); } catch {}
+  appendLog(logPath, `[lifecycle pid=${process.pid}] ${message} windows=${windows}`);
+}
+
+function rotateLogIfLarge(filePath, maxBytes = 5 * 1024 * 1024) {
+  try {
+    if (fs.statSync(filePath).size > maxBytes) fs.renameSync(filePath, `${filePath}.1`);
+  } catch {}
+}
+
+function logRunningConnectorProcesses() {
+  if (process.platform !== "win32") return;
+  const image = path.basename(process.execPath);
+  execFile("tasklist", ["/FI", `IMAGENAME eq ${image}`, "/FO", "CSV", "/NH"], { timeout: 4000, windowsHide: true }, (error, stdout) => {
+    if (error) {
+      logLifecycle(`could not list running connector processes: ${error.message}`);
+      return;
+    }
+    const pids = String(stdout).split(/\r?\n/).map((line) => line.split('","')[1]).filter(Boolean);
+    logLifecycle(`running ${image} processes=${pids.length} pids=${pids.join(",")}`);
+  });
+  execFile("reg", ["query", `HKCU\\Software\\Classes\\${PROTOCOL_NAME}\\shell\\open\\command`, "/ve"], { timeout: 4000, windowsHide: true }, (error, stdout) => {
+    if (error) {
+      logLifecycle(`protocol handler for ${PROTOCOL_NAME}:// not found in HKCU (${error.message.split("\n")[0]})`);
+      return;
+    }
+    const handler = String(stdout).split(/\r?\n/).find((line) => /REG_SZ/.test(line));
+    logLifecycle(`protocol handler ${PROTOCOL_NAME}:// -> ${(handler || "").replace(/\s+/g, " ").trim()} (this exe: ${process.execPath})`);
+  });
 }
 
 // --- Local Matching (connector-scoped, read-only, persistent) ---
@@ -555,6 +608,7 @@ async function renderTallyPrintToPdf({ html, fileName }) {
 }
 
 async function startRunner() {
+  logLifecycle(`runner starting (previous runner ${runner && !runner.stopped ? "active, stopping it" : "none"})`);
   if (runner && !runner.stopped) runner.stop("restarting");
 
   runner = createBridgeRunner({
@@ -605,6 +659,7 @@ async function handleConnectUrl(value) {
     if (!args["api-base"] || !args["connection-id"] || !args["pairing-code"] || !args["control-token"]) {
       throw new Error("Connect link is missing pairing details.");
     }
+    logLifecycle(`pairing started connectionId=${args["connection-id"]} apiBase=${args["api-base"]} tally=${args["tally-url"] || "-"}`);
     showWindow();
     sendStatus({
       title: "Pairing connector",
@@ -612,7 +667,9 @@ async function handleConnectUrl(value) {
       state: "running",
     });
     await pairBridge(args);
+    logLifecycle(`pairing succeeded connectionId=${args["connection-id"]}`);
     const readiness = await testTally(args["tally-url"]);
+    logLifecycle(`tally readiness company=${readiness.companyName || "-"} reachable=${readiness.tallyReachable ?? "-"}`);
     if (readiness.companyName) {
       sendStatus({
         title: `Connected to ${readiness.companyName}`,
@@ -627,6 +684,7 @@ async function handleConnectUrl(value) {
   } catch (error) {
     const message = formatConnectorError(error);
     appendLog(errPath, message);
+    logLifecycle(`pairing failed: ${message}`);
     sendStatus({ title: "Connection failed", detail: message, state: "error" });
     showWindow();
     dialog.showErrorBox(CONNECTOR_NAME, message);
@@ -669,6 +727,7 @@ async function handleConnectionRecheck() {
 
 function handleProtocolUrl(value) {
   if (!value || !value.startsWith(`${PROTOCOL_NAME}://`)) return;
+  logLifecycle(`protocol link received: ${redactConnectorUrl(value)}`);
   if (value.startsWith(`${PROTOCOL_NAME}://connect`)) {
     void handleConnectUrl(value);
     return;
@@ -857,7 +916,7 @@ function createWindow() {
           <div class="updateHero">
             <div class="updateTile" aria-hidden="true">✓</div>
             <div>
-              <p class="updateVersion">Current version 0.1.88</p>
+              <p class="updateVersion">Current version 0.1.92</p>
               <h2 id="updateTitle">You're up to date</h2>
               <p id="updateCopy">Last checked a few minutes ago.</p>
             </div>
@@ -1147,17 +1206,27 @@ app.setName(CONNECTOR_NAME);
 app.setAppUserModelId(APP_USER_MODEL_ID);
 app.on("before-quit", () => {
   quitting = true;
+  logLifecycle("quitting");
   void closeZvecCollections();
   if (runner && !runner.stopped) runner.stop("application quitting");
 });
 
+rotateLogIfLarge(logPath);
+rotateLogIfLarge(errPath);
 const gotLock = app.requestSingleInstanceLock();
+logLifecycle(
+  `launch version=${app.getVersion()} gotLock=${gotLock} ppid=${process.ppid} exe=${process.execPath} ` +
+  `userData=${app.getPath("userData")} argv=${JSON.stringify(redactArgv(process.argv.slice(1)))}`
+);
 if (!gotLock) {
+  logLifecycle("another connector already holds the instance lock; this launch exits after forwarding its arguments");
   app.quit();
 } else {
+  logRunningConnectorProcesses();
   app.setAsDefaultProtocolClient(PROTOCOL_NAME);
   app.on("second-instance", (_event, argv) => {
     appendLog(errPath, "A second connector launch was blocked; the running connector was brought forward.");
+    logLifecycle(`second launch blocked argv=${JSON.stringify(redactArgv(argv.slice(1)))}`);
     const protocolArg = argv.find((entry) => entry.startsWith(`${PROTOCOL_NAME}://`));
     if (protocolArg) handleProtocolUrl(protocolArg);
     if (argv.includes("--show-updates") && mainWindow && !mainWindow.isDestroyed()) {
@@ -1167,6 +1236,7 @@ if (!gotLock) {
   });
   app.on("open-url", (event, url) => {
     event.preventDefault();
+    logLifecycle(`open-url ${redactConnectorUrl(url)}`);
     if (mainWindow) handleProtocolUrl(url);
     else pendingProtocolUrl = url;
   });
@@ -1220,6 +1290,7 @@ if (!gotLock) {
     } catch (e) { appendLog(errPath, `Local Matching IPC failed: ${formatConnectorError(e)}`); }
     createWindow();
     createTray();
+    logLifecycle("window and tray created");
     const protocolArg =
       process.argv.find((entry) => entry.startsWith(`${PROTOCOL_NAME}://`)) || pendingProtocolUrl;
     if (protocolArg) {

@@ -2613,7 +2613,16 @@ function findNarrationBill(openBills: OpenBillReference[], transaction: ReviewTr
   }).sort((left, right) =>
     normalizeReferenceToken(right.referenceName).length - normalizeReferenceToken(left.referenceName).length
   );
-  if (matches.length === 0) return null;
+  if (matches.length === 0) {
+    // Narrations often carry only the invoice's own number ("...-55112"), not the full
+    // "INV/26-27/55112" reference: accept a unique bill whose last segment is a whole word there.
+    const words = new Set(`${transaction.description} ${transaction.referenceNumber}`.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean));
+    const tailMatches = openBills.filter((bill) => {
+      const tail = String(bill.referenceName ?? "").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).at(-1) ?? "";
+      return tail.length >= 4 && /\d/.test(tail) && words.has(tail);
+    });
+    return tailMatches.length === 1 ? tailMatches[0] : null;
+  }
   const longestLength = normalizeReferenceToken(matches[0].referenceName).length;
   const longestMatches = matches.filter(
     (bill) => normalizeReferenceToken(bill.referenceName).length === longestLength
@@ -2796,7 +2805,17 @@ function allocateBillsForTransaction(
   const narrationBill = findNarrationBill(openBills, transaction);
   const candidateBills = sortOpenBills(openBills);
 
-  if (openBills.length > 0 && existingAdvances.length > 0) {
+  // An existing advance only needs review when it is unclear which bill the money settles.
+  // A bill named in the narration that covers the amount, or the one bill with exactly this
+  // amount, is unambiguous: settle it and leave the advance untouched.
+  const exactAmountBills = openBills.filter((bill) => Math.abs((bill.pendingAmount ?? 0) - receiptAmount) < 0.005);
+  const unambiguousBill =
+    narrationBill && (narrationBill.pendingAmount ?? 0) + 0.005 >= receiptAmount
+      ? narrationBill
+      : exactAmountBills.length === 1
+        ? exactAmountBills[0]
+        : null;
+  if (openBills.length > 0 && existingAdvances.length > 0 && !unambiguousBill) {
     return {
       status: "needs_review",
       caseType: "cannot_match_yet",
@@ -2818,7 +2837,7 @@ function allocateBillsForTransaction(
     receiptAmount,
     openBills,
     buildAdvanceReference(transaction),
-    narrationBill?.referenceName
+    (narrationBill ?? unambiguousBill)?.referenceName
   );
   const allocations: BillAllocationLine[] = automaticAllocation.allocations;
   const billAllocationCount = allocations.filter((allocation) => allocation.referenceType === "Agst Ref").length;
