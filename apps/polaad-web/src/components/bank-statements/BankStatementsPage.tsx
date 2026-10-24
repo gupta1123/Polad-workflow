@@ -2815,7 +2815,12 @@ function allocateBillsForTransaction(
       : exactAmountBills.length === 1
         ? exactAmountBills[0]
         : null;
-  if (openBills.length > 0 && existingAdvances.length > 0 && !unambiguousBill) {
+  // With no clear target, a receipt that fits inside the open bills is settled oldest-first and
+  // the existing advance is left untouched. Only a receipt larger than every open bill still
+  // needs a person, because the leftover could be netted against the advance.
+  const totalOpenAmount = openBills.reduce((sum, bill) => sum + Math.max(0, bill.pendingAmount ?? 0), 0);
+  const fitsWithinOpenBills = receiptAmount <= totalOpenAmount + 0.005;
+  if (openBills.length > 0 && existingAdvances.length > 0 && !unambiguousBill && !fitsWithinOpenBills) {
     return {
       status: "needs_review",
       caseType: "cannot_match_yet",
@@ -2843,6 +2848,9 @@ function allocateBillsForTransaction(
   const billAllocationCount = allocations.filter((allocation) => allocation.referenceType === "Agst Ref").length;
   const isBalanced = isAllocationTotalValid(receiptAmount, automaticAllocation.totalAllocatedAmount);
   let allocationReason = "Allocated against the oldest open bill using due date, invoice date, then bill reference.";
+  if (existingAdvances.length > 0 && !unambiguousBill) {
+    allocationReason = `Allocated oldest bill first. The existing advance of ${formatCurrencyAmount(existingAdvances.reduce((sum, advance) => sum + Math.abs(advance.pendingAdvanceAmount ?? 0), 0))} is left untouched.`;
+  }
   if (openBills.length === 0) {
     allocationReason = `No open bill was found. The full ${allocationSubject} will be posted as a new ${isOutgoingPaymentRow(transaction) ? "supplier" : "customer"} advance.`;
   } else if (narrationBill) {
