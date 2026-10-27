@@ -1460,3 +1460,49 @@ test("bank bill fetch attaches invoice narration only when asked, and never fail
   assert.equal(failed.bills.openBills[0].narration, undefined);
   assert.notEqual(failed.bills.narrationChecked, true);
 });
+
+// Mirrors the connector's found / ambiguous / missing rule for a candidate set.
+const statusOf = (match) => match.candidates.length === 0 ? "missing"
+  : match.identityInsufficient || match.candidates.length > 1 ? "ambiguous" : "found";
+
+test("a voucher carrying the statement's own narration counts as the same entry", () => {
+  const particulars = "RTGS :AGRAWAL STEEL :HDFC";
+  const row = { voucherDate: "2026-08-01", amount: 1250, expectedDirection: "incoming", narration: particulars, counterpartyLedgerName: "Agrawal Steel" };
+  const check = (vouchers, transaction = row) => strictBankTransactionCandidates(vouchers, transaction, "ICICI Current Account", new Set());
+  const typed = (overrides = {}) => ({ ...bankVoucher({ party: "Agrawal Steel Center" }), narration: "rtgs : agrawal  steel :hdfc", ...overrides });
+
+  // Same day, bank, amount, direction and text: found, even though the typed party ledger differs.
+  const same = check([typed()]);
+  assert.equal(same.candidates.length, 1);
+  assert.equal(same.identityInsufficient, false);
+  assert.equal(same.matchBasis, "date_bank_amount_direction_narration");
+  assert.equal(statusOf(same), "found");
+
+  // Text alone is not enough: amount, direction and bank must also agree.
+  assert.equal(check([typed()], { ...row, amount: 1251 }).candidates.length, 0);
+  assert.equal(check([typed()], { ...row, expectedDirection: "outgoing" }).candidates.length, 0);
+  // Short or different text does not identify an entry.
+  const notNarration = (match) => match.matchBasis !== "date_bank_amount_direction_narration" && match.matchBasis !== "narration_nearby_date";
+  assert.equal(notNarration(check([typed({ narration: "NEFT" })], { ...row, narration: "NEFT" })), true);
+  assert.equal(notNarration(check([typed({ narration: "RTGS :RATNASHREE STEEL :IBKL" })])), true);
+  assert.equal(check([typed({ narration: "RTGS :RATNASHREE STEEL :IBKL" })]).candidates.length, 0);
+
+  // A strong reference conflict still rules the voucher out.
+  const withUtr = check([typed({ reference: "UTIBN26300012345", bankReferences: ["UTIBN26300012345"] })], { ...row, referenceNumber: "UTIBN26300099999" });
+  assert.equal(withUtr.candidates.length, 0);
+});
+
+test("the same narration a few days off is flagged for review, never auto-skipped", () => {
+  const row = { voucherDate: "2026-08-01", amount: 1250, expectedDirection: "incoming", narration: "NEFT:MASKE TRADERS:ICIC", counterpartyLedgerName: "Maske Traders" };
+  const voucher = (date) => ({ ...bankVoucher({ party: "Maske Traders" }), date, effectiveDate: date, narration: "NEFT:MASKE TRADERS:ICIC" });
+  const check = (vouchers) => strictBankTransactionCandidates(vouchers, row, "ICICI Current Account", new Set());
+
+  const nearby = check([voucher("20260803")]);
+  assert.equal(nearby.matchBasis, "narration_nearby_date");
+  assert.equal(statusOf(nearby), "ambiguous");
+  // Four days away, or already reserved by another row, is not flagged.
+  assert.equal(check([voucher("20260805")]).candidates.length, 0);
+  assert.equal(strictBankTransactionCandidates([voucher("20260803")], row, "ICICI Current Account", new Set([0])).candidates.length, 0);
+  // The exact-day match always wins over a nearby one.
+  assert.equal(check([voucher("20260803"), voucher("20260801")]).matchBasis, "date_bank_amount_direction_narration");
+});

@@ -3469,6 +3469,28 @@ function baseBankTransactionCandidates(vouchers, transaction, bankLedgerName, re
   });
 }
 
+// A manually typed voucher often carries the statement's own Particulars text as its narration.
+// Compare it as letters and digits only, so spacing and punctuation differences do not matter.
+const NARRATION_IDENTITY_MIN_LENGTH = 12;
+const NARRATION_NEARBY_DAYS = 3;
+
+function compactNarration(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function narrationsIdentifySameEntry(rowNarration, voucherNarration) {
+  const row = compactNarration(rowNarration);
+  const voucher = compactNarration(voucherNarration);
+  if (row.length < NARRATION_IDENTITY_MIN_LENGTH || voucher.length < NARRATION_IDENTITY_MIN_LENGTH) return false;
+  return row === voucher || voucher.includes(row) || row.includes(voucher);
+}
+
+function daysBetween(left, right) {
+  const a = Date.parse(`${left}T00:00:00Z`);
+  const b = Date.parse(`${right}T00:00:00Z`);
+  return Number.isFinite(a) && Number.isFinite(b) ? Math.abs(Math.round((a - b) / 86_400_000)) : Infinity;
+}
+
 function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, reservedVoucherIndexes, byDate = null) {
   const { bankReference, trackingReference } = bankTransactionReferences(transaction);
   const counterpartyLedgerName = String(transaction.counterpartyLedgerName || "").trim();
@@ -3523,7 +3545,18 @@ function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, 
       ? compatible.filter(({ voucher, index }) => !reservedVoucherIndexes.has(index) &&
           voucherHasLedger(voucher, counterpartyLedgerName))
       : [];
-    if (partyMatches.length > 0) {
+    const rowNarration = transaction.narration || transaction.description;
+    const narrationMatches = baseCandidates.filter(({ voucher, index }) =>
+      !reservedVoucherIndexes.has(index) &&
+      !voucherHasConflictingBankReference(voucher, bankReference) &&
+      narrationsIdentifySameEntry(rowNarration, voucher.narration));
+    if (narrationMatches.length > 0) {
+      // Same day, bank ledger, amount, direction and the statement's own text: the same entry,
+      // even if the party ledger on the manual voucher differs or is missing.
+      candidates = narrationMatches;
+      matchBasis = "date_bank_amount_direction_narration";
+      identityInsufficient = false;
+    } else if (partyMatches.length > 0) {
       candidates = partyMatches;
       matchBasis = "date_bank_amount_direction_party";
       identityInsufficient = candidates.some(({ voucher }) =>
@@ -3532,6 +3565,26 @@ function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, 
       candidates = compatible;
       identityInsufficient = compatible.length > 0;
       matchBasis = compatible.length > 0 ? "possible_manual_entry" : null;
+    }
+    if (candidates.length === 0) {
+      // Same text, bank ledger, amount and direction a few days off: probably entered on another
+      // date. Never auto-skip it, but flag it for review instead of posting a second copy.
+      const rowDate = normalizeDateForCompare(transaction.voucherDate);
+      const nearby = vouchers.flatMap((voucher, index) => {
+        if (reservedVoucherIndexes.has(index)) return [];
+        const date = normalizeDateForCompare(voucher.effectiveDate || voucher.date);
+        const gap = daysBetween(date, rowDate);
+        if (!date || gap === 0 || gap > NARRATION_NEARBY_DAYS) return [];
+        if (!narrationsIdentifySameEntry(transaction.narration || transaction.description, voucher.narration)) return [];
+        if (voucherHasConflictingBankReference(voucher, bankReference)) return [];
+        const bankEntry = getBankLedgerEntry(voucher, bankLedgerName, Number(transaction.amount || 0), transaction.expectedDirection);
+        return bankEntry ? [{ voucher, index, bankEntry }] : [];
+      });
+      if (nearby.length > 0) {
+        candidates = nearby;
+        identityInsufficient = true;
+        matchBasis = "narration_nearby_date";
+      }
     }
   }
 
