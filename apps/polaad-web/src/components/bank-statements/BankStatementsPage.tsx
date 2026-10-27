@@ -8068,14 +8068,11 @@ export function BankStatementsPage() {
                     <div className="mt-3 rounded-xl border border-[#e5ddd0] bg-[#faf8f4]/70 p-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.8)]">
                       <div className="mb-3 flex items-start justify-between gap-3 border-b border-[#e5ddd0] pb-2.5">
                         <div>
-                          <div className="text-[11px] font-extrabold text-[#1a1a1a]">Filter transactions</div>
-                          <div className="mt-0.5 text-[9px] font-semibold text-slate-400">
-                            Combine search, workflow, Tally, ledger, and period filters.
-                          </div>
+                          <div className="text-[12px] font-extrabold text-[#1a1a1a]">Filter transactions</div>
                         </div>
                         <div className="flex shrink-0 items-center gap-1.5">
                           <button
-                            className="h-7 rounded-lg border border-[#e5ddd0] bg-white px-2.5 text-[9px] font-bold text-[#5a5046] transition hover:bg-[#f5f1eb] hover:text-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-40"
+                            className="h-7 rounded-lg px-2.5 text-[11px] font-bold text-[#8a4b12] transition hover:bg-[#f5f1eb] disabled:cursor-not-allowed disabled:text-slate-400 disabled:hover:bg-transparent"
                             disabled={activeReviewFilterCount === 0}
                             onClick={() => {
                               setReviewSearch("");
@@ -8093,7 +8090,7 @@ export function BankStatementsPage() {
                           </button>
                           <button
                             aria-label="Close transaction filters"
-                            className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[#e5ddd0] bg-white text-slate-400 transition hover:bg-[#f5f1eb] hover:text-[#1a1a1a]"
+                            className="inline-flex h-7 w-7 items-center justify-center rounded-lg text-slate-500 transition hover:bg-[#f5f1eb] hover:text-[#1a1a1a]"
                             onClick={() => setReviewFiltersOpen(false)}
                             type="button"
                           >
@@ -8104,7 +8101,7 @@ export function BankStatementsPage() {
 
                       <div className="grid gap-2.5 md:grid-cols-2 xl:grid-cols-12 xl:items-end">
                         <label className="block xl:col-span-4">
-                          <span className="text-[9px] font-bold uppercase tracking-wider text-slate-400">Search</span>
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Search</span>
                           <div className="relative mt-1">
                             <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
                             <input
@@ -8118,9 +8115,9 @@ export function BankStatementsPage() {
                         </label>
 
                         <label className="block xl:col-span-2">
-                          <span className="text-[9px] font-bold uppercase tracking-wider text-slate-400">Work status</span>
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Work status</span>
                           <select
-                            className="mt-1 h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 text-[10px] font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
+                            className="mt-1 h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 text-[11px] font-semibold text-[#1a1a1a] outline-none focus:border-amber-500"
                             onChange={(event) => setReviewWorkStatusFilter(event.target.value as ReviewWorkStatusFilter)}
                             title="Needs action contains only unresolved close ledger matches."
                             value={reviewWorkStatusFilter}
@@ -8133,9 +8130,9 @@ export function BankStatementsPage() {
                         </label>
 
                         <label className="block xl:col-span-2">
-                          <span className="text-[9px] font-bold uppercase tracking-wider text-slate-400">Tally status</span>
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Tally status</span>
                           <select
-                            className="mt-1 h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 text-[10px] font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
+                            className="mt-1 h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 text-[11px] font-semibold text-[#1a1a1a] outline-none focus:border-amber-500"
                             onChange={(event) => setReviewTallyResultFilter(event.target.value as ReviewTallyResultFilter)}
                             value={reviewTallyResultFilter}
                           >
@@ -8149,9 +8146,9 @@ export function BankStatementsPage() {
                         </label>
 
                         <label className="block xl:col-span-2">
-                          <span className="text-[9px] font-bold uppercase tracking-wider text-slate-400">Ledger review</span>
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Ledger review</span>
                           <select
-                            className="mt-1 h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 text-[10px] font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
+                            className="mt-1 h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 text-[11px] font-semibold text-[#1a1a1a] outline-none focus:border-amber-500"
                             onChange={(event) => setReviewLedgerFilter(event.target.value as ReviewLedgerFilter)}
                             value={reviewLedgerFilter}
                           >
@@ -8164,9 +8161,9 @@ export function BankStatementsPage() {
                         </label>
 
                         <label className="block xl:col-span-2">
-                          <span className="text-[9px] font-bold uppercase tracking-wider text-slate-400">Money flow</span>
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Money flow</span>
                           <select
-                            className="mt-1 h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 text-[10px] font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
+                            className="mt-1 h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 text-[11px] font-semibold text-[#1a1a1a] outline-none focus:border-amber-500"
                             onChange={(event) => setReviewDirectionFilter(event.target.value as ReviewDirectionFilter)}
                             value={reviewDirectionFilter}
                           >
@@ -8176,42 +8173,38 @@ export function BankStatementsPage() {
                           </select>
                         </label>
 
-                        <fieldset className={`min-w-0 rounded-lg border border-[#e5ddd0] bg-white px-2.5 pb-2 pt-1.5 md:col-span-2 ${tallyCheckAttempted ? "xl:col-span-8" : "xl:col-span-12"}`}>
-                          <legend className="px-1 text-[9px] font-bold uppercase tracking-wider text-slate-400">Statement period</legend>
-                          <div className="grid gap-2 sm:grid-cols-2">
-                            <label className="block min-w-0">
-                              <span className="text-[8px] font-bold uppercase tracking-wide text-slate-400">From</span>
-                              <div className="relative mt-0.5">
-                                <CalendarDays className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-                                <input
-                                  className="h-8 w-full rounded-lg border border-[#e5ddd0] bg-[#fcfbfa] px-2.5 pl-8 text-[10px] font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
-                                  onChange={(event) => setReviewDateFrom(event.target.value)}
-                                  ref={reviewPeriodInputRef}
-                                  type="date"
-                                  value={reviewDateFrom}
-                                />
-                              </div>
-                            </label>
-                            <label className="block min-w-0">
-                              <span className="text-[8px] font-bold uppercase tracking-wide text-slate-400">To</span>
-                              <div className="relative mt-0.5">
-                                <CalendarDays className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-                                <input
-                                  className="h-8 w-full rounded-lg border border-[#e5ddd0] bg-[#fcfbfa] px-2.5 pl-8 text-[10px] font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
-                                  onChange={(event) => setReviewDateTo(event.target.value)}
-                                  type="date"
-                                  value={reviewDateTo}
-                                />
-                              </div>
-                            </label>
+                        <label className="block xl:col-span-3">
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Period from</span>
+                          <div className="relative mt-1">
+                            <CalendarDays className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+                            <input
+                              className="h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 pl-8 text-[11px] font-semibold text-[#1a1a1a] outline-none focus:border-amber-500"
+                              onChange={(event) => setReviewDateFrom(event.target.value)}
+                              ref={reviewPeriodInputRef}
+                              type="date"
+                              value={reviewDateFrom}
+                            />
                           </div>
-                        </fieldset>
+                        </label>
+
+                        <label className="block xl:col-span-3">
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Period to</span>
+                          <div className="relative mt-1">
+                            <CalendarDays className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+                            <input
+                              className="h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 pl-8 text-[11px] font-semibold text-[#1a1a1a] outline-none focus:border-amber-500"
+                              onChange={(event) => setReviewDateTo(event.target.value)}
+                              type="date"
+                              value={reviewDateTo}
+                            />
+                          </div>
+                        </label>
 
                         {tallyCheckAttempted ? (
-                          <label className="block md:col-span-2 xl:col-span-4">
-                            <span className="text-[9px] font-bold uppercase tracking-wider text-slate-400">Receipt allocation</span>
+                          <label className="block xl:col-span-3">
+                            <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Receipt allocation</span>
                             <select
-                              className="mt-1 h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 text-[10px] font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
+                              className="mt-1 h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 text-[11px] font-semibold text-[#1a1a1a] outline-none focus:border-amber-500"
                               onChange={(event) => setReviewAllocationFilter(event.target.value as ReviewAllocationFilter)}
                               value={reviewAllocationFilter}
                             >
@@ -8231,7 +8224,7 @@ export function BankStatementsPage() {
                   <table className="w-full min-w-full table-fixed border-collapse text-left md:min-w-[900px] xl:min-w-[1120px]">
                     <thead className="sticky top-0 z-20">
                       <tr className="border-b border-[#d8cbbb] bg-[#f7f3ed] text-[9px] font-extrabold uppercase tracking-[0.1em] text-[#776b5f]">
-                        <th className="w-[74px] px-3 py-2">Date</th>
+                        <th className="w-[96px] px-3 py-2">Date</th>
                         <th className="w-auto px-2 py-2 sm:px-3 md:w-[28%]">Particulars</th>
                         <th className="hidden w-[84px] px-2 py-2 lg:table-cell">Vch type</th>
                         <th className="hidden w-[120px] px-2 py-2 xl:table-cell">Reference</th>
@@ -8333,7 +8326,7 @@ export function BankStatementsPage() {
                                 else reviewRowRefs.current.delete(transaction.id);
                               }}
                             >
-                              <td className="px-3 py-2 align-top text-[10px] font-bold leading-[12px] text-slate-600">
+                              <td className="whitespace-nowrap px-3 py-2 align-top text-[10px] font-bold leading-[12px] text-slate-600">
                                 {formatShortDate(getEffectiveTransactionDate(transaction))}
                               </td>
                               <td
@@ -8400,10 +8393,10 @@ export function BankStatementsPage() {
                               <td className="hidden px-2 py-2 align-top text-[9px] font-bold leading-[12px] text-slate-600 xl:table-cell" title={reference}>
                                 <span className="block truncate">{reference || "-"}</span>
                               </td>
-                              <td className="hidden px-3 py-2 align-top text-right text-[11px] font-extrabold leading-[14px] tabular-nums text-red-600 md:table-cell">
+                              <td className={`hidden px-3 py-2 align-top text-right text-[11px] font-extrabold leading-[14px] tabular-nums md:table-cell ${debit ? "text-red-600" : "text-slate-300"}`}>
                                 {debit || "-"}
                               </td>
-                              <td className="hidden px-3 py-2 align-top text-right text-[11px] font-extrabold leading-[14px] tabular-nums text-emerald-700 md:table-cell">
+                              <td className={`hidden px-3 py-2 align-top text-right text-[11px] font-extrabold leading-[14px] tabular-nums md:table-cell ${credit ? "text-emerald-700" : "text-slate-300"}`}>
                                 {credit || "-"}
                               </td>
                               <td className={`px-2 py-2 align-top text-right text-[10px] font-extrabold leading-[14px] tabular-nums md:hidden ${debit ? "text-red-600" : "text-emerald-700"}`}>
@@ -8417,7 +8410,7 @@ export function BankStatementsPage() {
                                     : ""
                                 } ${
                                   highlightedReviewAction === "ledger"
-                                    ? "relative group-data-[active=true]:ring-2 group-data-[active=true]:ring-inset group-data-[active=true]:ring-[#ad7617]"
+                                    ? "relative group-data-[active=true]:ring-1 group-data-[active=true]:ring-inset group-data-[active=true]:ring-[#d69a28]"
                                     : ""
                                 }`}
                                 onClick={() => {
@@ -8473,7 +8466,7 @@ export function BankStatementsPage() {
                               <td
                                 className={`px-2 py-2 align-top sm:px-3 ${
                                   highlightedReviewAction !== "ledger"
-                                    ? "relative group-data-[active=true]:ring-2 group-data-[active=true]:ring-inset group-data-[active=true]:ring-[#ad7617]"
+                                    ? "relative group-data-[active=true]:ring-1 group-data-[active=true]:ring-inset group-data-[active=true]:ring-[#d69a28]"
                                     : ""
                                 }`}
                               >
