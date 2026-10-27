@@ -7,7 +7,7 @@ const narrationsAgree = (left?: string, right?: string | null) => {
 };
 const normalize = (value: string) => value.toUpperCase().replace(/[^A-Z0-9]/g, "");
 const money = (value: number) => new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", minimumFractionDigits: 2 }).format(value);
-const date = (value: string) => /^\d{4}-\d{2}-\d{2}$/.test(value) ? value.split("-").reverse().join("/") : value;
+const date = (value: string) => /^\d{4}-\d{2}-\d{2}$/.test(value) ? new Date(`${value}T00:00:00`).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }) : value;
 export function comparePostingVoucher(statement: ReviewStatement, match: Partial<PostingMatch>) {
   const refs = match.bankReferences?.length ? match.bankReferences : match.reference ? [match.reference] : [];
   const fields = [

@@ -118,7 +118,7 @@ function dayGapText(statementDate?: string | null, voucherDate?: string | null) 
   const days = Math.round((Date.parse(String(statementDate || "").slice(0, 10)) - Date.parse(String(voucherDate || "").slice(0, 10))) / 86400000);
   if (!Number.isFinite(days) || days === 0) return "";
   const n = Math.abs(days);
-  return `, entered ${n} ${n === 1 ? "day" : "days"} ${days > 0 ? "earlier" : "later"}`;
+  return `, dated ${n} ${n === 1 ? "day" : "days"} ${days > 0 ? "earlier" : "later"}`;
 }
 export function heldPostingReason(row: StatementRow, rows: StatementRow[], matches: PostingMatch[]) {
   const normalize = (value?: string | null) => String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
@@ -129,7 +129,7 @@ export function heldPostingReason(row: StatementRow, rows: StatementRow[], match
   if (matches.length > 1) reason = `${matches.length} Tally vouchers could match this transaction. Compare their dates, parties and references to identify the correct voucher.`;
   else if (!row.referenceNumber && sameRows.length > 1 && matches.length === 1) reason = "This statement repeats the same transaction details without a bank reference. One existing Tally voucher cannot confirm both rows. Check whether this row is a separate transaction.";
   else if (matches.length === 1 && matches[0].narration && narrationsAgree(row.description, matches[0].narration)) {
-    reason = `Tally voucher${matches[0].voucherNumber ? ` ${matches[0].voucherNumber}` : ""} carries the same narration as this statement line${dayGapText(row.transactionDate, matches[0].date)}. It may be the same entry typed in by hand. Compare the two before posting.`;
+    return `Same narration as Tally voucher${matches[0].voucherNumber ? ` ${matches[0].voucherNumber}` : ""}${dayGapText(row.transactionDate, matches[0].date)}. Check it is not the same entry.`;
   } else if (matches.length === 1) {
     const match = matches[0];
     const references = [match.reference, ...match.bankReferences].filter(Boolean);
