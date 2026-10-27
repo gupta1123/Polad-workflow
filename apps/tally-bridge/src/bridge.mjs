@@ -30,7 +30,7 @@ const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
 
-const BRIDGE_VERSION = "0.1.92";
+const BRIDGE_VERSION = "0.1.93";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 
 // Diagnostic lines for "Check Tally" and bank posting. They go to bridge.log
@@ -5013,7 +5013,7 @@ function findBankLedgersFromMasters(ledgers, groups) {
     while (currentName) {
       const normalized = normalizeLooseName(currentName);
       if (!normalized || visited.has(normalized)) return false;
-      if (normalized === normalizeLooseName("Bank Accounts")) return true;
+      if (BANK_GROUP_NAMES.some((groupName) => normalized === normalizeLooseName(groupName))) return true;
       visited.add(normalized);
       currentName = groupParentByName.get(normalized) || null;
     }
@@ -5033,6 +5033,10 @@ function findBankLedgersFromMasters(ledgers, groups) {
   });
 }
 
+// Cash-credit and overdraft ledgers sit under their own group trees, not under
+// "Bank Accounts", but they are still bank accounts for statement matching.
+const BANK_GROUP_NAMES = ["Bank Accounts", "Bank OD A/c", "Bank CC A/c"];
+
 async function fetchBankLedgersFromTally(config, commandPayload = {}) {
   const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
   const companyNames = mergeCompanyNames([
@@ -5051,22 +5055,27 @@ async function fetchBankLedgersFromTally(config, commandPayload = {}) {
       // was busy. Fall back to the full scan only when the group yields nothing.
       const bankFetchFields =
         "Name,Parent,GUID,ClosingBalance,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BranchName,BankBranchName,Branch,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName";
-      let scopedLedgerXml = null;
-      try {
-        const xml = await exportTallyCollection(tallyUrl, {
-          collectionName: "Polaad Bank Ledger Discovery",
-          tallyType: "Ledger",
-          fetchFields: bankFetchFields,
-          companyName,
-          childOf: "Bank Accounts",
-          belongsTo: true,
-        });
-        if (parseMasterCollection(xml, "LEDGER").length > 0) scopedLedgerXml = xml;
-      } catch {
-        scopedLedgerXml = null;
+      const scopedLedgerByName = new Map();
+      for (const bankGroupName of BANK_GROUP_NAMES) {
+        try {
+          const xml = await exportTallyCollection(tallyUrl, {
+            collectionName: "Polaad Bank Ledger Discovery",
+            tallyType: "Ledger",
+            fetchFields: bankFetchFields,
+            companyName,
+            childOf: bankGroupName,
+            belongsTo: true,
+          });
+          for (const ledger of parseMasterCollection(xml, "LEDGER")) {
+            if (ledger?.name) scopedLedgerByName.set(ledger.name, ledger);
+          }
+        } catch {
+          // A missing group (e.g. no Bank CC A/c in this company) is not an error.
+        }
       }
+      const scopedLedgers = Array.from(scopedLedgerByName.values());
       const [ledgerXml, groupXml] = await Promise.all([
-        scopedLedgerXml ?? exportTallyCollection(tallyUrl, {
+        scopedLedgers.length > 0 ? Promise.resolve(null) : exportTallyCollection(tallyUrl, {
           collectionName: "Polaad Bank Ledger Discovery",
           tallyType: "Ledger",
           fetchFields: bankFetchFields,
@@ -5079,7 +5088,7 @@ async function fetchBankLedgersFromTally(config, commandPayload = {}) {
           companyName,
         }),
       ]);
-      const ledgers = parseMasterCollection(ledgerXml, "LEDGER");
+      const ledgers = scopedLedgers.length > 0 ? scopedLedgers : parseMasterCollection(ledgerXml, "LEDGER");
       const groups = parseMasterCollection(groupXml, "GROUP");
       byCompany[key] = findBankLedgersFromMasters(ledgers, groups)
         .map(toBankLedgerPayload);
@@ -5200,7 +5209,7 @@ async function collectTallyMasters(config, commandPayload = {}) {
     };
     const bankLedgerNames = ledgers
       .filter((ledger) =>
-        descendsFrom(ledger.parent, "Bank Accounts") || descendsFrom(ledger.parent, "Bank OD A/c")
+        BANK_GROUP_NAMES.some((groupName) => descendsFrom(ledger.parent, groupName))
       )
       .map((ledger) => ledger.name);
 

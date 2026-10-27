@@ -447,6 +447,7 @@ type TallyMaster = {
   type: string;
   parent?: string | null;
   billWiseEnabled?: boolean | null;
+  inBankGroup?: boolean;
   ledgerType?: string | null;
   raw?: {
     billWiseEnabled?: boolean | null;
@@ -761,6 +762,8 @@ function masterParentDescendsFromGroup(
   return masterParentDescendsFromGroupMap(parentName, parentByName, targetGroupName);
 }
 
+const BANK_GROUP_NAMES = ["Bank Accounts", "Bank OD A/c", "Bank CC A/c"];
+
 function normalizeLiveLedgerMasters(ledgers: TallyMaster[], groups: TallyMaster[]) {
   const parentByName = new Map(
     groups
@@ -774,12 +777,18 @@ function normalizeLiveLedgerMasters(ledgers: TallyMaster[], groups: TallyMaster[
         ? "supplier"
         : ledger.ledgerType ?? "other";
     const rawBillWiseEnabled = ledger.raw?.billWiseEnabled;
+    // Cash-credit / overdraft groups (e.g. "01.COSMOS CC GROUP" under "Bank CC A/c")
+    // are bank accounts even though their parent is not literally "Bank Accounts".
+    const inBankGroup = BANK_GROUP_NAMES.some((groupName) =>
+      masterParentDescendsFromGroupMap(ledger.parent, parentByName, groupName)
+    );
 
     return {
       ...ledger,
       key: ledger.key || ledger.guid || normalizeName(ledger.name),
       type: ledger.type || "ledger",
       ledgerType,
+      inBankGroup: inBankGroup || ledger.inBankGroup === true,
       billWiseEnabled:
         typeof ledger.billWiseEnabled === "boolean"
           ? ledger.billWiseEnabled
@@ -1363,6 +1372,7 @@ function isBankLedgerMaster(ledger: TallyMaster) {
   const accountNumber = String(ledger.bankAccountNumber ?? "").trim();
 
   if (/\bbank\s+accounts?\b/.test(parent)) return true;
+  if (ledger.inBankGroup === true) return true;
   if (bankName || accountNumber) return true;
   return false;
 }
