@@ -11,6 +11,7 @@ type Props = {
   matches: Array<Partial<PostingMatch>>; confirmed: boolean; held: boolean;
   checkedAt?: string | null; checkFailed?: boolean; canRecheck: boolean; busy: boolean;
   notice?: string | null;
+  canDecide?: boolean; onDecide?: (decision: "same" | "separate") => void;
   ledgers: string[]; onRecheck: (ledgerName?: string) => void; onClose: () => void; onNext: () => void; hasNext: boolean;
 };
 
@@ -104,8 +105,11 @@ export function BankPostingReview(props: Props) {
             
           </section> : null}
         </div>
-        <footer className="flex items-center justify-between gap-3 border-t border-[#e5ddd0] px-5 py-3">
-          <span />
+        <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-[#e5ddd0] px-4 py-3">
+          {props.canDecide && props.onDecide ? <div className="flex flex-wrap gap-2">
+            <Button variant="outline" disabled={props.busy} onClick={() => props.onDecide?.("same")}>Same entry, skip</Button>
+            <Button variant="outline" disabled={props.busy} onClick={() => props.onDecide?.("separate")}>Different payment, post it</Button>
+          </div> : <span />}
           <Button onClick={props.hasNext ? props.onNext : props.onClose}>{props.hasNext ? "Next entry" : "Close"}</Button>
         </footer>
       </aside>

@@ -916,7 +916,7 @@ function createWindow() {
           <div class="updateHero">
             <div class="updateTile" aria-hidden="true">✓</div>
             <div>
-              <p class="updateVersion">Current version 0.1.96</p>
+              <p class="updateVersion">Current version 0.1.97</p>
               <h2 id="updateTitle">You're up to date</h2>
               <p id="updateCopy">Last checked a few minutes ago.</p>
             </div>

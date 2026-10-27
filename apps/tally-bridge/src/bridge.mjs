@@ -30,7 +30,7 @@ const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
 
-const BRIDGE_VERSION = "0.1.96";
+const BRIDGE_VERSION = "0.1.97";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 
 // Diagnostic lines for "Check Tally" and bank posting. They go to bridge.log
@@ -2394,7 +2394,11 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
           console.log(`Command ${command.id} completed: bank transaction already existed in Tally.`);
           continue;
         }
-        if (preflight?.verificationStatus === "ambiguous") {
+        const reviewerConfirmedSeparate = preflight?.verificationStatus === "ambiguous" && command.payload?.separateEntryConfirmed === true;
+        if (reviewerConfirmedSeparate) {
+          logTallyPost(`${describeBankRow(command.payload)} possible duplicate cleared by reviewer basis=${preflight.matchBasis || "-"}; posting as a separate entry`);
+        }
+        if (preflight?.verificationStatus === "ambiguous" && !reviewerConfirmedSeparate) {
           await sendCommandResult(config, command, {
             success: false,
             error: "Possible existing bank transaction found in Tally. Review before posting to avoid a duplicate.",
@@ -2409,7 +2413,7 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
           continue;
         }
 
-        if (preflight?.verificationStatus !== "missing") {
+        if (preflight?.verificationStatus !== "missing" && !reviewerConfirmedSeparate) {
           logTallyPost(`${describeBankRow(command.payload)} BLOCKED duplicate check returned status=${preflight?.verificationStatus || "none"}; nothing posted`);
           await sendCommandResult(config, command, {
             success: false,

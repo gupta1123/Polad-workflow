@@ -57,6 +57,7 @@ type QueuePayload = {
     billMatchingVerified?: boolean;
     directPosting?: boolean;
     duplicateCheckVerified?: boolean;
+    separateEntryConfirmed?: boolean;
     ledgerSelectionConfirmed?: boolean;
     saveMapping?: boolean;
   }>;
@@ -165,6 +166,7 @@ type TransactionLedgerSelection = {
   billMatchingVerified: boolean;
   directPosting: boolean;
   duplicateCheckVerified: boolean;
+  separateEntryConfirmed: boolean;
   ledgerSelectionConfirmed: boolean;
 };
 
@@ -372,6 +374,7 @@ export async function POST(request: Request) {
               billMatchingVerified: transaction?.billMatchingVerified === true,
               directPosting: transaction?.directPosting === true,
               duplicateCheckVerified: transaction?.duplicateCheckVerified === true,
+              separateEntryConfirmed: transaction?.separateEntryConfirmed === true,
               ledgerSelectionConfirmed: transaction?.ledgerSelectionConfirmed === true,
             },
           ] as const,
@@ -1134,6 +1137,8 @@ export async function POST(request: Request) {
             billAllocations,
             expectedDirection: outgoingPayment ? "outgoing" : "incoming",
             preflightVerifyExisting: true,
+            // The reviewer saw a possible duplicate and confirmed this is a separate transaction.
+            separateEntryConfirmed: selectedLedger?.separateEntryConfirmed === true,
           },
         });
 

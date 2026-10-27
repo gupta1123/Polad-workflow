@@ -664,6 +664,7 @@ type OutgoingVerificationDraft = {
   checkedAt?: string | null;
   checkFailed?: boolean;
   alreadyInTally?: boolean;
+  separateEntryConfirmed?: boolean;
   reviewKind?: "held" | "confirmation_pending" | "outcome_unknown";
   status:
     | "verification_pending"
@@ -5333,6 +5334,24 @@ export function BankStatementsPage() {
     if (next) setBillAllocationReviewTransactionId(next.id);
   }
 
+  // A reviewer's call on a possible duplicate: "same" counts it as already in Tally, "separate" lets it post.
+  function decideDuplicateReview(transactionId: string, decision: "same" | "separate") {
+    setTallyPresenceByTransactionId((current) => {
+      const draft = current[transactionId];
+      if (!draft || draft.status !== "ambiguous") return current;
+      const first = draft.matches?.[0];
+      return {
+        ...current,
+        [transactionId]: decision === "same"
+          ? { ...draft, status: "found", label: "Already in Tally", alreadyInTally: true, reviewKind: undefined,
+              reason: "Reviewer confirmed this is the same entry.", voucherNumber: first?.voucherNumber ?? draft.voucherNumber ?? null,
+              voucherDate: first?.date ?? draft.voucherDate ?? null }
+          : { ...draft, status: "missing", label: "Posting as new", reviewKind: undefined, separateEntryConfirmed: true,
+              reason: "Reviewer confirmed this is a separate transaction." },
+      };
+    });
+  }
+
   function completePostingReview(transactionId: string) {
     setBillAllocationReviewTransactionId(null);
     setOutgoingReviewTransactionId(null);
@@ -6859,6 +6878,9 @@ export function BankStatementsPage() {
                 duplicateCheckVerified:
                   reviewedTransaction != null &&
                   tallyPresenceByTransactionId[reviewedTransaction.id]?.status === "missing",
+                separateEntryConfirmed:
+                  reviewedTransaction != null &&
+                  tallyPresenceByTransactionId[reviewedTransaction.id]?.separateEntryConfirmed === true,
                 billAllocations: postingBillAllocations.length > 0
                     ? postingBillAllocations.map((allocation) => ({
                         referenceType: allocation.referenceType,
@@ -9175,6 +9197,8 @@ export function BankStatementsPage() {
                   canRecheck={needsPostingCheck.some(row => statementRowKey(row) === statementRowKey(outgoingReviewTransaction))}
                   busy={recheckingPostings || tallyPostingInProgress || sending || matchingBills}
                   notice={postingReviewNotice}
+                  canDecide={tallyResultReviewDraft?.status === "ambiguous"}
+                  onDecide={decision => { decideDuplicateReview(outgoingReviewTransaction.id, decision); setPostingReviewNotice(null); completePostingReview(outgoingReviewTransaction.id); }}
                   ledgers={ledgerMasters.map(ledger => ledger.name)}
                   onRecheck={ledgerName => {
                     const saved = needsPostingCheck.find(row => statementRowKey(row) === statementRowKey(outgoingReviewTransaction));
