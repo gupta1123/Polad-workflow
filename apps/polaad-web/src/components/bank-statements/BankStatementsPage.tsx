@@ -1240,12 +1240,12 @@ function transactionIsValid(transaction: ReviewTransaction) {
   );
 }
 
-const bankAmountFormatter = new Intl.NumberFormat(undefined, {
+const bankAmountFormatter = new Intl.NumberFormat("en-IN", {
   maximumFractionDigits: 2,
   minimumFractionDigits: 0,
 });
 
-const bankCurrencyInputFormatter = new Intl.NumberFormat(undefined, {
+const bankCurrencyInputFormatter = new Intl.NumberFormat("en-IN", {
   maximumFractionDigits: 2,
   minimumFractionDigits: 2,
 });
@@ -3454,6 +3454,7 @@ export function BankStatementsPage() {
   const [tallyBalanceProof, setTallyBalanceProof] = useState<TallyBalanceProof | null>(null);
   const [billAllocationReviewTransactionId, setBillAllocationReviewTransactionId] = useState<string | null>(null);
   const [billAllocationSearch, setBillAllocationSearch] = useState("");
+  const [billAllocationShowAll, setBillAllocationShowAll] = useState(false);
   const [confirmFullAdvance, setConfirmFullAdvance] = useState(false);
   const [outgoingReviewTransactionId, setOutgoingReviewTransactionId] = useState<string | null>(null);
   const [reviewActionStage, setReviewActionStage] = useState<"ledger" | "posting">("ledger");
@@ -4440,7 +4441,15 @@ export function BankStatementsPage() {
         .some((value) => normalizeName(String(value)).includes(query))
     );
   }, [billAllocationReviewDraft, billAllocationSearch]);
+  // A ledger can have hundreds of open bills; render the first page and let the
+  // user search or expand, so the panel stays fast.
+  const BILL_ALLOCATION_PAGE_SIZE = 100;
+  const visibleBillAllocationCandidates =
+    billAllocationShowAll || billAllocationSearch.trim()
+      ? filteredBillAllocationCandidates
+      : filteredBillAllocationCandidates.slice(0, BILL_ALLOCATION_PAGE_SIZE);
   useEffect(() => {
+    setBillAllocationShowAll(false);
     setBillAllocationSearch("");
     setConfirmFullAdvance(false);
   }, [billAllocationReviewTransactionId]);
@@ -8694,7 +8703,7 @@ export function BankStatementsPage() {
                         </div>
                       ) : (
                         <>
-                          <div className="border-y border-[#b8cad5] bg-[#f4f8fb] px-3 py-2.5 text-[#172f3e]">
+                          <div className="sticky top-0 z-20 border-y border-[#b8cad5] bg-[#f4f8fb] px-3 py-2.5 text-[#172f3e] shadow-[0_2px_6px_rgba(23,47,62,0.12)]">
                             <div className="flex flex-wrap items-end justify-between gap-3">
                               <div>
                                 <div className="text-[8px] font-extrabold uppercase tracking-[0.14em] text-[#7890a1]">
@@ -8925,7 +8934,7 @@ export function BankStatementsPage() {
                                       </td>
                                     </tr>
                                   ) : (
-                                    filteredBillAllocationCandidates.map((bill) => {
+                                    visibleBillAllocationCandidates.map((bill) => {
                                       const currentAmount =
                                         billAllocationReviewDraft.allocations.find(
                                           (line) => line.referenceType === "Agst Ref" && line.referenceName === bill.referenceName
@@ -8995,6 +9004,21 @@ export function BankStatementsPage() {
                                       );
                                     })
                                   )}
+                                  {visibleBillAllocationCandidates.length < filteredBillAllocationCandidates.length ? (
+                                    <tr>
+                                      <td className="px-3 py-2.5 text-center text-[10px] font-bold text-slate-500" colSpan={4}>
+                                        Showing {visibleBillAllocationCandidates.length} of {filteredBillAllocationCandidates.length} bills.{" "}
+                                        <button
+                                          className="font-extrabold text-[#1f4f6b] underline"
+                                          onClick={() => setBillAllocationShowAll(true)}
+                                          type="button"
+                                        >
+                                          Show all
+                                        </button>{" "}
+                                        or search by bill number or amount.
+                                      </td>
+                                    </tr>
+                                  ) : null}
                                   <tr className="bg-[#fbf8f3]">
                                     <td className="px-3 py-2.5 font-bold text-[#1a1a1a]">New advance</td>
                                     <td className="px-3 py-2.5" aria-label="Not allocated to an open bill"></td>
