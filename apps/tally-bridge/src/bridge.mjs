@@ -3616,6 +3616,7 @@ function serializeStrictVoucherMatch(candidate) {
     bankLedgerName: candidate.bankEntry?.ledgerName || null,
     direction: candidate.bankEntry ? (candidate.bankEntry.isDebit ? "incoming" : "outgoing") : null,
     partyLedgerName: voucher.partyLedgerName,
+    narration: voucher.narration || null,
     ledgerNames: voucher.ledgerNames,
     masterId: voucher.masterId,
   };

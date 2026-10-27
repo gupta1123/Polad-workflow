@@ -1,6 +1,10 @@
 import type { PostingMatch } from "./statement-bank-book";
 
-export type ReviewStatement = { date: string; amount: number; ledger: string; bank: string; reference: string; direction: "incoming" | "outgoing" };
+export type ReviewStatement = { date: string; amount: number; ledger: string; bank: string; reference: string; narration?: string; direction: "incoming" | "outgoing" };
+const narrationsAgree = (left?: string, right?: string | null) => {
+  const a = String(left || "").toLowerCase().replace(/[^a-z0-9]+/g, ""), b = String(right || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+  return a.length >= 12 && b.length >= 12 && (a === b || a.includes(b) || b.includes(a));
+};
 const normalize = (value: string) => value.toUpperCase().replace(/[^A-Z0-9]/g, "");
 const money = (value: number) => new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", minimumFractionDigits: 2 }).format(value);
 const date = (value: string) => /^\d{4}-\d{2}-\d{2}$/.test(value) ? value.split("-").reverse().join("/") : value;
@@ -15,6 +19,8 @@ export function comparePostingVoucher(statement: ReviewStatement, match: Partial
     { label: "Bank ledger", statement: statement.bank, tally: match.bankLedgerName || null, equal: normalize(statement.bank) === normalize(match.bankLedgerName || "") },
     { label: "Payment / receipt", statement: statement.direction === "incoming" ? "Receipt" : "Payment", tally: match.direction ? match.direction === "incoming" ? "Receipt" : "Payment" : null,
       equal: statement.direction === match.direction },
+    { label: "Narration", statement: statement.narration || "Not recorded", tally: match.narration || null,
+      equal: narrationsAgree(statement.narration, match.narration) },
     { label: "Bank reference / UTR", statement: statement.reference || "Not recorded", tally: refs.join(", ") || null,
       equal: Boolean(statement.reference && refs.some(ref => normalize(ref) === normalize(statement.reference))) },
   ];

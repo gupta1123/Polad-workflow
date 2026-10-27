@@ -47,3 +47,11 @@ test('recheck messages distinguish new confirmations, no change, failure and com
   assert.match(recheckResultMessage({ confirmed: 1, checked: 1, remaining: 0 }), /All entries are confirmed.*No vouchers were posted/);
   assert.equal(summarizeSavedPostings([{ ...row, postingStatus: 'verified', postingResult: { alreadyInTally: true } }]).alreadyExisting, 1);
 });
+
+test('the compare table shows both narrations and marks the same text as matching', () => {
+  const statement = { date: '2026-10-01', amount: 21000, ledger: 'Om Sai Iron Works', bank: 'Axis Bank', reference: '', narration: 'NEFT CR-UTIB0001234-OM SAI IRON WORKS-PAYMENT 7001', direction: 'incoming' };
+  const rows = comparePostingVoucher(statement, { date: '2026-10-01', amount: 21000, bankLedgerName: 'Axis Bank', direction: 'incoming', narration: 'NEFT CR-UTIB0001234-OM SAI IRON WORKS-PAYMENT 7001', ledgerNames: [], bankReferences: [] });
+  assert.equal(rows.find(row => row.label === 'Narration').state, 'match');
+  const other = comparePostingVoucher(statement, { narration: 'Received from customer', ledgerNames: [], bankReferences: [] });
+  assert.equal(other.find(row => row.label === 'Narration').state, 'different');
+});

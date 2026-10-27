@@ -89,7 +89,7 @@ export type PostingMatch = {
   reasons: string[]; ledgerNames: string[]; bankReferences: string[];
   date: string | null; voucherType: string | null; voucherNumber: string | null;
   reference: string | null; partyLedgerName: string | null; masterId: string | null;
-  amount?: number | null; bankLedgerName?: string | null; direction?: string | null;
+  amount?: number | null; bankLedgerName?: string | null; direction?: string | null; narration?: string | null;
 };
 export function postingMatches(result?: Record<string, unknown> | null): PostingMatch[] {
   const recheck = result?.recheck as { verification?: Record<string, unknown>; lastSuccessfulVerification?: Record<string, unknown> } | undefined;
@@ -105,10 +105,21 @@ export function postingMatches(result?: Record<string, unknown> | null): Posting
       date: string("date"), voucherType: string("voucherType"), voucherNumber: string("voucherNumber"), reference: string("reference"),
       partyLedgerName: string("partyLedgerName"), masterId: string("masterId"),
       amount: typeof row.amount === "number" && Number.isFinite(row.amount) ? row.amount : null,
-      bankLedgerName: string("bankLedgerName"), direction: string("direction") }];
+      bankLedgerName: string("bankLedgerName"), direction: string("direction"), narration: string("narration") }];
   }) : [];
 }
 
+const compactText = (value?: string | null) => String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+export function narrationsAgree(left?: string | null, right?: string | null) {
+  const a = compactText(left), b = compactText(right);
+  return a.length >= 12 && b.length >= 12 && (a === b || a.includes(b) || b.includes(a));
+}
+function dayGapText(statementDate?: string | null, voucherDate?: string | null) {
+  const days = Math.round((Date.parse(String(statementDate || "").slice(0, 10)) - Date.parse(String(voucherDate || "").slice(0, 10))) / 86400000);
+  if (!Number.isFinite(days) || days === 0) return "";
+  const n = Math.abs(days);
+  return `, entered ${n} ${n === 1 ? "day" : "days"} ${days > 0 ? "earlier" : "later"}`;
+}
 export function heldPostingReason(row: StatementRow, rows: StatementRow[], matches: PostingMatch[]) {
   const normalize = (value?: string | null) => String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
   const sameRows = rows.filter(candidate => candidate.transactionDate === row.transactionDate &&
@@ -117,7 +128,9 @@ export function heldPostingReason(row: StatementRow, rows: StatementRow[], match
   let reason = "Possible existing entry in Tally. Compare the voucher details before deciding whether this is a separate transaction.";
   if (matches.length > 1) reason = `${matches.length} Tally vouchers could match this transaction. Compare their dates, parties and references to identify the correct voucher.`;
   else if (!row.referenceNumber && sameRows.length > 1 && matches.length === 1) reason = "This statement repeats the same transaction details without a bank reference. One existing Tally voucher cannot confirm both rows. Check whether this row is a separate transaction.";
-  else if (matches.length === 1) {
+  else if (matches.length === 1 && matches[0].narration && narrationsAgree(row.description, matches[0].narration)) {
+    reason = `Tally voucher${matches[0].voucherNumber ? ` ${matches[0].voucherNumber}` : ""} carries the same narration as this statement line${dayGapText(row.transactionDate, matches[0].date)}. It may be the same entry typed in by hand. Compare the two before posting.`;
+  } else if (matches.length === 1) {
     const match = matches[0];
     const references = [match.reference, ...match.bankReferences].filter(Boolean);
     if (row.referenceNumber && references.length && !references.some(reference => normalize(reference) === normalize(row.referenceNumber))) {

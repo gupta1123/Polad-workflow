@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { AlertTriangle, Loader2, RefreshCw, X } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Loader2, RefreshCw, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { comparePostingVoucher, type ReviewStatement } from "@/lib/bank-posting-review";
 import type { PostingMatch } from "@/lib/statement-bank-book";
@@ -25,47 +25,54 @@ export function BankPostingReview(props: Props) {
       <aside role="dialog" aria-modal="true" aria-label="Tally entry details" className="relative z-10 flex h-full w-full max-w-[720px] flex-col border-l border-[#ddd3c5] bg-white shadow-2xl">
         <header className="border-b border-[#e5ddd0] px-5 py-4">
           <div className="flex items-start justify-between gap-4">
-            <div><p className="text-xs font-semibold text-slate-500">Tally entry details</p><h2 className="mt-1 text-lg font-bold text-[#2b241d]">{props.title}</h2></div>
+            <div className="min-w-0">
+              <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-slate-500">Tally entry check</p>
+              <h2 className="mt-1 truncate text-lg font-bold text-[#2b241d]">{props.title}</h2>
+              <p className="mt-0.5 text-xs font-semibold text-slate-500">{props.statement.date} · {new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR" }).format(props.statement.amount)}</p>
+            </div>
             <Button autoFocus variant="ghost" size="icon" aria-label="Close" onClick={props.onClose}><X className="h-4 w-4" /></Button>
           </div>
-          <p className="mt-2 text-sm text-slate-600">{props.statement.date} · {new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR" }).format(props.statement.amount)}</p>
         </header>
-        <div className="min-h-0 flex-1 overflow-y-auto">
-          <section className={`border-b px-5 py-4 ${props.confirmed ? "border-sky-100 bg-sky-50" : "border-amber-100 bg-amber-50"}`}>
-            <p className={`text-sm font-bold ${props.confirmed ? "text-sky-900" : "text-amber-900"}`}>{props.label}</p>
-            <p className="mt-1 text-sm leading-6 text-[#4b4238]">{props.reason}</p>
-            <p className="mt-2 text-xs text-slate-600">{props.checkedAt ? `Last recheck: ${new Date(props.checkedAt).toLocaleString("en-IN")}` : "Saved result from the last Tally check."} Opening these details does not run a new check.</p>
-            {props.notice ? <p role="status" aria-live="polite" className="mt-3 rounded-lg border border-[#ddd3c5] bg-white p-3 text-sm leading-6">{props.notice}</p> : null}
+        <div className="min-h-0 flex-1 overflow-y-auto bg-[#faf8f4]">
+          <section className={`flex gap-3 border-b px-5 py-4 ${props.confirmed ? "border-sky-100 bg-sky-50" : "border-amber-100 bg-amber-50"}`}>
+            {props.confirmed ? <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-sky-700" /> : <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-700" />}
+            <div className="min-w-0">
+              <p className={`text-[11px] font-bold uppercase tracking-wide ${props.confirmed ? "text-sky-900" : "text-amber-900"}`}>{props.label}</p>
+              <p className="mt-1 text-sm leading-6 text-[#3d352c]">{props.reason}</p>
+              <p className="mt-2 text-[11px] text-slate-500">{props.checkedAt ? `Last recheck: ${new Date(props.checkedAt).toLocaleString("en-IN")}` : "Saved result from the last Tally check."} Opening these details does not run a new check.</p>
+              {props.notice ? <p role="status" aria-live="polite" className="mt-3 rounded-lg border border-[#ddd3c5] bg-white p-3 text-sm leading-6">{props.notice}</p> : null}
+            </div>
           </section>
           <section className="px-5 py-4">
-            <h3 className="text-sm font-bold">{props.confirmed ? "Matched Tally voucher" : "Compare with Tally"}</h3>
+            <h3 className="text-[10px] font-bold uppercase tracking-[0.14em] text-slate-500">{props.confirmed ? "Matched Tally voucher" : "Compare with Tally"}</h3>
             {props.checkFailed ? <p className="mt-2 text-sm text-amber-800">The latest check failed. These are previously saved voucher details.</p> : null}
             {props.matches.length ? props.matches.map((match, index) => {
               const comparison = comparePostingVoucher(props.statement, match);
-              return <div key={`${match.masterId || match.voucherNumber || index}`} className="mt-3 overflow-hidden rounded-lg border border-[#e5ddd0]">
-                <div className="flex flex-wrap items-center justify-between gap-2 bg-[#faf8f4] px-3 py-2.5">
-                  <h4 className="text-sm font-bold">{match.voucherNumber ? `Voucher ${match.voucherNumber}` : `Possible voucher ${index + 1}`}{match.voucherType ? ` · ${match.voucherType}` : ""}</h4>
-                  <span className="text-xs text-slate-500">{props.confirmed ? "Confirmed in Tally" : "Possible match"}</span>
+              return <div key={`${match.masterId || match.voucherNumber || index}`} className="mt-3 overflow-hidden rounded-xl border border-[#e5ddd0] bg-white">
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#eee8df] px-4 py-3">
+                  <h4 className="text-sm font-bold text-[#2b241d]">{match.voucherNumber ? `Voucher ${match.voucherNumber}` : `Possible voucher ${index + 1}`}{match.voucherType ? ` · ${match.voucherType}` : ""}</h4>
+                  <span className={`rounded-full border px-2 py-0.5 text-[9px] font-bold uppercase tracking-wide ${props.confirmed ? "border-sky-200 bg-sky-50 text-sky-800" : "border-amber-250 bg-amber-50 text-amber-800"}`}>{props.confirmed ? "Confirmed in Tally" : "Possible match"}</span>
                 </div>
-                <table className="w-full table-fixed text-left text-xs sm:text-sm">
-                  <thead><tr className="border-b border-[#e5ddd0]"><th className="w-[28%] p-3 font-semibold">Compare</th><th className="w-[36%] p-3 font-semibold">Statement</th><th className="w-[36%] p-3 font-semibold">Tally voucher</th></tr></thead>
-                  <tbody>{comparison.map(field => <tr key={field.label} className={`border-b border-[#eee8df] last:border-0 ${field.state === "different" ? "bg-amber-50" : ""}`}>
-                    <th className="break-words p-3 align-top font-medium text-slate-600">{field.label}{field.state === "different" ? <span className="mt-1 block text-xs font-semibold text-amber-800">Different</span> : null}</th>
-                    <td className="break-words p-3 align-top">{field.statement}</td>
-                    <td className={`break-words p-3 align-top ${field.state === "different" ? "font-semibold text-amber-900" : !field.tally ? "text-slate-500" : ""}`}>{field.tally || (field.label === "Bank reference / UTR" ? "Not recorded" : "Not returned by this check")}</td>
-                  </tr>)}</tbody>
-                </table>
-                {match.reference ? <p className="border-t border-[#eee8df] px-3 py-2 text-xs text-slate-600">Voucher reference: <span className="break-all font-medium">{match.reference}</span></p> : null}
+                <div className="grid grid-cols-[110px_1fr_1fr] gap-x-3 border-b border-[#eee8df] bg-[#faf8f4] px-4 py-2 text-[10px] font-bold uppercase tracking-wide text-slate-500"><span>Field</span><span>Statement</span><span>Tally voucher</span></div>
+                <dl>{comparison.map(field => <div key={field.label} className={`grid grid-cols-[110px_1fr_1fr] gap-x-3 border-b border-[#f1ece3] px-4 py-2.5 text-[13px] leading-5 last:border-0 ${field.state === "different" ? "bg-amber-50" : ""}`}>
+                  <dt className="text-xs font-semibold text-slate-500">{field.label}</dt>
+                  <dd className="break-words font-medium text-[#2b241d]">{field.statement}</dd>
+                  <dd className={`flex items-start gap-1.5 break-words font-medium ${field.state === "different" ? "text-amber-900" : !field.tally ? "text-slate-400" : "text-[#2b241d]"}`}>
+                    {field.state === "match" ? <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600" aria-label="Matches" /> : field.state === "different" ? <span className="mt-0.5 shrink-0 rounded bg-amber-100 px-1 text-[9px] font-bold uppercase text-amber-800">Differs</span> : null}
+                    <span>{field.tally || (field.label === "Bank reference / UTR" ? "Not recorded" : "Not returned by this check")}</span>
+                  </dd>
+                </div>)}</dl>
+                {match.reference ? <p className="border-t border-[#eee8df] px-4 py-2 text-xs text-slate-600">Voucher reference: <span className="break-all font-medium">{match.reference}</span></p> : null}
               </div>;
-            }) : <div className="mt-3 rounded-lg border border-[#e5ddd0] p-4 text-sm leading-6">
+            }) : <div className="mt-3 rounded-xl border border-[#e5ddd0] bg-white p-4 text-sm leading-6">
               <dl className="grid gap-3 sm:grid-cols-2">
-                {[["Selected ledger", props.statement.ledger || "Not selected"], ["Bank ledger", props.statement.bank], ["Bank reference / UTR", props.statement.reference || "Not recorded"], ["Payment / receipt", props.statement.direction === "incoming" ? "Receipt" : "Payment"]].map(([label, value]) => <div key={label}><dt className="text-xs text-slate-500">{label}</dt><dd className="break-words font-medium">{value}</dd></div>)}
+                {[["Selected ledger", props.statement.ledger || "Not selected"], ["Bank ledger", props.statement.bank], ["Bank reference / UTR", props.statement.reference || "Not recorded"], ["Payment / receipt", props.statement.direction === "incoming" ? "Receipt" : "Payment"]].map(([label, value]) => <div key={label}><dt className="text-xs font-semibold text-slate-500">{label}</dt><dd className="break-words font-medium">{value}</dd></div>)}
               </dl>
               <p className="mt-4 text-slate-600">No candidate voucher details were returned. Check the bank ledger in Tally for this date, amount and reference. A missing match alone does not mean it is safe to post again.</p>
             </div>}
           </section>
-          {!props.confirmed && props.canRecheck ? <section className="border-t border-[#e5ddd0] px-5 py-4">
-            <h3 className="text-sm font-bold">What to do next</h3>
+          {!props.confirmed && props.canRecheck ? <section className="border-t border-[#e5ddd0] bg-white px-5 py-4">
+            <h3 className="text-[10px] font-bold uppercase tracking-[0.14em] text-slate-500">What to do next</h3>
             <p className="mt-2 text-sm leading-6 text-slate-600">{props.held ? "Compare the voucher in Tally with this statement entry. If the selected ledger is wrong, correct it below. If Tally needs a correction, make it there, then recheck." : "Keep Tally and the connector open on this company, then recheck the voucher confirmation. This entry may already have been posted."}</p>
             <div className="mt-3 flex flex-wrap gap-2">
               <Button variant="outline" disabled={props.busy} onClick={() => props.onRecheck()}>{props.busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}Recheck this entry</Button>

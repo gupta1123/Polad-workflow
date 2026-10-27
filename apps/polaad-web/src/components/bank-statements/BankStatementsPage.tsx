@@ -654,6 +654,7 @@ type OutgoingMatchCandidate = {
   ledgerNames: string[];
   masterId?: string | null;
   bankReferences?: string[];
+  narration?: string | null;
   amount?: number | null;
   bankLedgerName?: string | null;
   direction?: string | null;
@@ -2409,6 +2410,7 @@ function outgoingVerificationFromCommand(command?: TallyCommand | null): Outgoin
           bankLedgerName: typeof row.bankLedgerName === "string" ? row.bankLedgerName : null,
           direction: typeof row.direction === "string" ? row.direction : null,
           partyLedgerName: typeof row.partyLedgerName === "string" ? row.partyLedgerName : null,
+          narration: typeof row.narration === "string" ? row.narration : null,
           ledgerNames: Array.isArray(row.ledgerNames)
             ? row.ledgerNames.filter((ledgerName): ledgerName is string => typeof ledgerName === "string")
             : [],
@@ -8478,6 +8480,14 @@ export function BankStatementsPage() {
                                     <span className="text-[9px] text-slate-500">{tallyPresence.reason || "Check again before sending"}</span>
                                     <span className="text-[9px] font-semibold text-amber-800 underline">View details</span>
                                   </button>
+                                ) : tallyPresence?.status === "ambiguous" ? (
+                                  <button type="button" className="flex w-full flex-col items-start gap-1 rounded-lg border border-transparent px-1.5 py-0 text-left transition hover:border-amber-200 hover:bg-amber-50 focus-visible:ring-2 focus-visible:ring-amber-300" title="Compare with the possible Tally voucher"
+                                    onClick={() => { setReviewActionStage("posting"); setOutgoingReviewTransactionId(transaction.id); }}>
+                                    <span className="inline-flex min-h-5 max-w-full self-start items-center rounded-full border border-amber-250 bg-amber-50 px-2 py-0.5 text-[8px] font-bold uppercase leading-none tracking-wide text-amber-800">Possible duplicate</span>
+                                    <span className="block w-full whitespace-normal break-words text-[9px] font-semibold leading-[13px] text-slate-500">
+                                      {tallyPresence.matches?.[0]?.voucherNumber ? `Voucher ${tallyPresence.matches[0].voucherNumber} · ` : ""}Review before posting
+                                    </span>
+                                  </button>
                                 ) : outgoingPayment && !outgoingNeedsBillAllocation ? (
                                   <button
                                     className={`flex w-full min-w-0 flex-col items-start gap-1 rounded-lg border border-transparent px-1.5 py-0 text-left transition ${
@@ -9153,7 +9163,7 @@ export function BankStatementsPage() {
                   key={`${outgoingReviewTransaction.id}:${outgoingReviewTransaction.selectedLedgerName}`}
                   statement={{ date: getEffectiveTransactionDate(outgoingReviewTransaction), amount: Number(tallyResultReviewAmount),
                     ledger: outgoingReviewTransaction.selectedLedgerName, bank: bankLedgerName,
-                    reference: getTransactionReference(outgoingReviewTransaction), direction: tallyResultReviewIsIncoming ? "incoming" : "outgoing" }}
+                    reference: getTransactionReference(outgoingReviewTransaction), narration: outgoingReviewTransaction.description || "", direction: tallyResultReviewIsIncoming ? "incoming" : "outgoing" }}
                   title={getTransactionPartyTitle(outgoingReviewTransaction)}
                   label={tallyResultReviewDraft?.label || "Not checked in Tally"}
                   reason={tallyResultReviewReason || "Check this entry in Tally before posting."}
