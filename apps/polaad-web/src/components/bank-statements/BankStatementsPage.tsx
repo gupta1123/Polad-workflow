@@ -4863,8 +4863,8 @@ export function BankStatementsPage() {
     setOutgoingReviewTransactionId(null);
   }, [selectReviewTransaction]);
   const pollTallyPostingStatus = useCallback(async (connectionId: string, commandIds: string[]) => {
-    for (let attempt = 0; attempt < 180; attempt += 1) {
-      await wait(2000);
+    for (let attempt = 0; attempt < 360; attempt += 1) {
+      await wait(1000);
 
       const commandChunks = await Promise.all(
         chunkValues(commandIds, 80).map(async (chunk) => {
@@ -4938,7 +4938,7 @@ export function BankStatementsPage() {
   }, []);
 
   const pollTallyQueueJob = useCallback(async (jobId: string): Promise<TallyQueueResult> => {
-    for (let attempt = 0; attempt < 180; attempt += 1) {
+    for (let attempt = 0; attempt < 340; attempt += 1) {
       const payload = await readTallyQueueJob(jobId);
       const job = payload.job;
       if (job?.status === "succeeded") {
@@ -4965,7 +4965,7 @@ export function BankStatementsPage() {
             ? `Preparing Tally queue: ${Math.min(processed, total)} of ${total} transaction(s).`
             : "Preparing Tally queue.",
       });
-      await wait(1500);
+      await wait(800);
     }
 
     throw new Error("Tally queue preparation is still running. Keep the connector open and try refreshing in a moment.");
@@ -5550,7 +5550,7 @@ export function BankStatementsPage() {
     const startedAt = Date.now();
     const maximumWaitMs = 15 * 60 * 1000;
     for (let attempt = 0; Date.now() - startedAt < maximumWaitMs; attempt += 1) {
-      await wait(attempt < 10 ? 3000 : 5000);
+      await wait(attempt === 0 ? 1000 : attempt < 15 ? 1500 : 4000);
       const payload = await loadImportPreviewMetadata(importId);
       if (payload.processing) {
         setAnalysisEngineSource(payload.extractionSource ?? null);
