@@ -30,7 +30,7 @@ const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
 
-const BRIDGE_VERSION = "0.1.95";
+const BRIDGE_VERSION = "0.1.96";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 
 // Diagnostic lines for "Check Tally" and bank posting. They go to bridge.log
@@ -3546,13 +3546,16 @@ function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, 
           voucherHasLedger(voucher, counterpartyLedgerName))
       : [];
     const rowNarration = transaction.narration || transaction.description;
-    const narrationMatches = baseCandidates.filter(({ voucher, index }) =>
+    const narrationAll = baseCandidates.filter(({ voucher, index }) =>
       !reservedVoucherIndexes.has(index) &&
       !voucherHasConflictingBankReference(voucher, bankReference) &&
       narrationsIdentifySameEntry(rowNarration, voucher.narration));
+    // The party must also agree (or be unknown): the same text under a different customer is not
+    // a confirmed duplicate, it is something to review.
+    const compatibleKeys = new Set(compatible.map(({ index }) => index));
+    const narrationMatches = narrationAll.filter(({ index }) => compatibleKeys.has(index));
     if (narrationMatches.length > 0) {
-      // Same day, bank ledger, amount, direction and the statement's own text: the same entry,
-      // even if the party ledger on the manual voucher differs or is missing.
+      // Same day, bank ledger, amount, direction, text and party: the same entry.
       candidates = narrationMatches;
       matchBasis = "date_bank_amount_direction_narration";
       identityInsufficient = false;
@@ -3565,6 +3568,11 @@ function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, 
       candidates = compatible;
       identityInsufficient = compatible.length > 0;
       matchBasis = compatible.length > 0 ? "possible_manual_entry" : null;
+    }
+    if (candidates.length === 0 && narrationAll.length > 0) {
+      candidates = narrationAll;
+      identityInsufficient = true;
+      matchBasis = "narration_party_differs";
     }
     if (candidates.length === 0) {
       // Same text, bank ledger, amount and direction a few days off: probably entered on another

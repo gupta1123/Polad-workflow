@@ -128,7 +128,10 @@ export function heldPostingReason(row: StatementRow, rows: StatementRow[], match
   let reason = "Possible existing entry in Tally. Compare the voucher details before deciding whether this is a separate transaction.";
   if (matches.length > 1) reason = `${matches.length} Tally vouchers could match this transaction. Compare their dates, parties and references to identify the correct voucher.`;
   else if (!row.referenceNumber && sameRows.length > 1 && matches.length === 1) reason = "This statement repeats the same transaction details without a bank reference. One existing Tally voucher cannot confirm both rows. Check whether this row is a separate transaction.";
-  else if (matches.length === 1 && matches[0].narration && narrationsAgree(row.description, matches[0].narration)) {
+  else if (matches.length === 1 && matches[0].narration && narrationsAgree(row.description, matches[0].narration) && row.selectedLedgerName && matches[0].partyLedgerName &&
+    normalize(matches[0].partyLedgerName) !== normalize(row.selectedLedgerName)) {
+    return `Same narration as Tally voucher${matches[0].voucherNumber ? ` ${matches[0].voucherNumber}` : ""}, but it is entered under ${matches[0].partyLedgerName}, not ${row.selectedLedgerName}.`;
+  } else if (matches.length === 1 && matches[0].narration && narrationsAgree(row.description, matches[0].narration)) {
     return `Same narration as Tally voucher${matches[0].voucherNumber ? ` ${matches[0].voucherNumber}` : ""}${dayGapText(row.transactionDate, matches[0].date)}. Check it is not the same entry.`;
   } else if (matches.length === 1) {
     const match = matches[0];

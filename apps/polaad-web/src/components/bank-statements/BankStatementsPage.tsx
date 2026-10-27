@@ -2437,7 +2437,7 @@ function outgoingVerificationFromCommand(command?: TallyCommand | null): Outgoin
   if (verificationStatus === "ambiguous") {
     return {
       status: "ambiguous",
-      label: "Possible Match",
+      label: "Possible duplicate",
       reason: reason || "Multiple Tally vouchers look similar. Review manually.",
       voucherNumber,
       voucherDate,
@@ -8485,7 +8485,7 @@ export function BankStatementsPage() {
                                     onClick={() => { setReviewActionStage("posting"); setOutgoingReviewTransactionId(transaction.id); }}>
                                     <span className="inline-flex min-h-5 max-w-full self-start items-center rounded-full border border-amber-250 bg-amber-50 px-2 py-0.5 text-[8px] font-bold uppercase leading-none tracking-wide text-amber-800">Possible duplicate</span>
                                     <span className="block w-full whitespace-normal break-words text-[9px] font-semibold leading-[13px] text-slate-500">
-                                      {tallyPresence.matches?.[0]?.voucherNumber ? `Voucher ${tallyPresence.matches[0].voucherNumber} · ` : ""}Review before posting
+                                      {tallyPresence.matches?.[0]?.voucherNumber ? `Voucher ${tallyPresence.matches[0].voucherNumber}` : "Review before posting"}
                                     </span>
                                   </button>
                                 ) : outgoingPayment && !outgoingNeedsBillAllocation ? (

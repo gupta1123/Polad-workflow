@@ -1471,18 +1471,23 @@ test("a voucher carrying the statement's own narration counts as the same entry"
   const check = (vouchers, transaction = row) => strictBankTransactionCandidates(vouchers, transaction, "ICICI Current Account", new Set());
   const typed = (overrides = {}) => ({ ...bankVoucher({ party: "Agrawal Steel Center" }), narration: "rtgs : agrawal  steel :hdfc", ...overrides });
 
-  // Same day, bank, amount, direction and text: found, even though the typed party ledger differs.
-  const same = check([typed()]);
+  // Same day, bank, amount, direction, text and party: found.
+  const same = check([{ ...bankVoucher({ party: "Agrawal Steel" }), narration: "rtgs : agrawal  steel :hdfc" }]);
   assert.equal(same.candidates.length, 1);
   assert.equal(same.identityInsufficient, false);
   assert.equal(same.matchBasis, "date_bank_amount_direction_narration");
   assert.equal(statusOf(same), "found");
 
+  // The same text under a different party is flagged for review, never treated as found.
+  const otherParty = check([typed()]);
+  assert.equal(otherParty.matchBasis, "narration_party_differs");
+  assert.equal(statusOf(otherParty), "ambiguous");
+
   // Text alone is not enough: amount, direction and bank must also agree.
   assert.equal(check([typed()], { ...row, amount: 1251 }).candidates.length, 0);
   assert.equal(check([typed()], { ...row, expectedDirection: "outgoing" }).candidates.length, 0);
   // Short or different text does not identify an entry.
-  const notNarration = (match) => match.matchBasis !== "date_bank_amount_direction_narration" && match.matchBasis !== "narration_nearby_date";
+  const notNarration = (match) => match.matchBasis !== "date_bank_amount_direction_narration" && match.matchBasis !== "narration_nearby_date" && match.matchBasis !== "narration_party_differs";
   assert.equal(notNarration(check([typed({ narration: "NEFT" })], { ...row, narration: "NEFT" })), true);
   assert.equal(notNarration(check([typed({ narration: "RTGS :RATNASHREE STEEL :IBKL" })])), true);
   assert.equal(check([typed({ narration: "RTGS :RATNASHREE STEEL :IBKL" })]).candidates.length, 0);

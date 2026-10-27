@@ -14,6 +14,12 @@ type Props = {
   ledgers: string[]; onRecheck: (ledgerName?: string) => void; onClose: () => void; onNext: () => void; hasNext: boolean;
 };
 
+function StateIcon({ state }: { state: string }) {
+  if (state === "match") return <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600" aria-label="Matches" />;
+  if (state === "different") return <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600" aria-label="Differs" />;
+  return <span className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />;
+}
+
 const longDate = (value: string) => /^\d{4}-\d{2}-\d{2}$/.test(value) ? new Date(`${value}T00:00:00`).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }) : value;
 
 export function BankPostingReview(props: Props) {
@@ -32,7 +38,7 @@ export function BankPostingReview(props: Props) {
           </div>
           <div className="bg-white px-4 py-2.5">
             <h2 className="text-[15px] font-extrabold leading-5 text-[#171717]">{props.title}</h2>
-            <p className="mt-1 text-[9px] font-bold leading-4 text-[#61788a]">{longDate(props.statement.date)} · {new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR" }).format(props.statement.amount)}</p>
+            <p className="mt-1 text-xs font-bold leading-4 text-[#61788a]">{longDate(props.statement.date)} · {new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR" }).format(props.statement.amount)}</p>
           </div>
         </header>
         <div className="min-h-0 flex-1 overflow-y-auto">
@@ -54,23 +60,20 @@ export function BankPostingReview(props: Props) {
                 <div className="flex items-center justify-between gap-2 border-b border-[#e8e1d7] bg-[#f8fbfc] px-3 py-2">
                   <h3 className="text-xs font-extrabold text-[#1a1a1a]">{match.voucherNumber ? `Voucher ${match.voucherNumber}` : `Possible voucher ${index + 1}`}{match.voucherType ? ` · ${match.voucherType}` : ""}</h3>
                 </div>
-                <div className="grid grid-cols-[104px_1fr_1fr] gap-x-3 border-b border-[#e8e1d7] px-3 py-1.5 text-[9px] font-extrabold uppercase tracking-wide text-slate-400"><span>Field</span><span>Statement</span><span>Tally</span></div>
+                <div className="grid grid-cols-[132px_1fr_1fr] gap-x-3 border-b border-[#e8e1d7] px-3 py-1.5 text-[9px] font-extrabold uppercase tracking-wide text-slate-400"><span>Field</span><span>Statement</span><span>Tally</span></div>
                 <dl className="text-xs">
-                  {rest.map(field => <div key={field.label} className={`grid grid-cols-[104px_1fr_1fr] gap-x-3 border-b border-[#f1ece3] px-3 py-2 ${field.state === "different" ? "bg-amber-50" : ""}`}>
+                  {rest.map(field => <div key={field.label} className={`grid grid-cols-[132px_1fr_1fr] gap-x-3 border-b border-[#f1ece3] px-3 py-2 ${field.state === "different" ? "bg-amber-50" : ""}`}>
                     <dt className="font-semibold text-slate-500">{field.label}</dt>
                     <dd className="break-words font-extrabold text-[#1a1a1a]">{field.statement}</dd>
                     <dd className={`flex items-start gap-1.5 break-words font-extrabold ${field.state === "different" ? "text-amber-900" : !field.tally || field.state === "unavailable" ? "font-semibold text-slate-400" : "text-[#1a1a1a]"}`}>
-                      {field.state === "match" ? <CheckCircle2 className="mt-0.5 h-3 w-3 shrink-0 text-emerald-600" aria-label="Matches" /> : field.state === "different" ? <span className="mt-0.5 shrink-0 rounded bg-amber-100 px-1 text-[8px] font-extrabold uppercase text-amber-800">Differs</span> : null}
-                      <span>{field.tally || "-"}</span>
+                      <StateIcon state={field.state} />
+                      <span>{field.tally || (field.label === "Bank reference / UTR" ? "Not recorded" : "-")}</span>
                     </dd>
                   </div>)}
                   {narration ? <div className={`px-3 py-2 ${narration.state === "different" ? "bg-amber-50" : ""}`}>
                     <dt className="font-semibold text-slate-500">Narration</dt>
-                    <dd className="mt-1 break-words font-extrabold text-[#1a1a1a]">{narration.statement}</dd>
-                    <dd className={`mt-1 flex items-start gap-1.5 break-words font-extrabold ${narration.tally ? "text-[#1a1a1a]" : "font-semibold text-slate-400"}`}>
-                      {narration.state === "match" ? <CheckCircle2 className="mt-0.5 h-3 w-3 shrink-0 text-emerald-600" aria-label="Matches" /> : narration.state === "different" ? <span className="mt-0.5 shrink-0 rounded bg-amber-100 px-1 text-[8px] font-extrabold uppercase text-amber-800">Differs</span> : null}
-                      <span>{narration.tally || "-"}</span>
-                    </dd>
+                    <dd className="mt-1.5 grid grid-cols-[64px_1fr] gap-x-2"><span className="font-semibold text-slate-400">Statement</span><span className="break-words font-extrabold text-[#1a1a1a]">{narration.statement}</span></dd>
+                    <dd className="mt-1 grid grid-cols-[64px_1fr] gap-x-2"><span className="font-semibold text-slate-400">Tally</span><span className={`flex items-start gap-1.5 break-words font-extrabold ${narration.tally ? "text-[#1a1a1a]" : "font-semibold text-slate-400"}`}><StateIcon state={narration.state} /><span>{narration.tally || "-"}</span></span></dd>
                   </div> : null}
                 </dl>
               </div>;
