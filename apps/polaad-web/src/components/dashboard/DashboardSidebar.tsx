@@ -32,6 +32,7 @@ const SIDEBAR_SECTIONS = [
     title: "System",
     items: [
       { href: "/tally-prime?view=connection", label: "Tally Connector", icon: PlugZap },
+      { href: "/tally-settings", label: "Tally Settings", icon: Settings },
     ],
   },
 ];
