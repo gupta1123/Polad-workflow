@@ -1138,7 +1138,7 @@ export async function POST(request: Request) {
             expectedDirection: outgoingPayment ? "outgoing" : "incoming",
             preflightVerifyExisting: true,
             // The reviewer saw a possible duplicate and confirmed this is a separate transaction.
-            separateEntryConfirmed: selectedLedger?.separateEntryConfirmed === true,
+            separateEntryConfirmed: ledgerSelectionByTransactionId.get(transaction.id)?.separateEntryConfirmed === true,
           },
         });
 
