@@ -592,7 +592,14 @@ type OpenBillReference = {
   pendingAmount: number;
   sourceVoucherType?: string | null;
   status?: string | null;
+  narration?: string | null;
 };
+
+// Invoice narrations read "<amount>, <party>, <value>"; the client wants that last value.
+function billNarrationValue(narration?: string | null) {
+  const last = String(narration ?? "").split(",").at(-1)?.trim() ?? "";
+  return /^-?\d+(?:\.\d+)?%?$/.test(last) ? last : "";
+}
 
 type ExistingAdvanceReference = {
   referenceName: string;
@@ -4446,6 +4453,7 @@ export function BankStatementsPage() {
         bill.dueDate,
         bill.originalAmount,
         String(bill.pendingAmount),
+        bill.narration,
       ]
         .filter(Boolean)
         .some((value) => normalizeName(String(value)).includes(query))
@@ -8921,11 +8929,12 @@ export function BankStatementsPage() {
                               </div>
                             </div>
                             <div className="mt-2 overflow-x-auto border-y border-[#cfdbe2] bg-white">
-                              <table className="w-full min-w-[560px] text-left text-xs">
+                              <table className="w-full min-w-[620px] text-left text-xs">
                                 <thead className="bg-[#fcfbfa] text-[9px] font-extrabold uppercase tracking-[0.12em] text-slate-400">
                                   <tr>
                                     <th className="px-3 py-2">Bill Reference</th>
                                     <th className="px-3 py-2 text-right">Pending</th>
+                                    <th className="px-3 py-2 text-right">Values</th>
                                     <th className="px-3 py-2 text-right">Allocate</th>
                                     <th className="w-[150px] px-3 py-2 text-right"></th>
                                   </tr>
@@ -8933,13 +8942,13 @@ export function BankStatementsPage() {
                                 <tbody className="divide-y divide-[#eee7dc] text-slate-600 font-semibold">
                                   {billAllocationReviewDraft.candidateBills.length === 0 ? (
                                     <tr>
-                                      <td className="px-4 py-4 text-center font-semibold text-slate-400" colSpan={4}>
+                                      <td className="px-4 py-4 text-center font-semibold text-slate-400" colSpan={5}>
                                         No open bills returned by Tally.
                                       </td>
                                     </tr>
                                   ) : filteredBillAllocationCandidates.length === 0 ? (
                                     <tr>
-                                      <td className="px-4 py-4 text-center font-semibold text-slate-400" colSpan={4}>
+                                      <td className="px-4 py-4 text-center font-semibold text-slate-400" colSpan={5}>
                                         No bills match this search.
                                       </td>
                                     </tr>
@@ -8963,6 +8972,7 @@ export function BankStatementsPage() {
                                             </div>
                                           </td>
                                           <td className="px-3 py-2.5 text-right font-extrabold text-slate-600">{formatCurrencyAmount(bill.pendingAmount)}</td>
+                                          <td className="px-3 py-2.5 text-right font-extrabold text-slate-600">{billNarrationValue(bill.narration) || "-"}</td>
                                           <td className="px-3 py-2.5 text-right">
                                             <CurrencyAmountInput
                                               max={bill.pendingAmount}
@@ -9016,7 +9026,7 @@ export function BankStatementsPage() {
                                   )}
                                   {visibleBillAllocationCandidates.length < filteredBillAllocationCandidates.length ? (
                                     <tr>
-                                      <td className="px-3 py-2.5 text-center text-[10px] font-bold text-slate-500" colSpan={4}>
+                                      <td className="px-3 py-2.5 text-center text-[10px] font-bold text-slate-500" colSpan={5}>
                                         Showing {visibleBillAllocationCandidates.length} of {filteredBillAllocationCandidates.length} bills.{" "}
                                         <button
                                           className="font-extrabold text-[#1f4f6b] underline"
@@ -9032,6 +9042,7 @@ export function BankStatementsPage() {
                                   <tr className="bg-[#fbf8f3]">
                                     <td className="px-3 py-2.5 font-bold text-[#1a1a1a]">New advance</td>
                                     <td className="px-3 py-2.5" aria-label="Not allocated to an open bill"></td>
+                                    <td className="px-3 py-2.5"></td>
                                     <td className="px-3 py-2.5 text-right">
                                       <CurrencyAmountInput
                                         min={0}

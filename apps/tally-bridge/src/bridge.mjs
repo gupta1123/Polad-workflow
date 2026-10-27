@@ -30,7 +30,7 @@ const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
 
-const BRIDGE_VERSION = "0.1.93";
+const BRIDGE_VERSION = "0.1.94";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 
 // Diagnostic lines for "Check Tally" and bank posting. They go to bridge.log
@@ -4233,6 +4233,40 @@ async function exportTargetedBillEvidenceXml(tallyUrl, { companyName, ledgerName
   return { xml: responses.join("\n"), batchCount: batches.length };
 }
 
+// The invoice's narration carries the client's own value ("46800, Kushal Traders, 1.50"),
+// which the allocation screen shows beside each bill. Best effort: one narrow, party-filtered
+// read of this ledger's invoice vouchers. Bills never depend on it.
+async function readBillNarrations({ exportCollection, tallyUrl, companyName, ledgerName, bills, asOfDate, timeoutMs, index }) {
+  const dateFrom = bills.map((bill) => normalizeDateForCompare(bill.invoiceDate)).filter(Boolean).sort()[0];
+  if (!dateFrom) return;
+  const filterName = "PolaadBillNarrationParty";
+  const xml = await exportCollection(tallyUrl, {
+    collectionName: `Polaad Bill Narrations ${index + 1}`, tallyType: "Voucher",
+    fetchFields: "Date,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName",
+    companyName, dateFrom, dateTo: asOfDate,
+    formulae: [{ name: filterName, formula: buildRequestedLedgerFormula([ledgerName], ["$PartyLedgerName"]) }],
+    filterNames: [filterName],
+    timeoutMs, maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
+  });
+  if (!/<\/ENVELOPE\s*>/i.test(xml) || /<LINEERROR[\s>]/i.test(xml)) return;
+  const narrationByReference = new Map();
+  for (const voucher of extractBlocks(xml, "VOUCHER")) {
+    if (!isPartyInvoiceVoucher(voucher)) continue;
+    const narration = getTagText(voucher, "NARRATION");
+    if (!narration) continue;
+    for (const reference of [getTagText(voucher, "VOUCHERNUMBER"), getTagText(voucher, "REFERENCE")]) {
+      if (reference) narrationByReference.set(normalizeLooseName(reference), narration);
+    }
+  }
+  for (const bill of bills) {
+    const narration =
+      narrationByReference.get(normalizeLooseName(bill.referenceName)) ||
+      narrationByReference.get(normalizeLooseName(bill.voucherNumber)) ||
+      null;
+    if (narration) bill.narration = narration;
+  }
+}
+
 async function fetchLedgerScopedBankBills(config, commandPayload, dependencies) {
   // ChildOf gathers only this ledger. A Filter on Type: Bill first gathers all
   // company bills; a voucher-history fallback can freeze Tally on a 4 GB PC.
@@ -4251,6 +4285,7 @@ async function fetchLedgerScopedBankBills(config, commandPayload, dependencies) 
   let billBatchCount = 0;
   let billResultBytes = 0;
   let stopReason = null;
+  let narrationReadStopped = false;
   for (const [index, ledgerName] of ledgerNames.entries()) {
     dependencies.signal?.throwIfAborted();
     liveReadContext.getStore()?.signal?.throwIfAborted();
@@ -4306,6 +4341,22 @@ async function fetchLedgerScopedBankBills(config, commandPayload, dependencies) 
         const { kind, ...value } = entry;
         bucket[kind === "advance" ? "existingAdvances" : "openBills"].push(value);
         bucket.rawCount += 1;
+      }
+      const narrationBudgetMs = BANK_MATCH_BILL_BUDGET_MS - (Date.now() - startedAt);
+      if (commandPayload.includeBillNarration === true && !narrationReadStopped && bucket.openBills.length > 0 && narrationBudgetMs > 15_000) {
+        try {
+          await readBillNarrations({
+            exportCollection, tallyUrl, companyName: commandPayload.companyName || null, ledgerName,
+            bills: bucket.openBills, asOfDate, index,
+            timeoutMs: Math.min(BANK_MATCH_READ_TIMEOUT_MS, narrationBudgetMs),
+          });
+          bucket.narrationChecked = true;
+        } catch (error) {
+          dependencies.signal?.throwIfAborted();
+          liveReadContext.getStore()?.signal?.throwIfAborted();
+          // A timed-out read can leave Tally busy; do not queue more of them.
+          narrationReadStopped = true;
+        }
       }
       const bucketBytes = Buffer.byteLength(JSON.stringify(bucket), "utf8");
       if (billResultBytes + bucketBytes > BANK_MATCH_MAX_BILL_RESULT_BYTES) {
@@ -4547,7 +4598,9 @@ async function matchBankStatementInTally(config, commandPayload = {}, dependenci
     const cachedByLedger = {};
     const liveLedgerNames = [];
     for (const ledgerName of missingLedgerNames) {
-      const cached = context?.partition ? getCachedBillBucket(context.partition, ledgerName) : null;
+      let cached = context?.partition ? getCachedBillBucket(context.partition, ledgerName) : null;
+      // A bucket cached before narrations were read has none; read it live once.
+      if (cached?.openBills?.length > 0 && cached.narrationChecked !== true) cached = null;
       if (cached) cachedByLedger[ledgerName] = cached;
       else liveLedgerNames.push(ledgerName);
     }
@@ -4562,6 +4615,7 @@ async function matchBankStatementInTally(config, commandPayload = {}, dependenci
           ledgerNames: liveLedgerNames,
           asOfDate: commandPayload.asOfDate,
           queryPurpose: "bank_statement_match",
+          includeBillNarration: true,
         },
         dependencies
       );

@@ -1191,7 +1191,9 @@ test("live statement matching verifies vouchers and fetches bills in one connect
     }
   );
 
-  assert.equal(calls.length, 3);
+  // Voucher check, the bills, and one narrow narration read for the ledger that has bills.
+  assert.equal(calls.length, 4);
+  assert.equal(calls.at(-1).tallyType, "Voucher");
   assert.equal(outcome.result.transactions[0].verificationStatus, "found");
   assert.equal(outcome.result.transactions[1].verificationStatus, "missing");
   assert.deepEqual(outcome.result.billLedgerNames, ["Customer B"]);
@@ -1426,4 +1428,35 @@ test("Purchase voucher verification includes the attached source PDF identity", 
       payload
     ).some((difference) => /outstanding bill date/i.test(difference))
   );
+});
+
+test("bank bill fetch attaches invoice narration only when asked, and never fails the bills", async () => {
+  const bill = '<BILL NAME="INV-9"><LEDGERNAME>Customer A</LEDGERNAME><BILLTYPE>New Ref</BILLTYPE><BILLDATE>20260401</BILLDATE><OPENINGBALANCE>46800</OPENINGBALANCE><CLOSINGBALANCE>46800</CLOSINGBALANCE><ISADVANCE>No</ISADVANCE></BILL>';
+  const voucherXml = '<ENVELOPE><STATUS>1</STATUS><COLLECTION><VOUCHER><VOUCHERTYPENAME>Sales</VOUCHERTYPENAME><VOUCHERNUMBER>INV-9</VOUCHERNUMBER><NARRATION>46800, Kushal Traders, 1.50</NARRATION></VOUCHER></COLLECTION></ENVELOPE>';
+  const run = async (payload, voucherResponse) => {
+    const calls = [];
+    const outcome = await fetchCustomerOpenBillsFromTally({ tallyUrl: "http://127.0.0.1:9000" }, { ledgerNames: ["Customer A"], queryPurpose: "bank_statement_match", ...payload }, {
+      exportCollection: async (_url, options) => {
+        calls.push(options);
+        if (options.tallyType === "Voucher") { if (voucherResponse instanceof Error) throw voucherResponse; return voucherResponse; }
+        return billCollection(bill);
+      },
+    });
+    return { calls, bills: outcome.result.byLedger["Customer A"] };
+  };
+  const plain = await run({}, voucherXml);
+  assert.equal(plain.calls.length, 1);
+  assert.equal(plain.bills.openBills[0].narration, undefined);
+
+  const withNarration = await run({ includeBillNarration: true }, voucherXml);
+  assert.equal(withNarration.calls.length, 2);
+  assert.equal(withNarration.calls[1].tallyType, "Voucher");
+  assert.equal(withNarration.bills.openBills[0].narration, "46800, Kushal Traders, 1.50");
+  assert.equal(withNarration.bills.narrationChecked, true);
+
+  const failed = await run({ includeBillNarration: true }, new Error("Tally busy"));
+  assert.equal(failed.bills.complete, true);
+  assert.equal(failed.bills.openBills[0].pendingAmount, 46800);
+  assert.equal(failed.bills.openBills[0].narration, undefined);
+  assert.notEqual(failed.bills.narrationChecked, true);
 });
