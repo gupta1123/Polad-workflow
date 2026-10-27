@@ -30,7 +30,7 @@ const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
 
-const BRIDGE_VERSION = "0.1.94";
+const BRIDGE_VERSION = "0.1.95";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 
 // Diagnostic lines for "Check Tally" and bank posting. They go to bridge.log

@@ -22,7 +22,7 @@ export function BankPostingReview(props: Props) {
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-black/20">
       <button aria-label="Close Tally entry details" className="absolute inset-0 cursor-default" onClick={props.onClose} type="button" />
-      <aside role="dialog" aria-modal="true" aria-label="Tally entry details" className="relative z-10 flex h-full w-full max-w-[720px] flex-col border-l border-[#ddd3c5] bg-white shadow-2xl">
+      <aside role="dialog" aria-modal="true" aria-label="Tally entry details" className="relative z-10 flex h-full w-full max-w-[680px] flex-col border-l border-[#ddd3c5] bg-white shadow-2xl">
         <header className="border-b border-[#e5ddd0] px-5 py-4">
           <div className="flex items-start justify-between gap-4">
             <div className="min-w-0">
@@ -41,6 +41,13 @@ export function BankPostingReview(props: Props) {
               <p className="mt-1 text-sm leading-6 text-[#3d352c]">{props.reason}</p>
               <p className="mt-2 text-[11px] text-slate-500">{props.checkedAt ? `Last recheck: ${new Date(props.checkedAt).toLocaleString("en-IN")}` : "Saved result from the last Tally check."} Opening these details does not run a new check.</p>
               {props.notice ? <p role="status" aria-live="polite" className="mt-3 rounded-lg border border-[#ddd3c5] bg-white p-3 text-sm leading-6">{props.notice}</p> : null}
+            </div>
+          </section>
+          <section className="px-5 pt-4">
+            <h3 className="text-[10px] font-bold uppercase tracking-[0.14em] text-slate-500">This statement line</h3>
+            <div className="mt-2 rounded-xl border border-[#e5ddd0] bg-white px-4 py-3">
+              <p className="break-words text-[13px] font-semibold leading-5 text-[#2b241d]">{props.statement.narration || "No narration on this line"}</p>
+              <p className="mt-1 text-xs text-slate-500">{props.statement.direction === "incoming" ? "Receipt" : "Payment"} · {props.statement.bank}{props.statement.reference ? ` · Ref ${props.statement.reference}` : " · No bank reference"}</p>
             </div>
           </section>
           <section className="px-5 py-4">
