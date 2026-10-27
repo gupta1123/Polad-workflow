@@ -8065,157 +8065,108 @@ export function BankStatementsPage() {
                     </div>
                   </div>
                   {reviewFiltersOpen ? (
-                    <div className="mt-3 rounded-xl border border-[#e5ddd0] bg-[#faf8f4]/70 p-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.8)]">
-                      <div className="mb-3 flex items-start justify-between gap-3 border-b border-[#e5ddd0] pb-2.5">
-                        <div>
-                          <div className="text-[12px] font-extrabold text-[#1a1a1a]">Filter transactions</div>
-                        </div>
-                        <div className="flex shrink-0 items-center gap-1.5">
-                          <button
-                            className="h-7 rounded-lg px-2.5 text-[11px] font-bold text-[#8a4b12] transition hover:bg-[#f5f1eb] disabled:cursor-not-allowed disabled:text-slate-400 disabled:hover:bg-transparent"
-                            disabled={activeReviewFilterCount === 0}
-                            onClick={() => {
-                              setReviewSearch("");
-                              setReviewWorkStatusFilter("all");
-                              setReviewTallyResultFilter("all");
-                              setReviewLedgerFilter("all");
-                              setReviewDirectionFilter("all");
-                              setReviewAllocationFilter("all");
-                              setReviewDateFrom("");
-                              setReviewDateTo("");
-                            }}
-                            type="button"
-                          >
-                            Clear all
-                          </button>
-                          <button
-                            aria-label="Close transaction filters"
-                            className="inline-flex h-7 w-7 items-center justify-center rounded-lg text-slate-500 transition hover:bg-[#f5f1eb] hover:text-[#1a1a1a]"
-                            onClick={() => setReviewFiltersOpen(false)}
-                            type="button"
-                          >
-                            <X className="h-3.5 w-3.5" />
-                          </button>
-                        </div>
+                    <div className="mt-2.5 flex flex-wrap items-center gap-2 border-t border-[#e5ddd0] pt-2.5">
+                      <div className="relative min-w-[200px] flex-1 xl:max-w-[320px]">
+                        <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+                        <input
+                          aria-label="Search transactions"
+                          className="h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 pl-8 text-[11px] font-semibold text-[#1a1a1a] outline-none placeholder:text-slate-400 focus:border-amber-500"
+                          onChange={(event) => setReviewSearch(event.target.value)}
+                          placeholder="Search narration, amount, ledger"
+                          ref={reviewSearchInputRef}
+                          value={reviewSearch}
+                        />
                       </div>
 
-                      <div className="grid gap-2.5 md:grid-cols-2 xl:grid-cols-12 xl:items-end">
-                        <label className="block xl:col-span-4">
-                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Search</span>
-                          <div className="relative mt-1">
-                            <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-                            <input
-                              className="h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 pl-8 text-[11px] font-semibold text-[#1a1a1a] outline-none placeholder:text-slate-400 focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
-                              onChange={(event) => setReviewSearch(event.target.value)}
-                              placeholder="Narration, amount, ledger or reference"
-                              ref={reviewSearchInputRef}
-                              value={reviewSearch}
-                            />
-                          </div>
-                        </label>
+                      <select
+                        aria-label="Work status"
+                        className="h-8 rounded-lg border border-[#e5ddd0] bg-white px-2 text-[11px] font-semibold text-[#1a1a1a] outline-none focus:border-amber-500"
+                        onChange={(event) => setReviewWorkStatusFilter(event.target.value as ReviewWorkStatusFilter)}
+                        title="Needs action contains only unresolved close ledger matches."
+                        value={reviewWorkStatusFilter}
+                      >
+                        <option value="all">All work ({validTransactions.length})</option>
+                        <option value="needs_action">Needs action ({reviewWorkStatusCounts.needsAction})</option>
+                        <option value="ready">Ready ({reviewWorkStatusCounts.ready})</option>
+                        <option value="completed">Completed ({reviewWorkStatusCounts.completed})</option>
+                      </select>
 
-                        <label className="block xl:col-span-2">
-                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Work status</span>
-                          <select
-                            className="mt-1 h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 text-[11px] font-semibold text-[#1a1a1a] outline-none focus:border-amber-500"
-                            onChange={(event) => setReviewWorkStatusFilter(event.target.value as ReviewWorkStatusFilter)}
-                            title="Needs action contains only unresolved close ledger matches."
-                            value={reviewWorkStatusFilter}
+                      <select
+                        aria-label="Tally status"
+                        className="h-8 rounded-lg border border-[#e5ddd0] bg-white px-2 text-[11px] font-semibold text-[#1a1a1a] outline-none focus:border-amber-500"
+                        onChange={(event) => setReviewTallyResultFilter(event.target.value as ReviewTallyResultFilter)}
+                        value={reviewTallyResultFilter}
+                      >
+                        <option value="all">Any Tally result</option>
+                        <option value="pending">Check pending</option>
+                        <option value="found">Found in Tally</option>
+                        <option value="missing">Not found</option>
+                        <option value="review">Possible duplicate</option>
+                        <option value="failed">Failed / cannot check</option>
+                      </select>
+
+                      <div aria-label="Money flow" className="inline-flex h-8 rounded-lg border border-[#e5ddd0] bg-white p-0.5" role="group">
+                        {([["all", "All"], ["credit", "Receipts"], ["debit", "Payments"]] as const).map(([value, label]) => (
+                          <button
+                            aria-pressed={reviewDirectionFilter === value}
+                            className={`rounded-md px-2.5 text-[11px] font-semibold transition ${
+                              reviewDirectionFilter === value ? "bg-[#2d2d2d] text-white" : "text-slate-600 hover:bg-[#f5f1eb]"
+                            }`}
+                            key={value}
+                            onClick={() => setReviewDirectionFilter(value)}
+                            type="button"
                           >
-                            <option value="all">All ({validTransactions.length})</option>
-                            <option value="needs_action">Needs action ({reviewWorkStatusCounts.needsAction})</option>
-                            <option value="ready">Ready ({reviewWorkStatusCounts.ready})</option>
-                            <option value="completed">Completed ({reviewWorkStatusCounts.completed})</option>
-                          </select>
-                        </label>
+                            {label}
+                          </button>
+                        ))}
+                      </div>
 
-                        <label className="block xl:col-span-2">
-                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Tally status</span>
-                          <select
-                            className="mt-1 h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 text-[11px] font-semibold text-[#1a1a1a] outline-none focus:border-amber-500"
-                            onChange={(event) => setReviewTallyResultFilter(event.target.value as ReviewTallyResultFilter)}
-                            value={reviewTallyResultFilter}
-                          >
-                            <option value="all">All results</option>
-                            <option value="pending">Check pending</option>
-                            <option value="found">Found in Tally</option>
-                            <option value="missing">Not found</option>
-                            <option value="review">Ambiguous / duplicate</option>
-                            <option value="failed">Failed / cannot check</option>
-                          </select>
-                        </label>
+                      <div className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-[#e5ddd0] bg-white px-2 focus-within:border-amber-500">
+                        <CalendarDays className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+                        <input
+                          aria-label="Period from"
+                          className="w-[104px] bg-transparent text-[11px] font-semibold text-[#1a1a1a] outline-none"
+                          onChange={(event) => setReviewDateFrom(event.target.value)}
+                          ref={reviewPeriodInputRef}
+                          type="date"
+                          value={reviewDateFrom}
+                        />
+                        <span className="text-[11px] text-slate-400">to</span>
+                        <input
+                          aria-label="Period to"
+                          className="w-[104px] bg-transparent text-[11px] font-semibold text-[#1a1a1a] outline-none"
+                          onChange={(event) => setReviewDateTo(event.target.value)}
+                          type="date"
+                          value={reviewDateTo}
+                        />
+                      </div>
 
-                        <label className="block xl:col-span-2">
-                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Ledger review</span>
-                          <select
-                            className="mt-1 h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 text-[11px] font-semibold text-[#1a1a1a] outline-none focus:border-amber-500"
-                            onChange={(event) => setReviewLedgerFilter(event.target.value as ReviewLedgerFilter)}
-                            value={reviewLedgerFilter}
-                          >
-                            <option value="all">All reviews</option>
-                            <option value="needs_action">Close match action</option>
-                            <option value="automatic">Auto matched</option>
-                            <option value="manual">Manually confirmed</option>
-                            <option value="suspense">Suspense / no match</option>
-                          </select>
-                        </label>
-
-                        <label className="block xl:col-span-2">
-                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Money flow</span>
-                          <select
-                            className="mt-1 h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 text-[11px] font-semibold text-[#1a1a1a] outline-none focus:border-amber-500"
-                            onChange={(event) => setReviewDirectionFilter(event.target.value as ReviewDirectionFilter)}
-                            value={reviewDirectionFilter}
-                          >
-                            <option value="all">Payments + receipts</option>
-                            <option value="debit">Payments only</option>
-                            <option value="credit">Receipts only</option>
-                          </select>
-                        </label>
-
-                        <label className="block xl:col-span-3">
-                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Period from</span>
-                          <div className="relative mt-1">
-                            <CalendarDays className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-                            <input
-                              className="h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 pl-8 text-[11px] font-semibold text-[#1a1a1a] outline-none focus:border-amber-500"
-                              onChange={(event) => setReviewDateFrom(event.target.value)}
-                              ref={reviewPeriodInputRef}
-                              type="date"
-                              value={reviewDateFrom}
-                            />
-                          </div>
-                        </label>
-
-                        <label className="block xl:col-span-3">
-                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Period to</span>
-                          <div className="relative mt-1">
-                            <CalendarDays className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-                            <input
-                              className="h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 pl-8 text-[11px] font-semibold text-[#1a1a1a] outline-none focus:border-amber-500"
-                              onChange={(event) => setReviewDateTo(event.target.value)}
-                              type="date"
-                              value={reviewDateTo}
-                            />
-                          </div>
-                        </label>
-
-                        {tallyCheckAttempted ? (
-                          <label className="block xl:col-span-3">
-                            <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Receipt allocation</span>
-                            <select
-                              className="mt-1 h-8 w-full rounded-lg border border-[#e5ddd0] bg-white px-2.5 text-[11px] font-semibold text-[#1a1a1a] outline-none focus:border-amber-500"
-                              onChange={(event) => setReviewAllocationFilter(event.target.value as ReviewAllocationFilter)}
-                              value={reviewAllocationFilter}
-                            >
-                              <option value="all">All allocations</option>
-                              <option value="needs_action">Needs allocation action</option>
-                              <option value="ready">Ready to post</option>
-                              <option value="completed">Allocation completed</option>
-                              <option value="not_applicable">Not applicable</option>
-                            </select>
-                          </label>
-                        ) : null}
+                      <div className="ml-auto flex items-center gap-1">
+                        <button
+                          className="h-8 rounded-lg px-2.5 text-[11px] font-bold text-[#8a4b12] transition hover:bg-[#f5f1eb] disabled:cursor-not-allowed disabled:text-slate-400 disabled:hover:bg-transparent"
+                          disabled={activeReviewFilterCount === 0}
+                          onClick={() => {
+                            setReviewSearch("");
+                            setReviewWorkStatusFilter("all");
+                            setReviewTallyResultFilter("all");
+                            setReviewLedgerFilter("all");
+                            setReviewDirectionFilter("all");
+                            setReviewAllocationFilter("all");
+                            setReviewDateFrom("");
+                            setReviewDateTo("");
+                          }}
+                          type="button"
+                        >
+                          Clear
+                        </button>
+                        <button
+                          aria-label="Close transaction filters"
+                          className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition hover:bg-[#f5f1eb] hover:text-[#1a1a1a]"
+                          onClick={() => setReviewFiltersOpen(false)}
+                          type="button"
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </button>
                       </div>
                     </div>
                   ) : null}
