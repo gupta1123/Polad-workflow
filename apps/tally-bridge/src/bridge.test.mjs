@@ -1505,9 +1505,31 @@ test("the same narration a few days off is flagged for review, never auto-skippe
   const nearby = check([voucher("20260803")]);
   assert.equal(nearby.matchBasis, "narration_nearby_date");
   assert.equal(statusOf(nearby), "ambiguous");
-  // Four days away, or already reserved by another row, is not flagged.
-  assert.equal(check([voucher("20260805")]).candidates.length, 0);
+  // The default window is 20 days; beyond it, or already reserved by another row, is not flagged.
+  assert.equal(check([voucher("20260820")]).matchBasis, "narration_nearby_date");
+  assert.equal(check([voucher("20260822")]).candidates.length, 0);
   assert.equal(strictBankTransactionCandidates([voucher("20260803")], row, "ICICI Current Account", new Set([0])).candidates.length, 0);
   // The exact-day match always wins over a nearby one.
   assert.equal(check([voucher("20260803"), voucher("20260801")]).matchBasis, "date_bank_amount_direction_narration");
+});
+
+test("duplicate rules from Settings tune the check, and bad or missing values fall back to the defaults", () => {
+  const row = { voucherDate: "2026-08-01", amount: 1250, expectedDirection: "incoming", narration: "NEFT:MASKE TRADERS:ICIC", counterpartyLedgerName: "Maske Traders" };
+  const voucher = (date) => ({ ...bankVoucher({ party: "Maske Traders" }), date, effectiveDate: date, narration: "NEFT:MASKE TRADERS:ICIC" });
+  const check = (vouchers, rules) => strictBankTransactionCandidates(vouchers, row, "ICICI Current Account", new Set(), null, rules);
+
+  // A company that wants a tighter window.
+  assert.equal(check([voucher("20260805")], { nearbyDays: 3 }).candidates.length, 0);
+  assert.equal(check([voucher("20260803")], { nearbyDays: 3 }).matchBasis, "narration_nearby_date");
+  // 0 turns the nearby check off; the same-day narration rule is unaffected.
+  assert.equal(check([voucher("20260803")], { nearbyDays: 0 }).candidates.length, 0);
+  assert.equal(check([voucher("20260801")], { nearbyDays: 0 }).matchBasis, "date_bank_amount_direction_narration");
+  // The narration rule can be switched off entirely.
+  const otherParty = { ...bankVoucher({ party: "Other Traders" }), date: "20260801", effectiveDate: "20260801", narration: "NEFT:MASKE TRADERS:ICIC" };
+  assert.equal(check([otherParty]).matchBasis, "narration_party_differs");
+  assert.equal(check([otherParty], { narrationRule: false }).candidates.length, 0);
+  // Missing, malformed or out-of-range values never fail the check: the defaults apply.
+  for (const rules of [undefined, null, {}, "x", [], { nearbyDays: "abc" }, { nearbyDays: -5 }, { nearbyDays: 9999 }, { narrationMinLength: 1 }]) {
+    assert.equal(check([voucher("20260820")], rules).matchBasis, "narration_nearby_date");
+  }
 });

@@ -30,7 +30,7 @@ const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
 
-const BRIDGE_VERSION = "0.1.97";
+const BRIDGE_VERSION = "0.1.98";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 
 // Diagnostic lines for "Check Tally" and bank posting. They go to bridge.log
@@ -2337,6 +2337,7 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
         // bank closing balance here added another unrelated Tally request to
         // every post and could consume the full export timeout.
         includeBalanceProof: false,
+        duplicateRules: firstPayload.duplicateRules,
         transactions: group.map((command) => ({
           ...command.payload,
           expectedDirection:
@@ -2469,6 +2470,7 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
         companyName,
         bankLedgerName: firstPayload.bankLedgerName,
         includeBalanceProof: false,
+        duplicateRules: firstPayload.duplicateRules,
         transactions: pendingCommands.map((command) => ({
           ...command.payload,
           expectedDirection:
@@ -3475,17 +3477,31 @@ function baseBankTransactionCandidates(vouchers, transaction, bankLedgerName, re
 
 // A manually typed voucher often carries the statement's own Particulars text as its narration.
 // Compare it as letters and digits only, so spacing and punctuation differences do not matter.
-const NARRATION_IDENTITY_MIN_LENGTH = 12;
-const NARRATION_NEARBY_DAYS = 3;
+// Duplicate-check tuning. The web app sends the company's own values with each command
+// (Settings); anything missing or out of range falls back to these.
+const DEFAULT_DUPLICATE_RULES = Object.freeze({ nearbyDays: 20, narrationMinLength: 12, narrationRule: true });
+
+function resolveDuplicateRules(raw) {
+  const source = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  const whole = (value, min, max, fallback) => {
+    const number = Number(value);
+    return Number.isInteger(number) && number >= min && number <= max ? number : fallback;
+  };
+  return {
+    nearbyDays: whole(source.nearbyDays, 0, 60, DEFAULT_DUPLICATE_RULES.nearbyDays),
+    narrationMinLength: whole(source.narrationMinLength, 8, 40, DEFAULT_DUPLICATE_RULES.narrationMinLength),
+    narrationRule: source.narrationRule === false ? false : true,
+  };
+}
 
 function compactNarration(value) {
   return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
 
-function narrationsIdentifySameEntry(rowNarration, voucherNarration) {
+function narrationsIdentifySameEntry(rowNarration, voucherNarration, minLength = DEFAULT_DUPLICATE_RULES.narrationMinLength) {
   const row = compactNarration(rowNarration);
   const voucher = compactNarration(voucherNarration);
-  if (row.length < NARRATION_IDENTITY_MIN_LENGTH || voucher.length < NARRATION_IDENTITY_MIN_LENGTH) return false;
+  if (row.length < minLength || voucher.length < minLength) return false;
   return row === voucher || voucher.includes(row) || row.includes(voucher);
 }
 
@@ -3495,7 +3511,8 @@ function daysBetween(left, right) {
   return Number.isFinite(a) && Number.isFinite(b) ? Math.abs(Math.round((a - b) / 86_400_000)) : Infinity;
 }
 
-function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, reservedVoucherIndexes, byDate = null) {
+function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, reservedVoucherIndexes, byDate = null, duplicateRules = DEFAULT_DUPLICATE_RULES) {
+  const rules = resolveDuplicateRules(duplicateRules);
   const { bankReference, trackingReference } = bankTransactionReferences(transaction);
   const counterpartyLedgerName = String(transaction.counterpartyLedgerName || "").trim();
   const baseCandidates = baseBankTransactionCandidates(
@@ -3553,7 +3570,7 @@ function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, 
     const narrationAll = baseCandidates.filter(({ voucher, index }) =>
       !reservedVoucherIndexes.has(index) &&
       !voucherHasConflictingBankReference(voucher, bankReference) &&
-      narrationsIdentifySameEntry(rowNarration, voucher.narration));
+      rules.narrationRule && narrationsIdentifySameEntry(rowNarration, voucher.narration, rules.narrationMinLength));
     // The party must also agree (or be unknown): the same text under a different customer is not
     // a confirmed duplicate, it is something to review.
     const compatibleKeys = new Set(compatible.map(({ index }) => index));
@@ -3578,7 +3595,7 @@ function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, 
       identityInsufficient = true;
       matchBasis = "narration_party_differs";
     }
-    if (candidates.length === 0) {
+    if (candidates.length === 0 && rules.narrationRule && rules.nearbyDays > 0) {
       // Same text, bank ledger, amount and direction a few days off: probably entered on another
       // date. Never auto-skip it, but flag it for review instead of posting a second copy.
       const rowDate = normalizeDateForCompare(transaction.voucherDate);
@@ -3586,8 +3603,8 @@ function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, 
         if (reservedVoucherIndexes.has(index)) return [];
         const date = normalizeDateForCompare(voucher.effectiveDate || voucher.date);
         const gap = daysBetween(date, rowDate);
-        if (!date || gap === 0 || gap > NARRATION_NEARBY_DAYS) return [];
-        if (!narrationsIdentifySameEntry(transaction.narration || transaction.description, voucher.narration)) return [];
+        if (!date || gap === 0 || gap > rules.nearbyDays) return [];
+        if (!narrationsIdentifySameEntry(transaction.narration || transaction.description, voucher.narration, rules.narrationMinLength)) return [];
         if (voucherHasConflictingBankReference(voucher, bankReference)) return [];
         const bankEntry = getBankLedgerEntry(voucher, bankLedgerName, Number(transaction.amount || 0), transaction.expectedDirection);
         return bankEntry ? [{ voucher, index, bankEntry }] : [];
@@ -3675,9 +3692,10 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}, dep
   logTallyCheck(`fetched vouchers=${vouchers.length} fetchMs=${Date.now() - checkStartedAt} diagnostics=${JSON.stringify(queryDiagnostics ?? {}).slice(0, 300)}`);
   const reservedVoucherIndexes = new Set();
   const vouchersByDate = indexBankVouchersByDate(vouchers);
+  const duplicateRules = resolveDuplicateRules(commandPayload.duplicateRules);
   const results = normalizedTransactions.map((transaction) => {
     const strictResult = strictBankTransactionCandidates(
-      vouchers, transaction, bankLedgerName, reservedVoucherIndexes, vouchersByDate
+      vouchers, transaction, bankLedgerName, reservedVoucherIndexes, vouchersByDate, duplicateRules
     );
     const {
       candidates,
@@ -3875,7 +3893,9 @@ async function verifyBankTransactionInTally(config, commandPayload = {}, depende
     vouchers,
     normalizedTransaction,
     bankLedgerName,
-    new Set()
+    new Set(),
+    null,
+    resolveDuplicateRules(commandPayload.duplicateRules)
   );
   const strictMatches = strictResult.candidates;
   const duplicateInTally = strictResult.matchBasis === "reference" && strictMatches.length > 1;

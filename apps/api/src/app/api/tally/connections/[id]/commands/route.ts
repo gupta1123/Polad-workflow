@@ -15,6 +15,7 @@ import {
   type TallyBridgeCommandType,
 } from "@/lib/tally/commands";
 import { toNullableText, toRequiredText, type TallyMasterRow } from "@/lib/tally/masters";
+import { DEFAULT_COMPANY_SETTINGS, loadCompanySettings } from "@/lib/tally/company-settings";
 
 function parseCommandType(value: unknown): TallyBridgeCommandType | null {
   if (typeof value !== "string") return null;
@@ -642,6 +643,9 @@ export async function POST(
           companyName,
           bankLedgerName,
           transactions,
+          duplicateRules: (isLocalDbMode()
+            ? DEFAULT_COMPANY_SETTINGS
+            : await loadCompanySettings(createSupabaseAdminClient(), user.id, companyName)).duplicateRules,
           source: "bank_statement_batch_review_check",
         };
         if (isLocalDbMode()) {

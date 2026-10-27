@@ -103,6 +103,19 @@ type LiveBankLedgerResult = {
 
 const BANK_STATEMENT_COMPANY_SELECTION_KEY = "polaad.bankStatements.selectedCompany.v1";
 
+// The company's duplicate-check tuning (Settings). Optional: any failure means the connector uses its defaults.
+async function fetchDuplicateRules(companyName: string) {
+  if (!companyName.trim()) return undefined;
+  try {
+    const response = await apiFetch(`/api/tally/company-settings?companyName=${encodeURIComponent(companyName)}`, { signal: AbortSignal.timeout(4000) });
+    if (!response.ok) return undefined;
+    const body = (await response.json()) as { settings?: { duplicateRules?: { nearbyDays?: number; narrationMinLength?: number; narrationRule?: boolean } } };
+    return body.settings?.duplicateRules;
+  } catch {
+    return undefined;
+  }
+}
+
 function uniqueCompanyOptions(options: CompanyOption[]) {
   const seen = new Set<string>();
   return options.filter((option) => {
@@ -6223,6 +6236,7 @@ export function BankStatementsPage() {
           .filter(Boolean)
       )
     );
+    const duplicateRules = await fetchDuplicateRules(selectedCompanyName || connection.lastCompanyName || "");
     const result = await runCashDiscountLiveRequest<{
       transactions?: Array<Record<string, unknown>>;
       balanceProof?: Record<string, unknown>;
@@ -6242,6 +6256,7 @@ export function BankStatementsPage() {
         bankLedgerName,
         relevantLedgerNames,
         voucherTypes: ["Receipt", "Payment", "Contra", "Journal"],
+        ...(duplicateRules ? { duplicateRules } : {}),
         // Matching rows must stay interactive. Closing-balance proof is a
         // separate diagnostic and must not block the duplicate check.
         includeBalanceProof: false,

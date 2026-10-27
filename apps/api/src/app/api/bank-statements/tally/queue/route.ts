@@ -17,6 +17,7 @@ import {
 } from "@/lib/bank-statement-ledger-safety";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { wakeTallyConnector } from "@/lib/tally/command-wake";
+import { configuredVoucherType, loadCompanySettings } from "@/lib/tally/company-settings";
 
 export const runtime = "nodejs";
 
@@ -941,6 +942,8 @@ export async function POST(request: Request) {
       };
     });
 
+    // Per-company voucher type names and duplicate-check tuning. Never throws: no row means defaults.
+    const companySettings = await loadCompanySettings(supabase, user.id, expectedCompanyName);
     const queuedCreateLedgerKeys = new Set<string>();
     const commands: TallyCommandInsert[] = commandInputs.flatMap(
       ({ transaction, counterpartyLedgerName, createLedgerName, createLedgerParentName }) => {
@@ -1113,7 +1116,7 @@ export async function POST(request: Request) {
             reviewedRevision: Number(review.revision ?? 0) || null,
             reviewDigest: toText(review.digest, 128) || null,
             companyName: expectedCompanyName,
-            voucherType: counterpartyIsBankOrCashLedger ? "Contra" : originalVoucherType,
+            voucherType: configuredVoucherType(companySettings, counterpartyIsBankOrCashLedger ? "Contra" : originalVoucherType),
             voucherDate,
             bankLedgerName,
             bankLedgerGuid: ledgerGuidByName.get(normalizeName(bankLedgerName)) || null,
@@ -1137,6 +1140,7 @@ export async function POST(request: Request) {
             billAllocations,
             expectedDirection: outgoingPayment ? "outgoing" : "incoming",
             preflightVerifyExisting: true,
+            duplicateRules: companySettings.duplicateRules,
             // The reviewer saw a possible duplicate and confirmed this is a separate transaction.
             separateEntryConfirmed: ledgerSelectionByTransactionId.get(transaction.id)?.separateEntryConfirmed === true,
           },
