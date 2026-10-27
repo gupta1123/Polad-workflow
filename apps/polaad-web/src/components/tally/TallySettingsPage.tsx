@@ -124,7 +124,7 @@ export function TallySettingsPage() {
                 <>
                   <section className="mt-6 rounded-lg border border-[#e5ddd0] bg-white">
                     <div className="border-b border-[#e8e1d7] bg-[#f8fbfc] px-4 py-2 text-xs font-extrabold text-[#1a1a1a]">Voucher types</div>
-                    <p className="px-4 pt-3 text-xs font-semibold text-slate-500">The names this company uses in Tally. Leave as is unless a post fails with "Voucher Type does not exist".</p>
+                    <p className="px-4 pt-3 text-xs font-semibold text-slate-500">The names this company uses in Tally. Leave as is unless a post fails with &ldquo;Voucher Type does not exist&rdquo;.</p>
                     <div className="grid gap-3 px-4 py-3 sm:grid-cols-2">
                       {VOUCHER_FIELDS.map(field => (
                         <label key={field.key} className="block text-xs font-semibold text-slate-500">
