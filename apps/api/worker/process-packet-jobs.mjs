@@ -2461,12 +2461,10 @@ async function waitForConnectorPreprocessCommand({ commandId, ownerUserId, prequ
             })).filter((candidate) => candidate.ledgerName)
           : []
       );
-      // One row with no vector hit (for example an unusual payee name) must not discard the
-      // shortlist for the whole statement. Rows without candidates fall back to a text
-      // shortlist in ledger matching; only a run with no candidates at all is unusable.
-      if (vectorCandidates.every((candidates) => candidates.length === 0)) {
-        return { used: false, reason: "vector_candidates_unavailable" };
-      }
+      // The connector already parsed the statement; that is the fast path and it stays in use even
+      // when the vector index returned nothing (no company data yet, index not ready). Rows without
+      // candidates fall back to a text shortlist or the live catalogue in ledger matching, so an
+      // empty shortlist must never push the whole statement onto the slow server extraction.
       return {
         used: true,
         parsed,
