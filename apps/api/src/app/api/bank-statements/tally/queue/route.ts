@@ -1280,6 +1280,8 @@ export async function POST(request: Request) {
         commandCount: commands.length,
         transactionIds: [...queuedTransactionIds, ...verificationTransactionIds],
         savedMappingCount: uniqueMappingRows.length,
+        // Kept so a slow post can be traced to the stage that was slow.
+        preparationTimingsMs,
       },
     });
 

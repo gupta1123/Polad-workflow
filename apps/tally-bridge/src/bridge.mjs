@@ -30,7 +30,7 @@ const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
 
-const BRIDGE_VERSION = "0.1.98";
+const BRIDGE_VERSION = "0.1.99";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 
 // Diagnostic lines for "Check Tally" and bank posting. They go to bridge.log
@@ -2324,6 +2324,8 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
       continue;
     }
     let preflightByTransactionId = null;
+    const batchTiming = { batchSize: group.length };
+    const preflightStartedAt = Date.now();
     try {
       const targets = new Set(group.map((command) => JSON.stringify(command.payload?.target)));
       if (targets.size !== 1) throw new Error("A Tally batch cannot cross company or connector sessions.");
@@ -2348,6 +2350,7 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
       preflightByTransactionId = new Map(
         (batchPreflight.result?.transactions || []).map((row) => [String(row.transactionId || ""), row])
       );
+      batchTiming.preflightMs = Date.now() - preflightStartedAt;
       logTallyPost(
         `duplicate_preflight found=${[...preflightByTransactionId.values()].filter((row) => row.verificationStatus === "found").length} ` +
         `ambiguous=${[...preflightByTransactionId.values()].filter((row) => row.verificationStatus === "ambiguous").length} ` +
@@ -2457,6 +2460,7 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
     }
 
     const batchElapsedMs = Date.now() - batchStartedAt;
+    batchTiming.tallyImportMs = batchElapsedMs;
     logTallyPost(
       `tally import success=${batchOutcome.success} elapsedMs=${batchElapsedMs} xmlBytes=${batchXml ? batchXml.length : 0}` +
       (batchOutcome.error ? ` error=${String(batchOutcome.error).slice(0, 300)}` : "") +
@@ -2465,6 +2469,7 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
     // Tally import counters acknowledge the envelope, not each voucher. Always
     // read every target back, even when CREATED equals the requested batch size.
     let postflightByTransactionId = null;
+    const postflightStartedAt = Date.now();
     try {
       const postflight = await reconcileBankTransactionsInTally(config, {
         companyName,
@@ -2478,6 +2483,7 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
             (/receipt/i.test(String(command.payload?.voucherType || "")) ? "incoming" : "outgoing"),
         })),
       });
+      batchTiming.postflightMs = Date.now() - postflightStartedAt;
       postflightByTransactionId = new Map(
         (postflight.result?.transactions || []).map((row) => [String(row.transactionId || ""), row])
       );
@@ -2509,6 +2515,7 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
             batchImport: true,
             batchSize: pendingCommands.length,
             batchElapsedMs,
+            timing: batchTiming,
           },
         }});
         continue;
@@ -2528,6 +2535,7 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
             verification: postflight,
             batchSize: pendingCommands.length,
             importSummary: batchOutcome.result || {},
+            timing: batchTiming,
           },
         }});
         continue;
@@ -2562,6 +2570,11 @@ async function runBankVoucherCommandBatch(config, commands, options = {}) {
         `reporting ${acknowledgementEntries.length} result(s): posted=${acknowledgementEntries.filter((entry) => entry.outcome.success).length} ` +
         `uncertain_or_failed=${acknowledgementEntries.filter((entry) => !entry.outcome.success).length}`
       );
+      // Shared by every entry, so each stored result records when reporting began;
+      // its completed_at then shows how long reporting took per command.
+      batchTiming.reportStartedAt = new Date().toISOString();
+      batchTiming.reportConcurrency = 10;
+      batchTiming.stagesDoneMs = Date.now() - preflightStartedAt;
       await sendCommandResults(config, acknowledgementEntries, 10);
     }
   }
