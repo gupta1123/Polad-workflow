@@ -2461,7 +2461,10 @@ async function waitForConnectorPreprocessCommand({ commandId, ownerUserId, prequ
             })).filter((candidate) => candidate.ledgerName)
           : []
       );
-      if (vectorCandidates.some((candidates) => candidates.length === 0)) {
+      // One row with no vector hit (for example an unusual payee name) must not discard the
+      // shortlist for the whole statement. Rows without candidates fall back to a text
+      // shortlist in ledger matching; only a run with no candidates at all is unusable.
+      if (vectorCandidates.every((candidates) => candidates.length === 0)) {
         return { used: false, reason: "vector_candidates_unavailable" };
       }
       return {
