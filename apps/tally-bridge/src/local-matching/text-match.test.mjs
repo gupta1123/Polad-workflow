@@ -23,6 +23,9 @@ test("extracts the payee from common bank narration shapes", () => {
   assert.equal(extractPayeeText("INB/RTGS/UTIBR62026102216568551/G AJLAXMI STEEL/ x"), "G AJLAXMI STEEL");
   assert.equal(extractPayeeText("NEFT Cr- TBMC0001007- DWARKADHISH ENTERPRISE- BHAGYA").trim(), "DWARKADHISH ENTERPRISE");
   assert.equal(extractPayeeText("IMPS-AFAJALKHAN AMARULLAK - 07352320000966 - 1856147"), "AFAJALKHAN AMARULLAK");
+  assert.equal(extractPayeeText("NEFT/AXISP00853063047/3110202901/K URESHI HARUN ABDU/MAHB0000029"), "K URESHI HARUN ABDU");
+  assert.equal(extractPayeeText("IFT/IFT26304057171/3110202907/GULA M RASUL A MUNA"), "GULA M RASUL A MUNA");
+  assert.equal(extractPayeeText("NEFT/HDFCH01367112247/SHRI SHIVPRASAD ENTERPRISES/HDFC BANK/0001NBKNCD"), "SHRI SHIVPRASAD ENTERPRISES");
 });
 
 test("an exact party name outranks a lookalike that shares a generic word", () => {

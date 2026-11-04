@@ -77,3 +77,26 @@ NRTGS/PUNBR wrapped continuation U123456 03-09-2026 50.00 950.00 Dr.`;
     /could not be normalized deterministically/
   );
 });
+
+test("moves an amount to the other column when the running balance proves the direction", async () => {
+  const markdown = `| Account Holder | Account Number | Bank Name |
+|---|---|---|
+| Solution Nyx | 8822014500 | ICICI Bank |
+
+| Opening Balance | 1000.00 |
+|---|---|
+| Statement | 1000.00 |
+
+| Transaction Date | Description | Reference | Debit | Credit | Balance |
+|---|---|---|---|---|---|
+| 01 Aug 2026 | NEFT CREDIT-NOVA ALLOY | REF001 | - | 200.00 | 1200.00 |
+| 02 Aug 2026 | BY ADARSH TRADING CO | REF002 | 300.00 | - | 1500.00 |
+| 03 Aug 2026 | UPI DEBIT-METRO MART | REF003 | 50.00 | - | 1450.00 |`;
+  const result = await processBankStatementMarkdownLocal(markdown);
+  const rows = result.parsed.transactions;
+  assert.equal(rows[1].credit_amount, 300);
+  assert.equal(rows[1].debit_amount, null);
+  assert.equal(rows[2].debit_amount, 50);
+  assert.equal(result.diagnostics.balanceValidation.status, "verified");
+  assert.equal(result.diagnostics.balanceValidation.directionRepairedRows, 1);
+});

@@ -211,6 +211,43 @@ function transactionsFromPhysicalRows(rows) {
   }));
 }
 
+const moneyOf = (value) => (value === null || value === undefined || value === "" || !Number.isFinite(Number(value)) ? null : Math.round(Number(value) * 100) / 100);
+
+// Some converters drop a credit into the Debit column (or the reverse) on part of a statement.
+// The running balance is the authority: when a row moves the balance by exactly its amount but in
+// the opposite direction, the amount is moved to the other column. The result is used only when the
+// repaired statement then verifies end to end.
+function swapDirectionsFromBalance(transactions, openingBalance, orientation) {
+  const indexes = transactions.map((_row, index) => index);
+  if (orientation === "reverse") indexes.reverse();
+  const repaired = [...transactions];
+  let previous = moneyOf(openingBalance);
+  let swapped = 0;
+  for (const index of indexes) {
+    const row = transactions[index];
+    const balance = moneyOf(row.balance_amount);
+    const debit = moneyOf(row.debit_amount) || 0;
+    const credit = moneyOf(row.credit_amount) || 0;
+    if (previous !== null && balance !== null && (debit > 0) !== (credit > 0)) {
+      const delta = Math.round((balance - previous) * 100) / 100;
+      const amount = debit || credit;
+      const movedUp = delta > 0;
+      if (Math.abs(delta) === amount && movedUp === (debit > 0)) {
+        repaired[index] = {
+          ...row,
+          debit_amount: credit > 0 ? credit : null,
+          credit_amount: debit > 0 ? debit : null,
+          category: debit > 0 ? "receipt" : "payment",
+          raw_payload: { ...(row.raw_payload ?? {}), balanceDirectionCorrection: { originalDebitAmount: debit || null, originalCreditAmount: credit || null, previousBalance: previous } },
+        };
+        swapped += 1;
+      }
+    }
+    if (balance !== null) previous = balance;
+  }
+  return { transactions: repaired, swapped };
+}
+
 export async function processBankStatementMarkdownLocal(markdown, { pageCount = 1, pdfBytes = null } = {}) {
   const { deterministic, account, amounts, runningBalance, resilience, pdfColumns } = await loadBankStatementModules();
   let normalized = deterministic.deterministicTransactionsFromAnydoc(markdown);
@@ -260,6 +297,16 @@ export async function processBankStatementMarkdownLocal(markdown, { pageCount = 
         normalized.transactions = candidate;
         pipeline = "physical_pdf_columns";
         balanceValidation = candidateValidation;
+      }
+    }
+  }
+  if (balanceValidation.status === "failed") {
+    const repair = swapDirectionsFromBalance(normalized.transactions, source.openingBalance, balanceValidation.orientation);
+    if (repair.swapped > 0) {
+      const repairedValidation = runningBalance.validateRunningBalanceContinuity(repair.transactions, source.openingBalance);
+      if (repairedValidation.status === "verified") {
+        normalized.transactions = repair.transactions;
+        balanceValidation = { ...repairedValidation, directionRepairedRows: repair.swapped };
       }
     }
   }

@@ -41,6 +41,8 @@ export function extractPayeeText(description) {
   if ((match = /^(?:NEFT|RTGS|IMPS)\s*(?:Cr|Dr)?\s*-\s*[A-Z]{4}0[A-Z0-9]{6}\s*-\s*([^-]+)-/i.exec(text))) return match[1];
   if ((match = /^IMPS\s*-\s*([^-]+?)\s*-\s*\d{6,}/i.exec(text))) return match[1];
   if ((match = /^IMPS\/P2A\/\d+\/([^/]+)/i.exec(text))) return match[1];
+  // Axis: NEFT/<ref>/<numeric ref>/<payee>/<IFSC> (and the IFT/ same-bank variant). The numeric segment is not the payee.
+  if ((match = /^(?:INB\/)?(?:NEFT|RTGS|IMPS|IFT)\/[A-Z0-9]+\/\d{6,}\/([^/]+)/i.exec(text))) return match[1];
   if ((match = /^(?:INB\/)?(?:RTGS|NEFT|IMPS)\/[^/]+\/([^/]+)/i.exec(text))) {
     if (!/^[A-Z]{4}R?\d/.test(match[1])) return match[1];
   }
