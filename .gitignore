@@ -13,3 +13,10 @@ __MACOSX/
 *.log
 *.tsbuildinfo
 
+
+# Installer build output. Installers are published as GitHub Releases, never committed (GitHub rejects files >100MB).
+installer/tally-bridge/output/
+installer/tally-bridge/payload-clean/
+installer/tally-bridge/payload-nyx/
+*.exe
+.npm-cache-codex/
