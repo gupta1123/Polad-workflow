@@ -163,7 +163,7 @@ export function serializeTallyConnectionStatus(row: TallyConnectionRow) {
     lastCompanyName:
       revoked || bridgeStale || !companyDetectionReliable ? null : row.last_company_name,
     lastError: connectorUpdateRequired
-      ? "Connector update required. Reconnect using the latest Polaad Tally Connector."
+      ? "Connector update required. Reconnect using the latest Tally Connector."
       : revoked
         ? row.revoked_reason ?? "This connector session is no longer active."
       : row.last_error,

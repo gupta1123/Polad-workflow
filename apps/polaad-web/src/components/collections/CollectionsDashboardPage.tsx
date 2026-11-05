@@ -1,6 +1,7 @@
 "use client";
 
-import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import { useBrand } from "@/lib/use-brand";import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckCircle2,
   Loader2,
@@ -368,6 +369,7 @@ function chunkValues<T>(values: T[], size: number) {
 }
 
 export function CollectionsDashboardPage() {
+  const brand = useBrand();
   const [companies, setCompanies] = useState<CompanyOption[]>([]);
   const [selectedConnectionId, setSelectedConnectionId] = useState("");
   const [selectedCompanyId, setSelectedCompanyId] = useState("");
@@ -995,7 +997,7 @@ export function CollectionsDashboardPage() {
             </span>
             <span className="hidden h-4 w-px bg-[#e5ddd0] sm:block" />
             <span className="whitespace-nowrap font-semibold">
-              Polaad: {selectedCompany?.companyName || "Not selected"} · Tally: {checkingLiveTallyCompany ? "Checking…" : activeTallyCompanyName || "Not detected"}
+              {brand.name}: {selectedCompany?.companyName || "Not selected"} · Tally: {checkingLiveTallyCompany ? "Checking…" : activeTallyCompanyName || "Not detected"}
             </span>
           </div>
 

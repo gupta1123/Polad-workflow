@@ -13,3 +13,8 @@ __MACOSX/
 *.log
 *.tsbuildinfo
 
+
+# Nyx white-label connector build artefacts
+installer/tally-bridge/payload-nyx/
+installer/tally-bridge/*.generated.iss
+installer/tally-bridge/output/NyxTallyConnectorSetup.exe

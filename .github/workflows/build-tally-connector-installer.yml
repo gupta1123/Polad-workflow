@@ -1,4 +1,4 @@
-name: Build Polaad Tally Connector
+name: Build Tally Connectors
 
 on:
   workflow_dispatch:
@@ -74,5 +74,67 @@ jobs:
           gh release view $tag *> $null
           if ($LASTEXITCODE -ne 0) {
             gh release create $tag --target $env:GITHUB_SHA --title "Polaad Tally Connector v0.1.98" --notes "Windows installer for the Polaad Tally Connector."
+          }
+          gh release upload $tag $installer --clobber
+
+  build-windows-installer-nyx:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7.0.0
+        with:
+          node-version: 24
+
+      - name: Install project dependencies
+        run: npm ci
+
+      - name: Install Windows Electron runtime
+        shell: pwsh
+        run: |
+          $runtimeRoot = Join-Path $env:RUNNER_TEMP "nyx-electron-runtime"
+          New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
+          Push-Location $runtimeRoot
+          npm init --yes
+          npm install --save-exact electron@43.2.0
+          npx install-electron
+          Pop-Location
+          $electronDist = Join-Path $runtimeRoot "node_modules\electron\dist"
+          if (-not (Test-Path (Join-Path $electronDist "electron.exe"))) {
+            throw "Electron runtime was not downloaded to $electronDist"
+          }
+          "POLAAD_CONNECTOR_RUNTIME=$electronDist" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Validate installer identity
+        run: npm run installer:tally-bridge:validate -- --brand nyx
+
+      - name: Build Nyx installer
+        run: npm run installer:tally-bridge -- --brand nyx
+
+      - name: Record installer checksum
+        shell: pwsh
+        run: Get-FileHash installer\tally-bridge\output\NyxTallyConnectorSetup.exe -Algorithm SHA256
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: NyxTallyConnectorSetup
+          path: installer/tally-bridge/output/NyxTallyConnectorSetup.exe
+          if-no-files-found: error
+
+      - name: Publish connector release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "nyx-tally-connector-v0.1.98"
+          $installer = "installer\tally-bridge\output\NyxTallyConnectorSetup.exe"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --target $env:GITHUB_SHA --title "Nyx Tally Connector v0.1.98" --notes "Windows installer for the Nyx Tally Connector."
           }
           gh release upload $tag $installer --clobber

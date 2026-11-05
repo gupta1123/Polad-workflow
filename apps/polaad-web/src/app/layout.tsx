@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Poppins } from "next/font/google";
 
+import { defaultBrand } from "@/lib/brand";
 import { TallyConnectionStatusProvider } from "@/components/tally/TallyConnectionStatusProvider";
 
 import "./globals.css";
@@ -12,9 +13,11 @@ const poppins = Poppins({
   display: "swap",
 });
 
+const brand = defaultBrand();
+
 export const metadata: Metadata = {
-  title: "Polaad Workflows",
-  description: "Document, statement, and Tally workflow tools for Polaad.",
+  title: brand.product,
+  description: brand.description,
 };
 
 export default function RootLayout({

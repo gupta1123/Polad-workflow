@@ -3,7 +3,10 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const connector = {
+// The source tree is written as the Polaad connector. A white-label build
+// (CONNECTOR_BRAND=nyx or --brand nyx) re-labels the staged copy only, so one
+// codebase produces separately installable connectors that can sit side by side.
+const sourceConnector = {
   brandName: "Polaad",
   connectorName: "Polaad Tally Connector",
   executableName: "Polaad Tally Connector.exe",
@@ -16,12 +19,43 @@ const connector = {
   tdlFileName: "polaad-native-debit-note-export.tdl",
   runtimePackageName: "@polaad/tally-bridge-runtime",
   tempFolderName: "polaad-tally-connector-installer",
+  appId: "C3B8D6B9-7F0E-42C6-A142-8706167053EC",
+  appUserModelId: "com.polaad.tally-connector",
+  logoFile: "polaad-logo.png",
+  payloadFolder: "payload-clean",
 };
+
+const brandProfiles = {
+  polaad: sourceConnector,
+  nyx: {
+    ...sourceConnector,
+    brandName: "Nyx",
+    connectorName: "Nyx Tally Connector",
+    executableName: "Nyx Tally Connector.exe",
+    executableProcessName: "Nyx Tally Connector",
+    setupName: "NyxTallyConnectorSetup.exe",
+    protocolName: "nyx-tally",
+    configFolderName: ".nyx-tally-bridge",
+    installDir: "C:\\Nyx\\tally-bridge",
+    runtimePackageName: "@nyx/tally-bridge-runtime",
+    tempFolderName: "nyx-tally-connector-installer",
+    appId: "5E0B7C4A-3D91-4F6B-9A28-6C1D0E7B2F54",
+    appUserModelId: "com.nyx.tally-connector",
+    logoFile: "nyx-logo.png",
+    payloadFolder: "payload-nyx",
+  },
+};
+
+const argBrand = process.argv.includes("--brand") ? process.argv[process.argv.indexOf("--brand") + 1] : "";
+const brandKey = (argBrand || process.env.CONNECTOR_BRAND || "polaad").toLowerCase();
+if (!brandProfiles[brandKey]) throw new Error(`Unknown connector brand: ${brandKey}`);
+const connector = brandProfiles[brandKey];
+const isRebranded = connector !== sourceConnector;
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const installerRoot = path.join(repoRoot, "installer", "tally-bridge");
 const electronAppSource = path.join(installerRoot, "electron-app");
-const payloadDir = path.join(installerRoot, "payload-clean");
+const payloadDir = path.join(installerRoot, connector.payloadFolder);
 const outputDir = path.join(installerRoot, "output");
 const setupName = process.env.POLAAD_INSTALLER_OUTPUT_NAME || connector.setupName;
 const outputExe = path.join(outputDir, setupName);
@@ -42,6 +76,7 @@ const powerShellSource = path.join(bridgeRoot, "powershell");
 const samplesSource = path.join(bridgeRoot, "samples");
 const tdlSource = path.join(bridgeRoot, "tdl");
 const tdlFile = path.join(tdlSource, connector.tdlFileName);
+const storeSource = path.join(localMatchingSource, "store.mjs");
 const dashboardSource = path.join(
   repoRoot,
   "apps",
@@ -51,7 +86,10 @@ const dashboardSource = path.join(
   "tally",
   "TallyPrimeDashboard.tsx"
 );
-const innoDefinition = path.join(installerRoot, "polaad-tally-bridge.iss");
+const innoTemplate = path.join(installerRoot, "polaad-tally-bridge.iss");
+const innoDefinition = isRebranded
+  ? path.join(installerRoot, `${brandKey}-tally-bridge.generated.iss`)
+  : innoTemplate;
 const tempBuildRoot = `C:\\tmp\\${connector.tempFolderName}`;
 const stagingDir = path.join(tempBuildRoot, "staging");
 const tempOutputDir = path.join(tempBuildRoot, "output");
@@ -80,23 +118,22 @@ function validateSources() {
   ensureFile(path.join(anydocPackageSource, "package.json"), "AnyDoc runtime dependency");
   ensureFile(path.join(anydocWindowsSource, "package.json"), "AnyDoc Windows runtime dependency");
   ensureFile(tdlFile, "native Tally PDF TDL");
-  ensureContains(
-    dashboardSource,
-    `${connector.protocolName}://connect`,
-    "Polaad web connector protocol"
-  );
+  ensureContains(dashboardSource, "://connect", "Web connector protocol link");
   ensureContains(
     bridgeSource,
-    connector.configFolderName,
+    sourceConnector.configFolderName,
     "Polaad bridge configuration folder"
   );
-  ensureContains(innoDefinition, connector.connectorName, "Inno Setup product name");
-  ensureContains(innoDefinition, connector.protocolName, "Inno Setup protocol");
+  ensureContains(innoTemplate, sourceConnector.connectorName, "Inno Setup product name");
+  ensureContains(innoTemplate, sourceConnector.protocolName, "Inno Setup protocol");
   ensureContains(
     path.join(electronAppSource, "main.mjs"),
-    connector.connectorName,
+    sourceConnector.connectorName,
     "Electron product name"
   );
+  if (isRebranded) {
+    ensureFile(path.join(electronAppSource, "assets", connector.logoFile), `${connector.brandName} logo`);
+  }
   // Zvec is required for Local Matching vector search. Validate if installed.
   if (fs.existsSync(path.join(zvecPackageSource, "package.json"))) {
     ensureContains(path.join(electronAppSource, "main.mjs"), "Local Matching", "Electron Local Matching UI");
@@ -144,7 +181,9 @@ function findRuntimeExecutable(runtimeSource) {
 function findRuntime() {
   const candidates = [
     process.env[connector.runtimeEnvironmentVariable],
+    process.env[sourceConnector.runtimeEnvironmentVariable],
     connector.installDir,
+    sourceConnector.installDir,
     process.env.KALIKA_CONNECTOR_RUNTIME,
     "C:\\Autodealer\\tally-bridge",
   ].filter(Boolean);
@@ -316,6 +355,37 @@ copyDir(pdfjsPackageSource, path.join(appDir, "node_modules", "pdfjs-dist"));
 copyDir(napiCanvasSource, path.join(appDir, "node_modules", "@napi-rs", "canvas"));
 copyDir(napiCanvasWindowsSource, path.join(appDir, "node_modules", "@napi-rs", "canvas-win32-x64-msvc"));
 copyDir(anydocWindowsSource, path.join(appDir, "node_modules", "@firecrawl", "anydoc-win32-x64-msvc"));
+function replaceInStaged(file, pairs) {
+  let text = fs.readFileSync(file, "utf8");
+  for (const [from, to] of pairs) {
+    if (!text.includes(from)) throw new Error(`Rebrand marker ${JSON.stringify(from)} not found in ${file}`);
+    text = text.split(from).join(to);
+  }
+  fs.writeFileSync(file, text);
+}
+
+if (isRebranded) {
+  // Display strings, protocol, Windows identity and config folder only. Tally-side
+  // names (UDFs, collections, the TDL file) stay shared with the Polaad connector.
+  replaceInStaged(stagedWrapper, [
+    [`const BRAND_NAME = "${sourceConnector.brandName}"`, `const BRAND_NAME = "${connector.brandName}"`],
+    [`const CONNECTOR_NAME = "${sourceConnector.connectorName}"`, `const CONNECTOR_NAME = "${connector.connectorName}"`],
+    [`const PROTOCOL_NAME = "${sourceConnector.protocolName}"`, `const PROTOCOL_NAME = "${connector.protocolName}"`],
+    [`"${sourceConnector.appUserModelId}"`, `"${connector.appUserModelId}"`],
+    [`"assets", "${sourceConnector.logoFile}"`, `"assets", "${connector.logoFile}"`],
+    [`"X-Title": "${sourceConnector.connectorName}"`, `"X-Title": "${connector.connectorName}"`],
+  ]);
+  replaceInStaged(path.join(appDir, "src", "bridge.mjs"), [
+    [sourceConnector.configFolderName, connector.configFolderName],
+  ]);
+  replaceInStaged(path.join(appDir, "src", "local-matching", "store.mjs"), [
+    [sourceConnector.configFolderName, connector.configFolderName],
+  ]);
+  for (const name of fs.readdirSync(path.join(appDir, "assets"))) {
+    if (name.startsWith("polaad-logo.")) fs.rmSync(path.join(appDir, "assets", name), { force: true });
+  }
+}
+
 if (fs.existsSync(zvecPackageSource)) {
   copyDir(path.join(repoRoot, "node_modules", "@zvec"), path.join(appDir, "node_modules", "@zvec"));
   // Also copy @zvec's transitive bindings if present
@@ -344,6 +414,28 @@ fs.writeFileSync(
     2
   )}\n`
 );
+
+if (isRebranded) {
+  let iss = fs.readFileSync(innoTemplate, "utf8");
+  const swaps = [
+    [sourceConnector.appId, connector.appId],
+    [`#define AppName "${sourceConnector.connectorName}"`, `#define AppName "${connector.connectorName}"`],
+    [`#define AppPublisher "${sourceConnector.brandName}"`, `#define AppPublisher "${connector.brandName}"`],
+    [`#define AppInstallDir "${sourceConnector.installDir}"`, `#define AppInstallDir "${connector.installDir}"`],
+    [`#define AppExeName "${sourceConnector.executableName}"`, `#define AppExeName "${connector.executableName}"`],
+    ["OutputBaseFilename=PolaadTallyConnectorSetup", `OutputBaseFilename=${path.basename(connector.setupName, ".exe")}`],
+    [`Source: "payload-clean\\*"`, `Source: "${connector.payloadFolder}\\*"`],
+    [`Programs\\${sourceConnector.connectorName}`, `Programs\\${connector.connectorName}`],
+    [`Classes\\${sourceConnector.protocolName}`, `Classes\\${connector.protocolName}`],
+    [`URL:${sourceConnector.brandName} Tally Protocol`, `URL:${connector.brandName} Tally Protocol`],
+    [`/IM "${sourceConnector.executableName}"`, `/IM "${connector.executableName}"`],
+  ];
+  for (const [from, to] of swaps) {
+    if (!iss.includes(from)) throw new Error(`Inno Setup marker not found: ${from}`);
+    iss = iss.split(from).join(to);
+  }
+  fs.writeFileSync(innoDefinition, iss);
+}
 
 if (fs.existsSync(outputExe)) fs.rmSync(outputExe, { force: true });
 const outputBaseName = path.basename(setupName, path.extname(setupName));

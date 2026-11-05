@@ -127,7 +127,7 @@ export async function POST(request: Request) {
         request,
         {
           error:
-            "Connector update required. Install and reconnect using the latest Polaad Tally Connector.",
+            "Connector update required. Install and reconnect using the latest Tally Connector.",
         },
         { status: 426 }
       );

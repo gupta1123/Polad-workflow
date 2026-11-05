@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
+import { brandForEmail, defaultBrand } from "@/lib/brand";
 import styles from "./Login.module.css";
 
 function safeNextPath(value: string | null) {
@@ -49,6 +50,7 @@ export function Login() {
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const brand = email.includes("@") && email.split("@")[1].includes(".") ? brandForEmail(email) : defaultBrand();
   const [showPassword, setShowPassword] = useState(false);
   const [loadingMode, setLoadingMode] = useState<"signin" | null>(null);
   const [error, setError] = useState<string | null>(initialError ?? null);
@@ -176,7 +178,7 @@ export function Login() {
           <div className={styles.brandMark}>
             <div className={styles.brandDot} />
           </div>
-          <span className={styles.brandName}>Polaad.</span>
+          <span className={styles.brandName}>{brand.name}.</span>
         </div>
 
         {/* Scanning document visual */}

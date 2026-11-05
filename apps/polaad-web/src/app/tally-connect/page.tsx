@@ -18,6 +18,7 @@ import { AppShell } from "@/components/dashboard/AppShell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { apiFetch } from "@/lib/api-client";
+import { useBrand } from "@/lib/use-brand";
 
 const WINDOWS_BRIDGE_ROOT = "C:\\Polad\\tally-bridge";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
@@ -145,6 +146,7 @@ function CodeValue({
 }
 
 export default function TallyConnectPage() {
+  const brand = useBrand();
   const [apiBase, setApiBase] = useState(DEFAULT_UTM_API_BASE);
   const [tallyUrl, setTallyUrl] = useState(DEFAULT_TALLY_URL);
   const [companyName, setCompanyName] = useState("");
@@ -269,7 +271,7 @@ export default function TallyConnectPage() {
               Local Tally bridge
             </div>
             <h1 className="max-w-2xl text-3xl font-extrabold tracking-tight text-[#17211c] sm:text-4xl">
-              Connect Polaad to Tally from this Mac
+              Connect {brand.name} to Tally from this Mac
             </h1>
             <p className="mt-4 max-w-3xl text-sm font-medium leading-7 text-[#52645b]">
               Generate a real connection code, pairing code and control token, then run the PowerShell commands below inside the UTM Windows machine while Tally Prime is open and the target company is loaded.

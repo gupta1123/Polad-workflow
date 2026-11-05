@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   CircleAlert,
   CircleDashed,
@@ -16,6 +16,7 @@ import {
 
 import { useTallyConnectionStatus } from "@/components/tally/TallyConnectionStatusProvider";
 import { GradientSuccessMark } from "@/components/ui/gradient-success-mark";
+import { useSessionBrand } from "@/lib/use-brand";
 import styles from "./DashboardSidebar.module.css";
 
 /* ── Sectioned nav ───────────────────────────── */
@@ -53,6 +54,10 @@ export interface DashboardSidebarProps {
 
 export function DashboardSidebar({ user, defaultCollapsed = false }: DashboardSidebarProps) {
   const pathname = usePathname();
+  const { email: sessionEmail, brand } = useSessionBrand();
+  useEffect(() => {
+    document.title = brand.product;
+  }, [brand.product]);
   const [popoverOpen, setPopoverOpen] = useState(false);
   const [collapsed, setCollapsed] = useState(defaultCollapsed);
   const userRowRef = useRef<HTMLDivElement>(null);
@@ -60,7 +65,7 @@ export function DashboardSidebar({ user, defaultCollapsed = false }: DashboardSi
 
   const displayUser: UserInfo = user ?? {
     name: "Admin",
-    email: "admin@polaad.local",
+    email: sessionEmail || `admin@${brand.id}.local`,
   };
 
   const initials = displayUser.name
@@ -89,8 +94,8 @@ export function DashboardSidebar({ user, defaultCollapsed = false }: DashboardSi
       {/* ── BRAND ── */}
       <div className={`${styles.brandRow} ${collapsed ? styles.collapsed : ""}`}>
         <div className={styles.brandLeft}>
-          <div className={styles.brandLogoMark}>G</div>
-          <span className={styles.brandTitle}>Polaad</span>
+          <div className={styles.brandLogoMark}>{brand.mark}</div>
+          <span className={styles.brandTitle}>{brand.name}</span>
         </div>
         <button
           onClick={() => setCollapsed(!collapsed)}

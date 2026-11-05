@@ -1,5 +1,7 @@
 "use client";
 
+
+import { useBrand } from "@/lib/use-brand";
 import { tallyBrowserStorage } from "@/lib/tally-browser-storage";
 
 
@@ -3403,6 +3405,7 @@ function formatFileSize(size: number | null | undefined) {
 }
 
 export function BankStatementsPage() {
+  const brand = useBrand();
   const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const selectedPreviewFileRef = useRef<File | null>(null);
@@ -3766,7 +3769,7 @@ export function BankStatementsPage() {
     : !tallyConnected
       ? "Open Tally Prime, load the company, then refresh the connection."
       : !activeTallyCompanyName
-        ? "Refresh Polaad to confirm the company currently open in Tally."
+        ? `Refresh ${brand.name} to confirm the company currently open in Tally.`
         : !tallyCompanyContextVerified
           ? `Tally is open to ${activeTallyCompanyName}. Switch Tally Prime to ${selectedCompanyName}, then refresh.`
           : "";
@@ -3796,7 +3799,7 @@ export function BankStatementsPage() {
       return {
         tone: "warning" as const,
         title: stateLabel,
-        text: "Refresh Polaad to confirm the company currently open in Tally before upload.",
+        text: `Refresh ${brand.name} to confirm the company currently open in Tally before upload.`,
       };
     }
 
@@ -5399,8 +5402,8 @@ export function BankStatementsPage() {
   function requireVerifiedTallyCompany(action: string) {
     if (tallyCompanyContextVerified) return true;
     const detail = tallyCompanyContextMismatch
-      ? `Tally is open to ${activeTallyCompanyName}. Switch it to ${selectedCompanyName}, refresh Polaad, then ${action}.`
-      : "Refresh Polaad to verify the company currently open in Tally before continuing.";
+      ? `Tally is open to ${activeTallyCompanyName}. Switch it to ${selectedCompanyName}, refresh ${brand.name}, then ${action}.`
+      : `Refresh ${brand.name} to verify the company currently open in Tally before continuing.`;
     showToast("error", detail);
     return false;
   }
@@ -5864,7 +5867,7 @@ export function BankStatementsPage() {
       return;
     }
     if (!tallyCompanyContextVerified) {
-      setBanner({ tone: "error", text: setupErrorMessage || "Refresh Polaad to verify the Tally company before upload." });
+      setBanner({ tone: "error", text: setupErrorMessage || `Refresh ${brand.name} to verify the Tally company before upload.` });
       return;
     }
     if (

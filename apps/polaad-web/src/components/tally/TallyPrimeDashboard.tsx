@@ -1,5 +1,6 @@
 "use client";
 
+import { useBrand } from "@/lib/use-brand";
 import { tallyBrowserStorage } from "@/lib/tally-browser-storage";
 
 
@@ -154,6 +155,7 @@ function buildConnectorConnectUrl(
   connection: TallyConnection,
   pairingCode: string,
   controlToken: string,
+  protocol: string,
 ) {
   const params = new URLSearchParams({
     apiBase: getBridgeApiBaseUrl(),
@@ -163,7 +165,7 @@ function buildConnectorConnectUrl(
     tallyUrl: connection.tallyUrl || DEFAULT_TALLY_URL,
   });
 
-  return `polaad-tally://connect?${params.toString()}`;
+  return `${protocol}://connect?${params.toString()}`;
 }
 
 function normalizeTallyUrlInput(value: string) {
@@ -279,6 +281,7 @@ interface TallyPrimeDashboardProps {
 
 export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboardProps) {
   const router = useRouter();
+  const brand = useBrand();
   const { refresh: refreshGlobalTallyStatus } = useTallyConnectionStatus();
   const [view, setView] = useState<"home" | "connection">(initialView);
   const [connections, setConnections] = useState<TallyConnection[]>([]);
@@ -375,7 +378,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
   const connectionVisual = {
     ready: {
       title: `Connected to ${selectedConnection?.lastCompanyName || selectedCompany?.companyName || "Tally"}`,
-      description: "The connector, Tally Prime, and company are ready for Polaad workflows.",
+      description: `The connector, Tally Prime, and company are ready for ${brand.name} workflows.`,
       eyebrow: "Ready",
       shader: "/images/tally/connection-ready.webp",
       badge: "Connected",
@@ -383,7 +386,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
     },
     needs_company: {
       title: "Open a company in Tally",
-      description: "Tally Prime is reachable. Load the company you want Polaad to use, then check again.",
+      description: `Tally Prime is reachable. Load the company you want ${brand.name} to use, then check again.`,
       eyebrow: "One step left",
       shader: "/images/tally/connection-waiting.webp",
       badge: "Company needed",
@@ -608,6 +611,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
           payload.connection,
           payload.pairingCode,
           payload.controlToken,
+          brand.connectorProtocol,
         ),
       );
       setMessage({
@@ -965,7 +969,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
                 Where does Tally run?
               </h3>
               <p className="mt-1 text-xs font-semibold text-[#6f6255]">
-                Choose the location once. Polaad will remember it for this connector.
+                Choose the location once. {brand.name} will remember it for this connector.
               </p>
             </div>
 
