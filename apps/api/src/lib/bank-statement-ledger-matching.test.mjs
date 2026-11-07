@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   bankNarrationMatchingQueries,
+  findLedgerWhollyNamedInNarration,
   isLedgerSupportedByNarration,
   shortlistBankLedgersForTransaction,
   suggestBankLedgersForTransactions,
@@ -89,4 +90,14 @@ test("truncated and honorific narrations still support the right ledger", () => 
   assert.equal(isLedgerSupportedByNarration("Arihant Sarda Construction Enterprises, Mumbai", "NEFT/N277010010011/SBIN0001999/ARIHANT SARDA CONSTRUCTION ENTE"), true);
   assert.equal(isLedgerSupportedByNarration("Avani Bajaj Fabrication Limited, Nashik", "NEFT/N277010010003/HDFC0002345/AVANI BAJAJ FABRICATION LTD NASHIK"), true);
   assert.equal(isLedgerSupportedByNarration("Mehta & Sons", "IMPS/P2A/627612345678/MEHTA AND SONS/ICIC/PAYMENT"), true);
+});
+
+test("a ledger written in full in the narration beats a lookalike ledger", () => {
+  const ledgers = [
+    ledger("Arnav Mehta Engineering Industries, Kolhapur", "Sundry Debtors"),
+    ledger("Arnav Mehta Engineering LLP, Kolhapur", "Sundry Debtors"),
+  ];
+  const named = findLedgerWhollyNamedInNarration(ledgers, "NEFT/N277010010008/ICIC0003456/ARNAV MEHTA ENGINEERING LLP KOLHAPUR");
+  assert.equal(named?.tally_name, "Arnav Mehta Engineering LLP, Kolhapur");
+  assert.equal(findLedgerWhollyNamedInNarration(ledgers, "NEFT/ARNAV MEHTA ENGINEERING"), null);
 });

@@ -2346,7 +2346,7 @@ function getBillAllocationClass(draft?: BillAllocationDraft | null) {
 }
 
 function getOutgoingVerificationLabel(draft?: OutgoingVerificationDraft | null) {
-  return draft?.label || "Check Entry";
+  return draft?.label || "Not Checked";
 }
 
 function getOutgoingVerificationClass(draft?: OutgoingVerificationDraft | null) {
@@ -2360,7 +2360,7 @@ function getOutgoingVerificationClass(draft?: OutgoingVerificationDraft | null) 
 }
 
 function getOutgoingVerificationSubtext(draft?: OutgoingVerificationDraft | null, transaction?: ReviewTransaction) {
-  if (!draft) return "Check for existing Tally voucher";
+  if (!draft) return "Check Tally to look for an existing voucher";
   if (draft.status === "checking") return "Checking Tally...";
   if (draft.status === "found") {
     if (draft.duplicateInTally) {

@@ -500,6 +500,22 @@ export function isLedgerSupportedByNarration(ledgerName?: string | null, descrip
   return present.length >= Math.ceil((required.length * 2) / 3);
 }
 
+/**
+ * When exactly one allowed ledger's whole name (before the city) is written in the
+ * narration, that ledger is the answer. Legal suffixes such as LLP / Limited are
+ * ignored by fuzzy scoring, so "ARNAV MEHTA ENGINEERING LLP" must not fall to the
+ * lookalike "Arnav Mehta Engineering Industries".
+ */
+export function findLedgerWhollyNamedInNarration(ledgers: TallyMasterRow[], description?: string | null) {
+  const narration = ` ${normalizeName(description)} `;
+  if (narration.trim().length === 0) return null;
+  const named = ledgers.filter((ledger) => {
+    const identity = normalizeName(String(ledger.tally_name ?? "").split(",")[0]);
+    return identity.length >= 8 && narration.includes(` ${identity} `);
+  });
+  return named.length === 1 ? named[0] : null;
+}
+
 function validateAiLedgerMatch(
   match: Partial<AiLedgerMatch> | undefined,
   candidateLedgers: TallyMasterRow[],
@@ -515,7 +531,9 @@ function validateAiLedgerMatch(
     : [];
 
   if (match.matchType === "direct_match" && match.action === "use_existing_ledger") {
-    const matchedLedger = findLedgerByNormalizedName(candidateLedgers, String(match.ledgerName ?? ""));
+    const aiLedger = findLedgerByNormalizedName(candidateLedgers, String(match.ledgerName ?? ""));
+    const namedLedger = findLedgerWhollyNamedInNarration(candidateLedgers, description);
+    const matchedLedger = aiLedger && namedLedger && aiLedger !== namedLedger ? namedLedger : aiLedger;
     const confidence = clampConfidence(match.confidence);
     if (matchedLedger && confidence >= 0.9 && !isLedgerSupportedByNarration(matchedLedger.tally_name, description)) {
       return {
