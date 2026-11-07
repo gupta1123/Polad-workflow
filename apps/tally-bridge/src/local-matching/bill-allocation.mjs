@@ -111,6 +111,11 @@ export function planChronologicalBillAllocations({ transactions, verificationRow
     const amount = amountFor(transaction);
     if (amount <= 0) continue;
     let preferred = preferredBillReference(bills, transaction);
+    if (!preferred) {
+      // No bill named in the narration: if exactly one open bill equals the amount, that is the target.
+      const exactOnly = bills.filter((bill) => Math.abs((Number(bill.pendingAmount) || 0) - amount) < 0.005);
+      if (exactOnly.length === 1) preferred = normalized(exactOnly[0].referenceName);
+    }
     if ((bucket.existingAdvances || []).length > 0) {
       // An existing advance needs a human unless one bill is clearly the target: the bill named
       // in the narration (covering the amount), or the only bill with exactly this amount.

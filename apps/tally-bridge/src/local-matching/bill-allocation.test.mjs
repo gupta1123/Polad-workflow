@@ -86,3 +86,20 @@ test("an existing advance with no clear target still waits for review", () => {
   });
   assert.equal(plans.t3, undefined);
 });
+
+test("picks the one bill whose amount equals the receipt instead of the oldest bill", () => {
+  const plans = planChronologicalBillAllocations({
+    transactions: [
+      { transactionId: "small", voucherDate: "2026-10-14", amount: 52486, counterpartyLedgerName: "Ladha" },
+      { transactionId: "exact", voucherDate: "2026-10-14", amount: 189048, counterpartyLedgerName: "Ladha" },
+    ],
+    verificationRows: [{ transactionId: "small", verificationStatus: "missing" }, { transactionId: "exact", verificationStatus: "missing" }],
+    openBillsByLedger: { Ladha: { complete: true, existingAdvances: [], openBills: [
+      { referenceName: "INV/05703", pendingAmount: 1928450.4, dueDate: "2026-04-20" },
+      { referenceName: "INV/14724", pendingAmount: 52486, dueDate: "2026-04-21" },
+      { referenceName: "INV/09426", pendingAmount: 189048, dueDate: "2026-04-23" },
+    ] } },
+  });
+  assert.equal(plans.exact.allocations[0].referenceName, "INV/09426");
+  assert.equal(plans.small.allocations[0].referenceName, "INV/14724");
+});

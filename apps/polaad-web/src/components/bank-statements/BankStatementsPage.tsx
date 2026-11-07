@@ -2710,7 +2710,8 @@ function billStateSignature(
 function validateAllocationAgainstFreshBillState(
   draft: BillAllocationDraft,
   openBills: OpenBillReference[],
-  existingAdvances: ExistingAdvanceReference[]
+  existingAdvances: ExistingAdvanceReference[],
+  alreadyAllocatedByBill: Map<string, number> = new Map()
 ) {
   const freshBillsByReference = new Map(
     openBills.map((bill) => [normalizeReferenceToken(bill.referenceName), bill])
@@ -2721,15 +2722,22 @@ function validateAllocationAgainstFreshBillState(
     if (!freshBill) {
       return `Bill ${allocation.referenceName} is no longer open in Tally.`;
     }
-    if (Number(freshBill.pendingAmount ?? 0) + 0.005 < allocation.allocatedAmount) {
+    // Earlier rows of the same party in this batch use up the same bill, so count them too.
+    const billKey = normalizeReferenceToken(allocation.referenceName);
+    const usedByEarlierRows = alreadyAllocatedByBill.get(billKey) ?? 0;
+    if (Number(freshBill.pendingAmount ?? 0) + 0.005 < usedByEarlierRows + allocation.allocatedAmount) {
       return `Bill ${allocation.referenceName} now has only ${formatCurrencyAmount(Number(freshBill.pendingAmount ?? 0))} pending.`;
     }
   }
 
-  const previousSignature = billStateSignature(draft.candidateBills, draft.existingAdvances);
-  const freshSignature = billStateSignature(openBills, existingAdvances);
-  if (draft.caseType !== "manual_review" && previousSignature !== freshSignature) {
-    return "Open bills or advances changed in Tally after the statement was checked.";
+  // Each row's draft only lists the bills left after earlier rows of the same party, so the bill list
+  // is not compared as a whole (it would always differ). Each allocated bill is checked above;
+  // only existing advances are compared here.
+  if (
+    draft.caseType !== "manual_review" &&
+    billStateSignature([], draft.existingAdvances) !== billStateSignature([], existingAdvances)
+  ) {
+    return "Open advances changed in Tally after the statement was checked.";
   }
   if (
     draft.caseType === "manual_review" &&
@@ -6703,6 +6711,7 @@ export function BankStatementsPage() {
           .sort()
           .at(-1);
         const freshBillData = await fetchOpenBillsForLedgers(connection, ledgerNames, asOfDate);
+        const allocatedSoFarByLedger = new Map<string, Map<string, number>>();
         const staleAllocations = billEligibleTransactions.flatMap((transaction) => {
           const draft = billAllocationsByTransactionId[transaction.id];
           const fresh = freshBillData.get(transaction.selectedLedgerName);
@@ -6712,11 +6721,22 @@ export function BankStatementsPage() {
           if (!fresh) {
             return [{ transaction, reason: "Could not refresh the selected party ledger's open bills." }];
           }
+          const usedForLedger =
+            allocatedSoFarByLedger.get(transaction.selectedLedgerName) ?? new Map<string, number>();
+          allocatedSoFarByLedger.set(transaction.selectedLedgerName, usedForLedger);
           const reason = validateAllocationAgainstFreshBillState(
             draft,
             fresh.openBills,
-            fresh.existingAdvances
+            fresh.existingAdvances,
+            usedForLedger
           );
+          if (!reason) {
+            for (const allocation of draft.allocations) {
+              if (allocation.referenceType !== "Agst Ref") continue;
+              const key = normalizeReferenceToken(allocation.referenceName);
+              usedForLedger.set(key, (usedForLedger.get(key) ?? 0) + allocation.allocatedAmount);
+            }
+          }
           return reason ? [{ transaction, reason }] : [];
         });
         if (staleAllocations.length > 0) {
