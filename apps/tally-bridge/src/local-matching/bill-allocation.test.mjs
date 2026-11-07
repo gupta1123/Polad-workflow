@@ -103,3 +103,20 @@ test("picks the one bill whose amount equals the receipt instead of the oldest b
   assert.equal(plans.exact.allocations[0].referenceName, "INV/09426");
   assert.equal(plans.small.allocations[0].referenceName, "INV/14724");
 });
+
+test("same party, same day: the big receipt takes its exact bill before a small receipt can use it", () => {
+  const plans = planChronologicalBillAllocations({
+    transactions: [
+      { transactionId: "a-small", voucherDate: "2026-10-14", amount: 167147, counterpartyLedgerName: "Avani" },
+      { transactionId: "z-big", voucherDate: "2026-10-14", amount: 1065894, counterpartyLedgerName: "Avani" },
+    ],
+    verificationRows: [{ transactionId: "a-small", verificationStatus: "missing" }, { transactionId: "z-big", verificationStatus: "missing" }],
+    openBillsByLedger: { Avani: { complete: true, existingAdvances: [], openBills: [
+      { referenceName: "05904", pendingAmount: 1065894, dueDate: "2026-04-01" },
+      { referenceName: "27363", pendingAmount: 66717, dueDate: "2026-04-05" },
+      { referenceName: "13390", pendingAmount: 100430, dueDate: "2026-04-06" },
+    ] } },
+  });
+  assert.deepEqual(plans["z-big"].allocations.map((a) => a.referenceName), ["05904"]);
+  assert.deepEqual(plans["a-small"].allocations.map((a) => a.referenceName), ["27363", "13390"]);
+});

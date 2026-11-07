@@ -98,6 +98,8 @@ export function planChronologicalBillAllocations({ transactions, verificationRow
   const ordered = [...(transactions || [])].sort((left, right) =>
     normalized(left.counterpartyLedgerName).localeCompare(normalized(right.counterpartyLedgerName)) ||
     String(left.voucherDate || "").localeCompare(String(right.voucherDate || "")) ||
+    // Same party, same day: plan the bigger receipt first so a small one cannot eat the bill a big one matches exactly.
+    amountFor(right) - amountFor(left) ||
     String(left.transactionId || "").localeCompare(String(right.transactionId || ""))
   );
   for (const transaction of ordered) {
