@@ -72,6 +72,22 @@ export function normalizeMasterKey({ name, guid }) {
   return `ledger:${source.toLowerCase().replace(/\s+/g, " ")}`;
 }
 
+// Older syncs stored ledger names with XML entities still in them ("R.K. Steels &amp; Co").
+// Tally's real name has the plain character, so show and post the plain name.
+export function decodeStoredMasterName(value) {
+  let decoded = String(value ?? "");
+  for (let pass = 0; pass < 3 && decoded.includes("&"); pass += 1) {
+    const next = decoded
+      .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCodePoint(Number.parseInt(code, 16)))
+      .replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number.parseInt(code, 10)))
+      .replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&quot;", '"').replaceAll("&apos;", "'")
+      .replaceAll("&amp;", "&");
+    if (next === decoded) break;
+    decoded = next;
+  }
+  return decoded;
+}
+
 function migrateDb(raw) {
   if (!raw || typeof raw !== "object") {
     return { version: LOCAL_DB_VERSION, schemaVersion: LOCAL_DB_SCHEMA_VERSION, companies: {}, meta: { createdAt: new Date().toISOString() } };
@@ -87,6 +103,10 @@ function migrateDb(raw) {
     if (!v.groups || typeof v.groups !== "object") v.groups = {};
     if (!v.syncHistory) v.syncHistory = {};
     if (!v.vector) v.vector = { status: "idle", lastVectorisedAt: null, vectorCount: 0, engine: "fts", error: null };
+    for (const item of [...Object.values(v.ledgers), ...Object.values(v.groups)]) {
+      if (typeof item?.tally_name === "string" && item.tally_name.includes("&")) item.tally_name = decodeStoredMasterName(item.tally_name);
+      if (typeof item?.parent_name === "string" && item.parent_name.includes("&")) item.parent_name = decodeStoredMasterName(item.parent_name);
+    }
   }
   return raw;
 }

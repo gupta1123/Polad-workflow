@@ -159,3 +159,18 @@ test("versioned migrations and backup-safe write", () => {
   assert.equal(loaded.version, 1);
   clean(base);
 });
+
+
+test("names stored with XML entities by an older sync are read back as plain text", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lm-entity-"));
+  fs.writeFileSync(path.join(dir, "db.json"), JSON.stringify({ version: 1, companies: { "name:co": { companyName: "Co", companyGuid: null, ledgers: {
+    "ledger:a": { tally_name: "R.K. Steels &amp; Co – Beed", parent_name: "Sundry Debtors", is_active: true },
+    "ledger:b": { tally_name: "Plain Name", parent_name: "Sundry Debtors", is_active: true },
+  }, groups: {} } } }));
+  const db = loadLocalDb({ baseDir: dir });
+  const names = getLocalMasterCatalogue(db, { companyName: "Co" }).ledgers.map((ledger) => ledger.name).sort();
+  assert.deepEqual(names, ["Plain Name", "R.K. Steels & Co – Beed"]);
+});
