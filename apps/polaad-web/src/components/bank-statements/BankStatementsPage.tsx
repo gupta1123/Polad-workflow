@@ -9329,7 +9329,9 @@ export function BankStatementsPage() {
                       </select>
                       <Button
                         className="h-8 flex-1 rounded-l-none rounded-r-lg bg-[#2d2d2d] px-3 text-[10px] font-bold text-white shadow-sm transition-all hover:bg-[#1a1a1a] sm:flex-none"
-                        title={selectedPostingTransactions.length === 0
+                        title={!bankLedgerName.trim()
+                          ? "Select the Tally bank ledger for this statement first."
+                          : selectedPostingTransactions.length === 0
                           ? "No ready entries in this scope. Check Tally matches and resolve held rows."
                           : `Post ${selectedPostingTransactions.length} ready entries only; held rows will stay for review.`}
                         onClick={() => {
