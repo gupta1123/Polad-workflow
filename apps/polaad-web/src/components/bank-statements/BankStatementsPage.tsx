@@ -3463,6 +3463,9 @@ export function BankStatementsPage() {
   const [ledgerCatalogueError, setLedgerCatalogueError] = useState("");
   const [pendingBankLedgerName, setPendingBankLedgerName] = useState("");
   const [ledgerMasters, setLedgerMasters] = useState<TallyMaster[]>([]);
+  // Latest catalogue, readable from async handlers whose closure may predate the catalogue load.
+  const ledgerMastersRef = useRef<TallyMaster[]>([]);
+  ledgerMastersRef.current = ledgerMasters;
   const [bankLedgerCatalogue, setBankLedgerCatalogue] = useState<TallyMaster[]>([]);
   const [tallyBankLedgersByCompany, setTallyBankLedgersByCompany] = useState<Record<string, LocalBankLedger[]>>({});
   const [transactions, setTransactions] = useState<ReviewTransaction[]>([]);
@@ -5541,7 +5544,7 @@ export function BankStatementsPage() {
     const effectiveLedgerMasters = Array.from(
       new Map(
         // Candidates are bare names; the full catalogue entry (ledgerType, bill-wise) must win.
-        [...candidateMasters, ...ledgerMastersForReview].map((ledger) => [normalizeName(ledger.name), ledger])
+        [...candidateMasters, ...ledgerMastersForReview, ...ledgerMastersRef.current].map((ledger) => [normalizeName(ledger.name), ledger])
       ).values()
     );
     if (candidateMasters.length > 0) {
