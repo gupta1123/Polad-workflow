@@ -473,9 +473,37 @@ function findLedgerByNormalizedName(ledgers: TallyMasterRow[], ledgerName?: stri
   return ledgers.find((ledger) => normalizeName(ledger.tally_name) === normalized) ?? null;
 }
 
+const LEDGER_HONORIFIC_TOKENS = new Set(["shree", "sri", "ms", "mr", "mrs", "m"]);
+
+/**
+ * Deterministic safety net for an AI direct match: a multi-word ledger identity
+ * ("Mehta Sankalp Mineral") must be mostly visible in the bank narration
+ * ("MEHTA AND SONS" only shares one word). Truncated narrations still pass because
+ * the final narration word may be a prefix ("KAVYA ENGINEERING WOR").
+ */
+export function isLedgerSupportedByNarration(ledgerName?: string | null, description?: string | null) {
+  const narrationTokens = ledgerNameTokens(description).filter((token) => !/^\d+$/.test(token));
+  if (narrationTokens.length === 0) return true;
+  // The city after the last comma is rarely in a narration, so it is not part of the identity.
+  const identity = String(ledgerName ?? "").split(",")[0];
+  const required = coreLedgerNameTokens(identity).filter(
+    (token) => !LEDGER_HONORIFIC_TOKENS.has(token) && !/^\d+$/.test(token)
+  );
+  if (required.length < 2) return true;
+  const lastToken = narrationTokens[narrationTokens.length - 1];
+  const present = required.filter(
+    (token) =>
+      narrationTokens.includes(token) ||
+      narrationTokens.some((word) => word.length >= 3 && (token.startsWith(word) || word.startsWith(token))) ||
+      token.startsWith(lastToken)
+  );
+  return present.length >= Math.ceil((required.length * 2) / 3);
+}
+
 function validateAiLedgerMatch(
   match: Partial<AiLedgerMatch> | undefined,
-  candidateLedgers: TallyMasterRow[]
+  candidateLedgers: TallyMasterRow[],
+  description?: string | null
 ): ValidatedAiLedgerMatch | null {
   if (!match) return null;
 
@@ -489,6 +517,15 @@ function validateAiLedgerMatch(
   if (match.matchType === "direct_match" && match.action === "use_existing_ledger") {
     const matchedLedger = findLedgerByNormalizedName(candidateLedgers, String(match.ledgerName ?? ""));
     const confidence = clampConfidence(match.confidence);
+    if (matchedLedger && confidence >= 0.9 && !isLedgerSupportedByNarration(matchedLedger.tally_name, description)) {
+      return {
+        ledgerName: null,
+        confidence: 0,
+        reason: "The narration does not contain enough of this ledger's name, so the row was kept in suspense.",
+        matchType: "suspense",
+        candidateLedgerNames: [],
+      };
+    }
     if (!matchedLedger || confidence < 0.9) {
       return {
         ledgerName: null,
@@ -627,7 +664,8 @@ async function aiMatchLedgersForTransactions(input: {
   return input.transactions.map((_, index) =>
     validateAiLedgerMatch(
       parsed.matches?.find((entry) => Number(entry?.index) === index),
-      allowedLedgersByIndex[index]
+      allowedLedgersByIndex[index],
+      input.transactions[index]?.transaction.description
     )
   );
 }

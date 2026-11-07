@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   bankNarrationMatchingQueries,
+  isLedgerSupportedByNarration,
   shortlistBankLedgersForTransaction,
   suggestBankLedgersForTransactions,
 } from "./bank-statement-ledger-matching.ts";
@@ -74,4 +75,18 @@ test("complete connector vector shortlists do not read the cloud master catalogu
   } finally {
     console.warn = originalWarn;
   }
+});
+
+test("a ledger that shares only one word with the narration is not accepted as a direct match", () => {
+  const narr = "IMPS/P2A/627612345678/MEHTA AND SONS/ICIC/PAYMENT";
+  assert.equal(isLedgerSupportedByNarration("Mehta Sankalp Mineral Private Limited, Nashik", narr), false);
+  assert.equal(isLedgerSupportedByNarration("Balaji Metal Distributors", "NEFT/N274044445555/AXIS0004567/BALAJI ENTERPRISES"), false);
+});
+
+test("truncated and honorific narrations still support the right ledger", () => {
+  assert.equal(isLedgerSupportedByNarration("Shree Maa Steels Private Limited", "NRTGS/PUNBR52026090511997279/5282432411/SHRI MAA S"), true);
+  assert.equal(isLedgerSupportedByNarration("Chaman Metals", "NRTGS/PUNBR52026090511997093/5282432017/CHAMAN MET"), true);
+  assert.equal(isLedgerSupportedByNarration("Arihant Sarda Construction Enterprises, Mumbai", "NEFT/N277010010011/SBIN0001999/ARIHANT SARDA CONSTRUCTION ENTE"), true);
+  assert.equal(isLedgerSupportedByNarration("Avani Bajaj Fabrication Limited, Nashik", "NEFT/N277010010003/HDFC0002345/AVANI BAJAJ FABRICATION LTD NASHIK"), true);
+  assert.equal(isLedgerSupportedByNarration("Mehta & Sons", "IMPS/P2A/627612345678/MEHTA AND SONS/ICIC/PAYMENT"), true);
 });
