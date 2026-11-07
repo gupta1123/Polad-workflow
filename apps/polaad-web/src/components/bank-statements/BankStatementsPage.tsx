@@ -2301,9 +2301,12 @@ function getBillAllocationSubtext(
       transaction.selectedLedgerName.trim() &&
       !isBillMatchEligibleTransaction(transaction, ledgerMasters)
     ) {
-      return isSuspenseLedgerName(transaction.selectedLedgerName)
-        ? "No matching customer found · will post to Suspense"
-        : "No customer bills to match";
+      if (isSuspenseLedgerName(transaction.selectedLedgerName)) {
+        return transaction.candidateLedgerNames.length > 0
+          ? "Possible parties found · pick one, or it posts to Suspense"
+          : "No matching customer found · will post to Suspense";
+      }
+      return "No customer bills to match";
     }
     return "";
   }
@@ -2612,7 +2615,9 @@ function getBillAllocationBadgeText(
   if (!transaction.selectedLedgerName.trim()) {
     return "Needs Ledger";
   }
-  if (isSuspenseLedgerName(transaction.selectedLedgerName)) return "Suspense";
+  if (isSuspenseLedgerName(transaction.selectedLedgerName)) {
+    return transaction.candidateLedgerNames.length > 0 ? "Review Party" : "Suspense";
+  }
   if (isIncomingReceiptRow(transaction)) return "Direct Receipt";
   return "Not Applicable";
 }
@@ -2629,6 +2634,7 @@ function getBillAllocationBadgeClass(
   if (!transaction.selectedLedgerName.trim()) {
     return "border-amber-200 bg-amber-50 text-amber-800";
   }
+  if (isSuspenseLedgerName(transaction.selectedLedgerName)) return "border-amber-200 bg-amber-50 text-amber-800";
   if (isIncomingReceiptRow(transaction)) return "border-emerald-200 bg-emerald-50 text-emerald-800";
   if (context.partyKind) return "border-amber-200 bg-amber-50 text-amber-800";
   return "border-[#d8cbbb] bg-white text-[#6f6256]";

@@ -88,9 +88,12 @@ test("Suspense receipt badge does not report a missing ledger", async () => {
   `;
   const compiled = ts.transpileModule(stubs + exported, { compilerOptions: { module: ts.ModuleKind.ESNext } }).outputText;
   const badges = await import("data:text/javascript;base64," + Buffer.from(compiled).toString("base64"));
-  const receipt = { selectedLedgerName: "Suspense", creditAmount: "13750", debitAmount: "" };
+  const receipt = { selectedLedgerName: "Suspense", creditAmount: "13750", debitAmount: "", candidateLedgerNames: [] };
   assert.equal(badges.getBillAllocationBadgeText(receipt, []), "Suspense");
   assert.match(badges.getBillAllocationSubtext(undefined, receipt, []), /will post to Suspense/);
+  const withCandidates = { ...receipt, candidateLedgerNames: ["Mehta & Sons"] };
+  assert.equal(badges.getBillAllocationBadgeText(withCandidates, []), "Review Party");
+  assert.match(badges.getBillAllocationSubtext(undefined, withCandidates, []), /Possible parties found/);
   assert.equal(badges.getBillAllocationBadgeText({...receipt, selectedLedgerName: ""}, []), "Needs Ledger");
 });
 
