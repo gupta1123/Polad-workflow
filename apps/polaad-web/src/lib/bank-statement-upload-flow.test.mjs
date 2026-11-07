@@ -173,3 +173,12 @@ test('Resume reads the original job and restores full results without confirmati
   assert.equal(review.state.persistedPostedTransactions.length,23);
   assert.equal(review.state.statementDoneSummary.tone,'info');
 });
+
+test('a row re-posted after its old voucher was deleted is counted as newly posted, not already existing', () => {
+  const { saved } = fixtures();
+  const prior = saved.slice(4);
+  const reposted = saved.map((row, index) => index >= 4 && index < 8 ? { ...row, voucherNumber: `${9000 + index}`, postingCommandId: `new-${index}` } : row);
+  const current = markPreviouslyConfirmedPostings(reposted, prior);
+  for (let index = 4; index < 8; index += 1) assert.notEqual(current[index].postingResult.alreadyInTally, true, `row ${index}`);
+  assert.equal(current[8].postingResult.alreadyInTally, true, 'untouched prior row stays existing');
+});

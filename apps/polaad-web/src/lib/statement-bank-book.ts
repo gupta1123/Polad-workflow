@@ -49,9 +49,17 @@ export function summarizeStatementPostings(rows: StatementRow[], saved: SavedPos
 // Results known before this upload's Post action are existing entries, even
 // when an identical PDF reuses the original import and transaction IDs.
 export function markPreviouslyConfirmedPostings<T extends SavedPostingRow>(saved: T[], previous: SavedPostingRow[]) {
-  const existingIds = new Set(previous.filter(row => savedPostingOutcome(row).status === "confirmed").map(row => row.id));
-  return saved.map(row => existingIds.has(row.id) && savedPostingOutcome(row).status === "confirmed"
-    ? { ...row, postingResult: { ...row.postingResult, alreadyInTally: true } } : row);
+  const confirmedBefore = new Map(previous.filter(row => savedPostingOutcome(row).status === "confirmed").map(row => [row.id, row]));
+  // A row whose posting command or voucher differs from the earlier record was posted again just now
+  // (e.g. the old voucher was deleted in Tally and the same row was re-posted), so it is not "existing".
+  const postedAgain = (row: SavedPostingRow, before: SavedPostingRow) =>
+    Boolean(row.postingCommandId && before.postingCommandId && row.postingCommandId !== before.postingCommandId) ||
+    Boolean(row.voucherNumber && before.voucherNumber && row.voucherNumber !== before.voucherNumber);
+  return saved.map(row => {
+    const before = confirmedBefore.get(row.id);
+    return before && savedPostingOutcome(row).status === "confirmed" && !postedAgain(row, before)
+      ? { ...row, postingResult: { ...row.postingResult, alreadyInTally: true } } : row;
+  });
 }
 
 export function mergeCompletedPostingEvidence<T extends SavedPostingRow>(saved: T[], commands: Array<{
