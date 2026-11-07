@@ -2228,7 +2228,7 @@ function getReviewStatusLabel(transaction: ReviewTransaction) {
   if (status === "suspense") {
     return transaction.candidateLedgerNames.length > 0
       ? "Possible parties found · choose the right one"
-      : "No matching party found · using Suspense";
+      : "No matching party found";
   }
   return "Review required";
 }
@@ -2359,7 +2359,7 @@ function getOutgoingVerificationClass(draft?: OutgoingVerificationDraft | null) 
   return "border-red-250 bg-red-50 text-red-800";
 }
 
-function getOutgoingVerificationSubtext(draft?: OutgoingVerificationDraft | null) {
+function getOutgoingVerificationSubtext(draft?: OutgoingVerificationDraft | null, transaction?: ReviewTransaction) {
   if (!draft) return "Check for existing Tally voucher";
   if (draft.status === "checking") return "Checking Tally...";
   if (draft.status === "found") {
@@ -2370,7 +2370,14 @@ function getOutgoingVerificationSubtext(draft?: OutgoingVerificationDraft | null
     return draft.voucherDate ? `${voucher} - ${formatShortDate(draft.voucherDate)}` : voucher;
   }
   if (draft.status === "ambiguous") return "Review possible vouchers";
-  if (draft.status === "missing") return "No existing payment found";
+  if (draft.status === "missing") {
+    if (transaction && isSuspenseLedgerName(transaction.selectedLedgerName)) {
+      return transaction.candidateLedgerNames.length > 0
+        ? "Will be created · possible parties found, pick one or it posts to Suspense"
+        : "Will be created · no matching party, posts to Suspense";
+    }
+    return "No existing payment found · will be created";
+  }
   return draft.reason || "Could not check";
 }
 
@@ -2466,7 +2473,7 @@ function outgoingVerificationFromCommand(command?: TallyCommand | null): Outgoin
 
   return {
     status: "missing",
-    label: "Missing in Tally",
+    label: "Not in Tally yet",
     reason: reason || "No matching outgoing entry was found in Tally.",
     voucherNumber,
     voucherDate,
@@ -4193,6 +4200,9 @@ export function BankStatementsPage() {
   ).length;
   const selectedPostingSuspenseCount = selectedPostingTransactions.filter(
     (transaction) => isSuspenseLedgerName(transaction.selectedLedgerName)
+  ).length;
+  const selectedPostingPartyReviewCount = selectedPostingTransactions.filter(
+    (transaction) => isSuspenseLedgerName(transaction.selectedLedgerName) && transaction.candidateLedgerNames.length > 0
   ).length;
   const postTallyButtonLabel = sendingMode
     ? "Sending..."
@@ -8498,7 +8508,7 @@ export function BankStatementsPage() {
                                       className="block w-full whitespace-normal break-words text-[9px] font-semibold leading-[13px] text-slate-500"
                                       title={outgoingVerification?.reason}
                                     >
-                                      {getOutgoingVerificationSubtext(outgoingVerification)}
+                                      {getOutgoingVerificationSubtext(outgoingVerification, transaction)}
                                     </span>
                                   </button>
                                 ) : (
@@ -9208,6 +9218,11 @@ export function BankStatementsPage() {
                 {!statementCompletedCleanly && selectedPostingSuspenseCount > 0 ? (
                   <span className="before:mr-2 before:text-[#c8bbaa] before:content-['·'] text-amber-700">
                     {selectedPostingSuspenseCount} use Suspense
+                  </span>
+                ) : null}
+                {!statementCompletedCleanly && selectedPostingPartyReviewCount > 0 ? (
+                  <span className="before:mr-2 before:text-[#c8bbaa] before:content-['·'] text-amber-800">
+                    {selectedPostingPartyReviewCount} have possible parties to confirm
                   </span>
                 ) : null}
               </div>
