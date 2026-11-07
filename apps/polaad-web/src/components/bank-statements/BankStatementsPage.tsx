@@ -9249,6 +9249,16 @@ export function BankStatementsPage() {
                   canRecheck={needsPostingCheck.some(row => statementRowKey(row) === statementRowKey(outgoingReviewTransaction))}
                   busy={recheckingPostings || tallyPostingInProgress || sending || matchingBills}
                   notice={postingReviewNotice}
+                  allocation={tallyResultReviewDraft?.status === "found" && tallyResultReviewIsIncoming
+                    ? {
+                        sent: postedAllocationsByTransactionId[outgoingReviewTransaction.id] ?? null,
+                        planned: (billAllocationsByTransactionId[outgoingReviewTransaction.id]?.allocations ?? []).map((line) => ({
+                          referenceType: line.referenceType,
+                          referenceName: line.referenceName,
+                          amount: line.allocatedAmount,
+                        })),
+                      }
+                    : null}
                   canDecide={tallyResultReviewDraft?.status === "ambiguous"}
                   onDecide={decision => { decideDuplicateReview(outgoingReviewTransaction.id, decision); setPostingReviewNotice(null); completePostingReview(outgoingReviewTransaction.id); }}
                   ledgers={ledgerMasters.map(ledger => ledger.name)}

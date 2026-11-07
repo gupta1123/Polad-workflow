@@ -11,6 +11,11 @@ type Props = {
   matches: Array<Partial<PostingMatch>>; confirmed: boolean; held: boolean;
   checkedAt?: string | null; checkFailed?: boolean; canRecheck: boolean; busy: boolean;
   notice?: string | null;
+  // What Check Tally planned and what was actually sent to Tally for this row (this session only).
+  allocation?: {
+    sent: { lines: Array<{ referenceType: string; referenceName: string; amount: number }>; note: string } | null;
+    planned: Array<{ referenceType: string; referenceName: string; amount: number }>;
+  } | null;
   canDecide?: boolean; onDecide?: (decision: "same" | "separate") => void;
   ledgers: string[]; onRecheck: (ledgerName?: string) => void; onClose: () => void; onNext: () => void; hasNext: boolean;
 };
@@ -20,6 +25,9 @@ function StateIcon({ state }: { state: string }) {
   if (state === "different") return <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600" aria-label="Differs" />;
   return <span className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />;
 }
+
+const inr = (value: number) => new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR" }).format(value);
+const lineLabel = (line: { referenceType: string; referenceName: string }) => line.referenceType === "Advance" ? `Advance (${line.referenceName})` : line.referenceName;
 
 const longDate = (value: string) => /^\d{4}-\d{2}-\d{2}$/.test(value) ? new Date(`${value}T00:00:00`).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }) : value;
 
@@ -51,6 +59,28 @@ export function BankPostingReview(props: Props) {
               {props.notice ? <p role="status" aria-live="polite" className="mt-2 rounded-md border border-[#ddd3c5] bg-white p-2 text-xs leading-5">{props.notice}</p> : null}
             </div>
           </section>
+          {props.allocation ? <section className="border-b border-[#e5ddd0] px-4 py-3">
+            <h3 className="text-xs font-extrabold text-[#1a1a1a]">Bill allocation</h3>
+            {props.allocation.sent ? <>
+              <p className="mt-1 text-[10px] font-extrabold uppercase tracking-wide text-slate-400">Sent to Tally</p>
+              {props.allocation.sent.lines.length ? <ul className="mt-1 divide-y divide-[#f1ece3] rounded-lg border border-[#e5ddd0] text-xs">
+                {props.allocation.sent.lines.map(line => <li key={`${line.referenceType}-${line.referenceName}`} className="flex items-center justify-between gap-3 px-3 py-2">
+                  <span className="break-words font-extrabold text-[#1a1a1a]">{lineLabel(line)}</span>
+                  <span className="shrink-0 font-extrabold">{inr(line.amount)}</span>
+                </li>)}
+              </ul> : <p className="mt-1 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-extrabold text-amber-900">On Account · no bill was allocated</p>}
+              <p className="mt-2 text-xs font-semibold leading-5 text-slate-600">{props.allocation.sent.note}</p>
+              {props.allocation.planned.length && JSON.stringify(props.allocation.planned.map(line => [line.referenceName, line.amount])) !== JSON.stringify(props.allocation.sent.lines.map(line => [line.referenceName, line.amount])) ? <>
+                <p className="mt-3 text-[10px] font-extrabold uppercase tracking-wide text-slate-400">Planned at Check Tally (not what was sent)</p>
+                <ul className="mt-1 divide-y divide-[#f1ece3] rounded-lg border border-[#e5ddd0] text-xs">
+                  {props.allocation.planned.map(line => <li key={`${line.referenceType}-${line.referenceName}`} className="flex items-center justify-between gap-3 px-3 py-2">
+                    <span className="break-words font-semibold text-slate-600">{lineLabel(line)}</span>
+                    <span className="shrink-0 font-semibold text-slate-600">{inr(line.amount)}</span>
+                  </li>)}
+                </ul>
+              </> : null}
+            </> : <p className="mt-1 text-xs font-semibold leading-5 text-slate-600">The allocation sent for this row was not recorded in this session. Open the voucher in Tally to see its bills.</p>}
+          </section> : null}
           <section className="px-4 py-3">
             {props.checkFailed ? <p className="mb-2 text-xs font-semibold text-amber-800">The latest check failed. Showing the last saved voucher details.</p> : null}
             {props.matches.length ? props.matches.map((match, index) => {
