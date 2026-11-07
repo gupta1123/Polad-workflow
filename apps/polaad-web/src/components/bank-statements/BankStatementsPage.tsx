@@ -2227,8 +2227,8 @@ function getReviewStatusLabel(transaction: ReviewTransaction) {
   if (status === "matched") return "Ledger selected";
   if (status === "suspense") {
     return transaction.candidateLedgerNames.length > 0
-      ? "Suggested ledger: Suspense · review party"
-      : "Selected ledger: Suspense";
+      ? "Possible parties found · choose the right one"
+      : "No matching party found · using Suspense";
   }
   return "Review required";
 }
@@ -2302,8 +2302,8 @@ function getBillAllocationSubtext(
       !isBillMatchEligibleTransaction(transaction, ledgerMasters)
     ) {
       return isSuspenseLedgerName(transaction.selectedLedgerName)
-        ? "Will post to Suspense · Bill matching not applicable"
-        : "Bill matching not applicable";
+        ? "No matching customer found · will post to Suspense"
+        : "No customer bills to match";
     }
     return "";
   }
@@ -2357,7 +2357,7 @@ function getOutgoingVerificationClass(draft?: OutgoingVerificationDraft | null) 
 }
 
 function getOutgoingVerificationSubtext(draft?: OutgoingVerificationDraft | null) {
-  if (!draft) return "Find existing payment";
+  if (!draft) return "Check for existing Tally voucher";
   if (draft.status === "checking") return "Checking Tally...";
   if (draft.status === "found") {
     if (draft.duplicateInTally) {
@@ -2606,13 +2606,13 @@ function getBillAllocationBadgeText(
 ) {
   if (draft) return getBillAllocationLabel(draft);
   const context = getPartyBillMatchContext(transaction, ledgerMasters);
-  if (context.eligible) return "Not Matched";
+  if (context.eligible) return "Not Checked";
   if (isOutgoingPaymentRow(transaction)) return "Check Entry";
   if (context.partyKind && context.reason.includes("bill-wise")) return "Needs Bill-Wise";
   if (!transaction.selectedLedgerName.trim()) {
     return "Needs Ledger";
   }
-  if (isSuspenseLedgerName(transaction.selectedLedgerName)) return "Post to Suspense";
+  if (isSuspenseLedgerName(transaction.selectedLedgerName)) return "Suspense";
   if (isIncomingReceiptRow(transaction)) return "Direct Receipt";
   return "Not Applicable";
 }

@@ -89,8 +89,8 @@ test("Suspense receipt badge does not report a missing ledger", async () => {
   const compiled = ts.transpileModule(stubs + exported, { compilerOptions: { module: ts.ModuleKind.ESNext } }).outputText;
   const badges = await import("data:text/javascript;base64," + Buffer.from(compiled).toString("base64"));
   const receipt = { selectedLedgerName: "Suspense", creditAmount: "13750", debitAmount: "" };
-  assert.equal(badges.getBillAllocationBadgeText(receipt, []), "Post to Suspense");
-  assert.match(badges.getBillAllocationSubtext(undefined, receipt, []), /Will post to Suspense/);
+  assert.equal(badges.getBillAllocationBadgeText(receipt, []), "Suspense");
+  assert.match(badges.getBillAllocationSubtext(undefined, receipt, []), /will post to Suspense/);
   assert.equal(badges.getBillAllocationBadgeText({...receipt, selectedLedgerName: ""}, []), "Needs Ledger");
 });
 
@@ -133,7 +133,7 @@ test("an explicit Suspense fallback stays postable when close-match alternatives
 
 test("close-match Suspense and plain Suspense have distinct labels and colors", async () => {
   const page = await readFile(new URL("../components/bank-statements/BankStatementsPage.tsx", import.meta.url), "utf8");
-  assert.match(page, /Suggested ledger: Suspense · review party/);
+  assert.match(page, /Possible parties found · choose the right one/);
   assert.match(page, /status === "suspense" && transaction\.candidateLedgerNames\.length > 0\) return "bg-sky-500"/);
   assert.match(page, /return "bg-amber-500"/);
 });
