@@ -3493,6 +3493,10 @@ export function BankStatementsPage() {
   const [rowsPerPage, setRowsPerPage] = useState(50);
   const [reviewPage, setReviewPage] = useState(1);
   const [billAllocationsByTransactionId, setBillAllocationsByTransactionId] = useState<Record<string, BillAllocationDraft>>({});
+  // What was actually sent to Tally for each posted row: bill lines, or "On Account" with the reason.
+  const [postedAllocationsByTransactionId, setPostedAllocationsByTransactionId] = useState<
+    Record<string, { lines: Array<{ referenceType: string; referenceName: string; amount: number }>; note: string }>
+  >({});
   const [outgoingVerificationsByTransactionId, setOutgoingVerificationsByTransactionId] = useState<Record<string, OutgoingVerificationDraft>>({});
   const [tallyPresenceByTransactionId, setTallyPresenceByTransactionId] = useState<Record<string, OutgoingVerificationDraft>>({});
   const [postedTransactionIds, setPostedTransactionIds] = useState<Set<string>>(() => new Set());
@@ -4891,6 +4895,7 @@ export function BankStatementsPage() {
     setPendingPostingJob(null);
     setStatementDoneSummary(null);
     setBillAllocationsByTransactionId({});
+    setPostedAllocationsByTransactionId({});
     setOutgoingVerificationsByTransactionId({});
     setTallyPresenceByTransactionId({});
     setPostedTransactionIds(new Set());
@@ -6842,6 +6847,27 @@ export function BankStatementsPage() {
         return;
       }
 
+      const allocationDecisionFor = (queueRow: (typeof queueRows)[number]) => {
+        const reviewed = reviewedTransactionsByKey.get(transactionQueueKey(queueRow));
+        if (!reviewed) {
+          return { reviewedId: null as string | null, party: "", amount: 0, lines: [] as Array<{ referenceType: string; referenceName: string; amount: number }>, note: "No reviewed row was found; posted straight to the party ledger." };
+        }
+        const draft = billAllocationsByTransactionId[reviewed.id];
+        const amount = transactionAmount(reviewed);
+        let lines: Array<{ referenceType: string; referenceName: string; amount: number }> = [];
+        let note: string;
+        if (directFallbackIds.has(reviewed.id)) {
+          note = "Tally bills changed or could not be re-read just before posting, so no bill was allocated (On Account).";
+        } else if (draft && hasUsableBillAllocation(draft, amount)) {
+          lines = draft.allocations.map((line) => ({ referenceType: line.referenceType, referenceName: line.referenceName, amount: line.allocatedAmount }));
+          note = `Allocated by rule: ${draft.caseLabel || draft.caseType}.`;
+        } else if (!draft) {
+          note = "No bill allocation was prepared for this row, so it was posted straight to the party ledger (On Account).";
+        } else {
+          note = `The prepared allocation was not used (status ${draft.status}: ${draft.reason}); posted straight to the party ledger (On Account).`;
+        }
+        return { reviewedId: reviewed.id, party: reviewed.selectedLedgerName, amount, lines, note };
+      };
       const queueResponse = await apiFetch("/api/bank-statements/tally/queue", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -6906,6 +6932,7 @@ export function BankStatementsPage() {
                 // for both.
                 directPosting: postingBillAllocations.length === 0,
                 billMatchingVerified: true,
+                allocationNote: allocationDecisionFor(transaction).note,
                 duplicateCheckVerified:
                   reviewedTransaction != null &&
                   tallyPresenceByTransactionId[reviewedTransaction.id]?.status === "missing",
@@ -6936,6 +6963,24 @@ export function BankStatementsPage() {
       if (!queueResponse.ok) {
         throw new Error(await readError(queueResponse));
       }
+      const allocationDecisions = queueRows.map(allocationDecisionFor);
+      for (const decision of allocationDecisions) {
+        console.info(
+          "[bill-allocation]",
+          `${decision.party || "-"} amount=${decision.amount}`,
+          decision.lines.length > 0
+            ? decision.lines.map((line) => `${line.referenceType} ${line.referenceName} ${line.amount}`).join(" | ")
+            : "ON ACCOUNT",
+          decision.note
+        );
+      }
+      setPostedAllocationsByTransactionId((current) => {
+        const next = { ...current };
+        for (const decision of allocationDecisions) {
+          if (decision.reviewedId) next[decision.reviewedId] = { lines: decision.lines, note: decision.note };
+        }
+        return next;
+      });
 
       const queueResponsePayload = (await queueResponse.json()) as TallyQueueJobResponse & TallyQueueResult;
       if (queueResponsePayload.jobId) setPendingPostingJob({ id: queueResponsePayload.jobId,
@@ -8469,6 +8514,18 @@ export function BankStatementsPage() {
                                             ? "Verified in live Tally"
                                             : "Unique live match"}
                                     </span>
+                                    {postedAllocationsByTransactionId[transaction.id] ? (
+                                      <span
+                                        className="block w-full whitespace-normal break-words text-[9px] font-semibold leading-[13px] text-slate-700"
+                                        title={postedAllocationsByTransactionId[transaction.id].note}
+                                      >
+                                        {postedAllocationsByTransactionId[transaction.id].lines.length > 0
+                                          ? postedAllocationsByTransactionId[transaction.id].lines
+                                              .map((line) => `${line.referenceType === "Advance" ? "Advance" : line.referenceName} · ${formatCurrencyAmount(line.amount)}`)
+                                              .join(" + ")
+                                          : "On Account · no bill allocated"}
+                                      </span>
+                                    ) : null}
                                   </button>
                                 ) : tallyPresence?.status === "verification_pending" ? (
                                   <button type="button" className="flex w-full flex-col gap-1 rounded-lg px-1.5 text-left hover:bg-amber-50 focus-visible:ring-2 focus-visible:ring-amber-300" title="View the reason and matching Tally voucher details"

@@ -56,6 +56,7 @@ type QueuePayload = {
       amount?: number | string;
     }>;
     billMatchingVerified?: boolean;
+    allocationNote?: string;
     directPosting?: boolean;
     duplicateCheckVerified?: boolean;
     separateEntryConfirmed?: boolean;
@@ -363,6 +364,15 @@ export async function POST(request: Request) {
         const createLedgerParentName = toText(transaction?.createLedgerParentName, 240);
         const billAllocations = readBillAllocations(transaction?.billAllocations);
         if (!transactionId || (!counterpartyLedgerName && !createLedgerName)) return [];
+        // Audit trail: which bills each receipt/payment is sent against, and why.
+        console.info(
+          "[bill-allocation]",
+          `tx=${transactionId} ledger="${counterpartyLedgerName || createLedgerName}"`,
+          billAllocations.length > 0
+            ? billAllocations.map((line) => `${line.referenceType} ${line.referenceName} ${line.amount}`).join(" | ")
+            : "ON ACCOUNT / direct",
+          `note="${toText(transaction?.allocationNote, 400)}"`
+        );
 
         return [
           [
