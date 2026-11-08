@@ -27,7 +27,7 @@ function reviewHarness(rows, saved, overrides = {}) {
   const requests = [];
   const toasts = [];
   const context = {
-    preview: payload, validTransactions: rows, ledgerMasters: [], bankLedgerOptions: [], EMPTY_ACCOUNT: {},
+    preview: payload, validTransactions: rows, ledgerMasters: [], ledgerMastersRef: { current: [] }, bankLedgerOptions: [], EMPTY_ACCOUNT: {},
     connectorCandidateMasters: () => [], normalizeName: value => value.toLowerCase(),
     normalizeBankAccountNumber: value => value, isBankLedgerMaster: () => false,
     normalizeReviewTransaction: row => row, findLedgerByNormalizedName: () => null,
