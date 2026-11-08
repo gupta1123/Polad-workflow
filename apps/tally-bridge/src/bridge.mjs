@@ -6674,6 +6674,127 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
           await assertCompany();
           return outcome.result || outcome;
         }
+        if (operation === "cash_discount_scan" || operation === "cash_discount_revalidate") {
+          const payload = message.payload && typeof message.payload === "object" ? message.payload : {};
+          const scope = message.customerScope && typeof message.customerScope === "object" ? message.customerScope : {};
+          const proposal = message.proposal && typeof message.proposal === "object" ? message.proposal : {};
+          const singleLedger = String(proposal.partyLedgerName || payload.ledgerName || "").trim();
+          const masters = await collectTallyMasters({ ...config, companyName: message.companyName }, {
+            companyName: message.companyName,
+            requestedMasterTypes: ["ledger", "group"],
+          });
+          const groupParentByName = new Map((masters.groups || []).map((g) => [normalizeLooseName(g.name), g.parent || null]));
+          const descendsFrom = (parentName, target) => {
+            const want = normalizeLooseName(target);
+            const seen = new Set();
+            let cur = parentName;
+            while (cur) {
+              const key = normalizeLooseName(cur);
+              if (!key || seen.has(key)) return false;
+              if (key === want) return true;
+              seen.add(key);
+              cur = groupParentByName.get(key) || null;
+            }
+            return false;
+          };
+          const selectedGroups = Array.isArray(scope.selectedGroupNames) && scope.selectedGroupNames.length > 0
+            ? scope.selectedGroupNames.map((n) => String(n))
+            : ["Sundry Debtors"];
+          const includeNested = scope.includeNestedGroups !== false;
+          const excludedLedgers = new Set((Array.isArray(scope.excludedLedgerNames) ? scope.excludedLedgerNames : []).map((n) => normalizeLooseName(n)));
+          const excludedGroups = (Array.isArray(scope.excludedGroupNames) ? scope.excludedGroupNames : []).map((n) => String(n));
+          const inScope = (ledger) => {
+            if (excludedLedgers.has(normalizeLooseName(ledger.name))) return false;
+            if (excludedGroups.some((g) => normalizeLooseName(ledger.parent) === normalizeLooseName(g) || descendsFrom(ledger.parent, g))) return false;
+            if (scope.mode === "strict") return selectedGroups.some((g) => normalizeLooseName(ledger.parent) === normalizeLooseName(g));
+            return selectedGroups.some((g) =>
+              normalizeLooseName(ledger.parent) === normalizeLooseName(g) || (includeNested && descendsFrom(ledger.parent, g)));
+          };
+          let candidateLedgers = (masters.ledgers || []).filter(inScope);
+          if (operation === "cash_discount_revalidate") {
+            if (!singleLedger) throw new Error("A customer is required for revalidation.");
+            candidateLedgers = candidateLedgers.filter((l) => normalizeLooseName(l.name) === normalizeLooseName(singleLedger));
+            if (candidateLedgers.length === 0) {
+              const fallback = (masters.ledgers || []).find((l) => normalizeLooseName(l.name) === normalizeLooseName(singleLedger));
+              if (fallback) candidateLedgers = [fallback];
+              else throw new Error("The selected customer is outside the configured Cash Discount customer scope in Tally.");
+            }
+          }
+          const byLedger = {};
+          const liveLedgers = [];
+          let rawCount = 0;
+          const batchSize = 20;
+          for (let i = 0; i < candidateLedgers.length; i += batchSize) {
+            controller.signal.throwIfAborted();
+            onProgress(`Reading customer bills (${Math.min(i + batchSize, candidateLedgers.length)}/${candidateLedgers.length})`);
+            const batch = candidateLedgers.slice(i, i + batchSize);
+            const outcome = await fetchCustomerOpenBillsFromTally(config, {
+              companyName: message.companyName,
+              ledgerNames: batch.map((l) => l.name),
+              asOfDate: payload.asOfDate || null,
+            }, { signal: controller.signal, forceVoucherEvidence: true });
+            const result = outcome.result || outcome;
+            for (const [name, bucket] of Object.entries(result.byLedger || {})) {
+              byLedger[name] = { ...(bucket || {}), ledgerName: name, complete: true };
+              rawCount += Number(bucket?.rawCount || 0);
+            }
+            for (const l of batch) {
+              liveLedgers.push({
+                name: l.name,
+                parent: l.parent || null,
+                gstin: l.gstin || null,
+                raw: { email: l.email || null, phone: l.phone || null, contactPerson: l.contactPerson || null, address: l.address || null },
+              });
+            }
+          }
+          await assertCompany();
+          const ledgerNames = liveLedgers.map((l) => l.name);
+          const firstBucket = ledgerNames.length > 0 ? byLedger[ledgerNames[0]] : null;
+          return {
+            companyName: message.companyName,
+            companyGuid: message.target?.companyGuid || null,
+            financialYear: String(message.financialYear || payload.financialYear || "").trim() || null,
+            dateFrom: null,
+            dateTo: null,
+            ledgers: liveLedgers,
+            openBillsResult: {
+              success: true,
+              result: {
+                ledgerNames,
+                byLedger,
+                openBills: firstBucket?.openBills || [],
+                existingAdvances: firstBucket?.existingAdvances || [],
+                rawCount,
+              },
+            },
+            scanSummary: { complete: true, completed: ledgerNames.length, total: ledgerNames.length },
+          };
+        }
+        if (operation === "cash_discount_execute_debit_note") {
+          const payload = message.commandPayload && typeof message.commandPayload === "object" ? message.commandPayload : {};
+          const posted = await postDebitNote(config.tallyUrl, payload, message.companyName || payload.companyName || null);
+          const outcome = posted.outcome;
+          const voucher = await resolveDebitNoteVoucher(config.tallyUrl, {
+            ...payload,
+            tallyVoucherId: outcome.result?.lastVchId,
+            expectedReference: payload.referenceNumber,
+          }, message.companyName || payload.companyName || null);
+          await assertCompany();
+          return {
+            ...(outcome.result || {}),
+            success: outcome.success,
+            error: outcome.error || null,
+            voucherId: voucher.masterId,
+            voucherGuid: voucher.guid || null,
+            voucherNumber: voucher.voucherNumber,
+            openReferenceName: voucher.reference || null,
+            voucherReference: voucher.reference || null,
+            voucherAlterId: voucher.alterId || null,
+            voucherType: voucher.voucherType,
+            partyLedgerName: voucher.partyLedgerName || null,
+            voucherDate: voucher.effectiveDate || voucher.date,
+          };
+        }
         throw new Error("Unsupported live Tally operation.");
       }), operation === "verify_bank_transaction"
         ? "preflight"
