@@ -25,10 +25,17 @@ import {
   saveOperationalCache,
   upsertVoucherPartition,
 } from "./local-matching/operational-cache.mjs";
+import {
+  buildCashDiscountScanKey,
+  createCashDiscountScanCache,
+} from "./cash-discount-scan-cache.mjs";
 
 const liveReadContext = new AsyncLocalStorage();
 const commandExecutionContext = new AsyncLocalStorage();
 const liveMasterCache = new Map();
+// CD-only scan cache ("customer dues lite"). Bank operations never read or
+// write it; see cash-discount-scan-cache.mjs.
+const cashDiscountScanCache = createCashDiscountScanCache();
 
 const BRIDGE_VERSION = "0.1.100";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
@@ -6679,6 +6686,24 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
           const scope = message.customerScope && typeof message.customerScope === "object" ? message.customerScope : {};
           const proposal = message.proposal && typeof message.proposal === "object" ? message.proposal : {};
           const singleLedger = String(proposal.partyLedgerName || payload.ledgerName || "").trim();
+          const scanFinancialYear = String(message.financialYear || payload.financialYear || "").trim() || null;
+          const scanCacheMeta = {
+            installationId: message.target?.installationId || config.connectionId || "",
+            companyGuid: message.target?.companyGuid || "",
+            companyName: message.companyName || "",
+          };
+          // CD-only cache: complete scans are reused for 5 minutes. Revalidate
+          // always reads live; `forceRefresh` bypasses; `resume` bypasses (a
+          // partial scan is never served from cache).
+          if (operation === "cash_discount_scan" && payload.forceRefresh !== true && payload.resume !== true) {
+            const scanKey = buildCashDiscountScanKey({ ...scanCacheMeta, companyName: message.companyName, financialYear: scanFinancialYear, scope });
+            const cached = cashDiscountScanCache.get(scanKey);
+            if (cached) {
+              log("info", `Cash Discount scan served from CD scan cache (${cached.scanSummary?.completed || 0} customers, no Tally read).`);
+              await assertCompany();
+              return { ...cached, cache: { source: "cd_scan_cache", stale: false } };
+            }
+          }
           const masters = await collectTallyMasters({ ...config, companyName: message.companyName }, {
             companyName: message.companyName,
             requestedMasterTypes: ["ledger", "group"],
@@ -6750,10 +6775,10 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
           await assertCompany();
           const ledgerNames = liveLedgers.map((l) => l.name);
           const firstBucket = ledgerNames.length > 0 ? byLedger[ledgerNames[0]] : null;
-          return {
+          const snapshot = {
             companyName: message.companyName,
             companyGuid: message.target?.companyGuid || null,
-            financialYear: String(message.financialYear || payload.financialYear || "").trim() || null,
+            financialYear: scanFinancialYear,
             dateFrom: null,
             dateTo: null,
             ledgers: liveLedgers,
@@ -6769,9 +6794,21 @@ function startTallyLiveChannel(config, executeExclusive, options = {}) {
             },
             scanSummary: { complete: true, completed: ledgerNames.length, total: ledgerNames.length },
           };
+          if (operation === "cash_discount_scan") {
+            const scanKey = buildCashDiscountScanKey({ ...scanCacheMeta, companyName: message.companyName, financialYear: scanFinancialYear, scope });
+            cashDiscountScanCache.set(scanKey, snapshot, scanCacheMeta);
+          }
+          return snapshot;
         }
         if (operation === "cash_discount_execute_debit_note") {
           const payload = message.commandPayload && typeof message.commandPayload === "object" ? message.commandPayload : {};
+          // A write invalidates cached CD scans for this company; the next
+          // scan re-reads Tally live. Bank caches are untouched.
+          cashDiscountScanCache.invalidateCompany({
+            installationId: message.target?.installationId || config.connectionId || "",
+            companyGuid: message.target?.companyGuid || "",
+            companyName: message.companyName || payload.companyName || "",
+          });
           const posted = await postDebitNote(config.tallyUrl, payload, message.companyName || payload.companyName || null);
           const outcome = posted.outcome;
           const voucher = await resolveDebitNoteVoucher(config.tallyUrl, {
