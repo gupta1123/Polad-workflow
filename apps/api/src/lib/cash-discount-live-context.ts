@@ -18,7 +18,7 @@ export async function loadLiveAnalysisContext(request: Request, userId: string, 
   financialYear: string | null;
   companyGuid?: unknown;
 }): Promise<LiveAnalysisContext> {
-  const { connectionId, companyName, financialYear } = params;
+  const { connectionId, companyName } = params;
   const supabase = createSupabaseAdminClient();
   const proposals = supabase.from('debit_note_proposals').select('*').eq('company_name', companyName).eq('status', 'created_in_tally')
     .order('created_at', { ascending: false }).order('id', { ascending: false }).eq('owner_user_id', userId);

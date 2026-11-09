@@ -422,14 +422,6 @@ function readTallyOpenBills(commandResult: Record<string, unknown> | null | unde
   });
 }
 
-function candidateKey(candidate: { partyLedgerName: string; linkedInvoiceNumber: string | null; recoverableAmount: number }) {
-  return [
-    normalizeLedgerName(candidate.partyLedgerName),
-    normalizeLedgerName(candidate.linkedInvoiceNumber),
-    toNumber(candidate.recoverableAmount).toFixed(2),
-  ].join("|");
-}
-
 function invoiceIdentityKey(partyLedgerName: string | null | undefined, linkedInvoiceNumber: string | null | undefined) {
   return [normalizeLedgerName(partyLedgerName), normalizeLedgerName(linkedInvoiceNumber)].join("|");
 }
