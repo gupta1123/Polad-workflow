@@ -13,6 +13,9 @@ import {
 } from "lucide-react";
 
 import { apiFetch } from "@/lib/api-client";
+import { runCashDiscountLiveRequest } from "@/lib/cash-discount-live";
+import { runDebitNoteBatch } from "@/lib/bulk-debit-notes";
+import { CashDiscountCustomerScopeSettings } from "@/components/collections/CashDiscountCustomerScopeSettings";
 
 type CompanyOption = {
   id: string;
@@ -146,7 +149,7 @@ type DashboardPayload = {
   notes?: string[];
 };
 
-type ActiveView = "needsAction" | "done" | "rules";
+type ActiveView = "needsAction" | "done" | "rules" | "scope";
 
 function formatMoney(value?: number | null) {
   if (value === null || value === undefined || Number.isNaN(value)) return "-";
@@ -376,7 +379,6 @@ export function CollectionsDashboardPage() {
   const [checkingLiveTallyCompany, setCheckingLiveTallyCompany] = useState(true);
   const [activeView, setActiveView] = useState<ActiveView>("needsAction");
   const [loading, setLoading] = useState(true);
-  const [savingRule, setSavingRule] = useState(false);
   const [approvingId, setApprovingId] = useState("");
   const [bulkCreating, setBulkCreating] = useState(false);
   const [sendingWhatsappId, setSendingWhatsappId] = useState("");
@@ -388,8 +390,11 @@ export function CollectionsDashboardPage() {
   const [whatsappSaveToTally, setWhatsappSaveToTally] = useState(true);
   const [whatsappDialogSending, setWhatsappDialogSending] = useState(false);
   const [message, setMessage] = useState<{ tone: "success" | "error" | "info"; text: string } | null>(null);
+  const [liveScanning, setLiveScanning] = useState(false);
+  const [liveMode, setLiveMode] = useState(false);
   const initialLoadStartedRef = useRef(false);
   const lastLoadedConnectionRef = useRef("");
+  const selectionKeyRef = useRef("");
 
   const selectedCompany = useMemo(
     () =>
@@ -399,6 +404,8 @@ export function CollectionsDashboardPage() {
       null,
     [companies, selectedCompanyId, selectedConnectionId]
   );
+
+  selectionKeyRef.current = `${selectedConnectionId}::${selectedCompanyId}::${selectedCompany?.companyName ?? ""}`;
 
   const loadCompanies = useCallback(async () => {
     const response = await apiFetch("/api/tally/companies", { cache: "no-store" });
@@ -434,9 +441,53 @@ export function CollectionsDashboardPage() {
       const payload = (await response.json().catch(() => ({}))) as DashboardPayload;
       if (!response.ok) throw new Error(payload.error || `Request failed with status ${response.status}`);
       setDashboard(payload);
+      setLiveMode(false);
     },
     [selectedCompany?.companyName, selectedConnectionId]
   );
+
+  // Live scan through the connector + gateway (Kalika parity). Reads open
+  // bills straight from Tally, analyses in the API, and shows the same
+  // dashboard shape. Never touches bank-statement state.
+  const refreshLiveScan = useCallback(async () => {
+    const connectionId = selectedConnectionId;
+    const companyName = selectedCompany?.companyName ?? "";
+    if (!connectionId || !companyName) {
+      setMessage({ tone: "error", text: "Select a Tally company before running a live scan." });
+      return;
+    }
+    try {
+      setLiveScanning(true);
+      setMessage({ tone: "info", text: "Reading live customer bills from Tally…" });
+      let customerScope: Record<string, unknown> | undefined;
+      try {
+        const scopeParams = new URLSearchParams({ connectionId, companyName });
+        const scopeResponse = await apiFetch(`/api/settings/cash-discount-customer-scope?${scopeParams}`, { cache: "no-store" });
+        if (scopeResponse.ok) {
+          const scopePayload = (await scopeResponse.json()) as { settings?: Record<string, unknown> };
+          if (scopePayload.settings) customerScope = scopePayload.settings;
+        }
+      } catch {
+        customerScope = undefined;
+      }
+      const live = await runCashDiscountLiveRequest<DashboardPayload>({
+        connectionId,
+        companyName,
+        financialYear: selectedCompany?.financialYear ?? null,
+        operation: "scan",
+        customerScope,
+        onProgress: (progress) => setMessage({ tone: "info", text: progress }),
+      });
+      setDashboard((current) => ({ ...live, rules: current?.rules ?? live.rules ?? [] }));
+      setLiveMode(true);
+      const tracked = live.tabs?.cashDiscountTracker?.length ?? 0;
+      setMessage({ tone: "success", text: `Live scan complete: ${tracked} discount-tracked ${tracked === 1 ? "bill" : "bills"} from Tally.` });
+    } catch (error) {
+      setMessage({ tone: "error", text: error instanceof Error ? error.message : "Live scan failed." });
+    } finally {
+      setLiveScanning(false);
+    }
+  }, [selectedConnectionId, selectedCompany?.companyName, selectedCompany?.financialYear]);
 
   const loadDebtorLedgers = useCallback(async (connectionId: string) => {
     const response = await apiFetch(`/api/tally/connections/${connectionId}/masters?type=ledger&limit=5000`, {
@@ -578,34 +629,6 @@ export function CollectionsDashboardPage() {
     },
     [loadCompanies, loadDashboard, refreshLiveTallyCompany, refreshTallyOpenBills, selectedCompanyId, selectedConnectionId]
   );
-
-  async function createDefaultRule() {
-    if (!selectedConnectionId) return;
-    try {
-      setSavingRule(true);
-      const response = await apiFetch("/api/collections/cash-discount-rules", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          connectionId: selectedConnectionId,
-          ruleName: "2% CD within 15 days",
-          discountType: "percentage",
-          discountValue: 2,
-          eligibilityDays: 15,
-          graceDays: 0,
-          paymentCondition: "full_payment",
-          missedCdTreatment: "debit_note_proposal",
-        }),
-      });
-      if (!response.ok) throw new Error(await readError(response));
-      setMessage({ tone: "success", text: "Cash Discount rule added." });
-      await loadDashboard();
-    } catch (error) {
-      setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not add rule." });
-    } finally {
-      setSavingRule(false);
-    }
-  }
 
   async function approveTallySuggestion(proposal: DebitNoteProposal) {
     const response = await apiFetch("/api/collections/tally-debit-notes/approve", {
@@ -918,9 +941,24 @@ export function CollectionsDashboardPage() {
     try {
       setBulkCreating(true);
       setMessage({ tone: "info", text: `Creating ${selectedPendingProposals.length} debit notes in Tally...` });
-      for (const proposal of selectedPendingProposals) {
-        setApprovingId(proposal.id);
-        await createDebitNoteForProposal(proposal);
+      // Stop on the first uncertain write: never replay a possibly accepted entry.
+      const batchKey = selectionKeyRef.current;
+      let firstError: unknown = null;
+      const batch = await runDebitNoteBatch(selectedPendingProposals, {
+        canContinue: () => selectionKeyRef.current === batchKey,
+        create: async (proposal) => {
+          setApprovingId(proposal.id);
+          await createDebitNoteForProposal(proposal);
+        },
+        confirmed: () => undefined,
+        uncertain: (_row, error) => {
+          firstError = error;
+        },
+      });
+      if (batch.scopeChanged) {
+        setMessage({ tone: "info", text: `Selection changed mid-batch. Created ${batch.confirmed} before the switch; review before continuing.` });
+      } else if (firstError) {
+        throw firstError;
       }
       if (selectedConnectionId) {
         await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName);
@@ -930,7 +968,7 @@ export function CollectionsDashboardPage() {
       }
       setSelectedPendingIds(new Set());
       setActiveView("done");
-      setMessage({ tone: "success", text: `${selectedPendingProposals.length} debit notes created in Tally.` });
+      setMessage({ tone: "success", text: `${batch.confirmed} debit note${batch.confirmed === 1 ? "" : "s"} created in Tally.` });
     } catch (error) {
       setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not create selected debit notes." });
       await loadDashboard().catch(() => undefined);
@@ -1000,6 +1038,17 @@ export function CollectionsDashboardPage() {
           </div>
 
           <button
+            className="inline-flex h-10 w-fit items-center justify-center gap-2 rounded-xl border border-[#e5ddd0] bg-white px-4 text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-all disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={loading || liveScanning || !selectedConnectionId}
+            onClick={() => void refreshLiveScan()}
+            title="Read open bills live from Tally through the connector (Kalika parity). Does not touch bank statements."
+            type="button"
+          >
+            {liveScanning ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" /> : <RefreshCw className="h-3.5 w-3.5 mr-1.5" />}
+            Live scan{liveMode ? " • live" : ""}
+          </button>
+
+          <button
             className="inline-flex h-10 w-fit items-center justify-center gap-2 rounded-xl border border-[#e5ddd0] bg-white px-4 text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-all"
             onClick={() => void refreshAll()}
             type="button"
@@ -1030,7 +1079,7 @@ export function CollectionsDashboardPage() {
       ) : null}
 
       <section className="mb-6">
-        <div className="grid gap-4 md:grid-cols-3">
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
           <WorkflowButton
             active={activeView === "needsAction"}
             count={pendingProposals.length}
@@ -1051,6 +1100,13 @@ export function CollectionsDashboardPage() {
             detail={activeRule ? `${activeRule.discountValue}% within ${activeRule.eligibilityDays} days` : "No active rule"}
             label={rules.length === 1 ? "Rule" : "Rules"}
             onClick={() => chooseView("rules")}
+          />
+          <WorkflowButton
+            active={activeView === "scope"}
+            count={0}
+            detail="Sundry Debtors default"
+            label="Customer scope"
+            onClick={() => chooseView("scope")}
           />
         </div>
       </section>
@@ -1334,16 +1390,16 @@ export function CollectionsDashboardPage() {
         <Section
           action={
             <button
-              className="inline-flex h-8.5 items-center gap-1.5 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm disabled:cursor-not-allowed disabled:opacity-50 transition-all"
-              disabled={!selectedConnectionId || savingRule}
-              onClick={() => void createDefaultRule()}
+              className="inline-flex h-8.5 items-center gap-1.5 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#5a5046] shadow-sm transition-all disabled:cursor-not-allowed disabled:opacity-50"
+              disabled
+              title="Cash discounts are fixed (ADVANCE RTGS 1.5%, SAME DAY RTGS 1%). Custom rules no longer affect calculation."
               type="button"
             >
-              {savingRule ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Settings2 className="h-3.5 w-3.5" />}
+              <Settings2 className="h-3.5 w-3.5" />
               Add default rule
             </button>
           }
-          description="Keep the active recovery rule simple and visible."
+          description="Fixed rule (Kalika parity): ADVANCE RTGS 1.5% and SAME DAY RTGS 1%. Saved rules below are legacy and no longer affect calculation."
           title="Rules"
         >
           <div className="grid gap-4 sm:grid-cols-2 md:grid-cols-3">
@@ -1362,6 +1418,22 @@ export function CollectionsDashboardPage() {
               ))
             )}
           </div>
+        </Section>
+      ) : null}
+
+      {activeView === "scope" ? (
+        <Section
+          description="Which Tally ledgers count as customers for cash discounts. Saved per Tally company, automatically. Live scans use this scope."
+          title="Customer scope"
+        >
+          {selectedConnectionId && selectedCompany?.companyName ? (
+            <CashDiscountCustomerScopeSettings
+              companyName={selectedCompany.companyName}
+              connectionId={selectedConnectionId}
+            />
+          ) : (
+            <EmptyState>Select a Tally company to configure its customer scope.</EmptyState>
+          )}
         </Section>
       ) : null}
 

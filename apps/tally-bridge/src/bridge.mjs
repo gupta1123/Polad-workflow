@@ -37,7 +37,7 @@ const liveMasterCache = new Map();
 // write it; see cash-discount-scan-cache.mjs.
 const cashDiscountScanCache = createCashDiscountScanCache();
 
-const BRIDGE_VERSION = "0.1.100";
+const BRIDGE_VERSION = "0.1.101";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 
 // Diagnostic lines for "Check Tally" and bank posting. They go to bridge.log
