@@ -34,7 +34,20 @@ export function resolveCompanySuspenseLedgerName(ledgers: LedgerIdentity[]) {
   );
   if (exactBankStatementSuspense.length === 1) return exactBankStatementSuspense[0].name;
 
-  return candidates.length === 1 ? candidates[0].name : null;
+  if (candidates.length === 1) return candidates[0].name;
+
+  // No canonical ledger, but exactly one candidate is itself parked directly
+  // under a Suspense group (e.g. "Suspense Amt." under "Suspense A/c"). That
+  // is the company's designated parking account — prefer it over ledgers
+  // that merely live under operational groups (e.g. Sundry Creditors).
+  // Anything still ambiguous fails closed (null) and the caller must hold
+  // the row loudly instead of guessing between real accounts.
+  const parkedUnderSuspense = candidates.filter((ledger) =>
+    normalizeLedgerIdentity(ledger.parent).includes("suspense")
+  );
+  if (parkedUnderSuspense.length === 1) return parkedUnderSuspense[0].name;
+
+  return null;
 }
 
 export function activeLedgerNameSet(ledgers: LedgerIdentity[]) {

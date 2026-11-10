@@ -27,6 +27,15 @@ test("ambiguous non-canonical suspense ledgers fail closed", () => {
     null
   );
 });
+test("one ledger parked directly under a Suspense group wins over operational-group candidates", () => {
+  assert.equal(
+    resolveCompanySuspenseLedgerName([
+      { name: "Suspense Amt.", parent: "Suspense A/c" },
+      { name: "Suspense Credit", parent: "Sundry Creditors" },
+    ]),
+    "Suspense Amt."
+  );
+});
 
 test("saved mappings can be validated against exact active ledger identities", () => {
   const names = activeLedgerNameSet([
