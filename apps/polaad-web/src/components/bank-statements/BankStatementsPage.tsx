@@ -258,6 +258,9 @@ type TallyQueueResult = {
     expectedPaymentCheckCount?: number;
     companySuspenseLedgerName?: string | null;
     skippedRows?: Array<{ transactionId?: string; description?: string; reason?: string }>;
+    suspenseLedgerUnresolved?: boolean;
+    suspenseLedgerCandidates?: string[];
+    suspenseHeldRows?: Array<{ transactionId?: string; description?: string }>;
   };
 };
 
@@ -7053,15 +7056,29 @@ export function BankStatementsPage() {
             setTallyCheckAttempted(true);
             const statementSummary = summarizeStatementPostings(validTransactions, savedResults);
             const checksOnly = finalStatus.voucherTotal === 0;
+            // Rows left on default Suspense with no single company Suspense
+            // ledger are held (never silently dropped). Name them here so the
+            // client can pick ledgers and post, instead of seeing "succeeded"
+            // while rows never moved.
+            const queueDiagnostics = queuedPayload.diagnostics ?? {};
+            const suspenseHeldRows = (queueDiagnostics.suspenseHeldRows ?? []).length > 0
+              ? queueDiagnostics.suspenseHeldRows ?? []
+              : (queueDiagnostics.skippedRows ?? []).filter((row) => row.reason === "counterpartyLedgerNotSynced" || row.reason === "missingCounterpartyLedger");
+            const heldNotice = suspenseHeldRows.length > 0
+              ? ` ${suspenseHeldRows.length} row${suspenseHeldRows.length === 1 ? " was" : "s were"} held in Suspense (no single company Suspense ledger to post to): ${suspenseHeldRows.slice(0, 5).map((row) => row.description || "row").join("; ")}${suspenseHeldRows.length > 5 ? ` and ${suspenseHeldRows.length - 5} more` : ""}. Pick ledgers to post them.`
+              : "";
             setStatementDoneSummary({
-              tone: statementSummary.failed ? "error" : statementSummary.needsCheck || statementSummary.pending ? "info" : "success",
+              tone: statementSummary.failed ? "error" : statementSummary.needsCheck || statementSummary.pending || suspenseHeldRows.length > 0 ? "info" : "success",
               title: checksOnly ? "Statement checked against Tally" : bankPostingTitle(statementSummary),
               text: checksOnly
-                ? `${finalStatus.paymentCheckCompleted} outgoing payment check(s) completed and no Tally entries were created.`
-                : bankPostingMessage(statementSummary) + " Your download includes the full statement.",
+                ? `${finalStatus.paymentCheckCompleted} outgoing payment check(s) completed and no Tally entries were created.${heldNotice}`
+                : bankPostingMessage(statementSummary) + heldNotice + " Your download includes the full statement.",
             });
             setBanner(balanceProof?.balancesMatch === false
-              ? { tone: "info", text: statementBalanceMessage(balanceProof) } : null);
+              ? { tone: "info", text: statementBalanceMessage(balanceProof) }
+              : suspenseHeldRows.length > 0
+                ? { tone: "info", text: `Posting finished.${heldNotice}` }
+                : null);
           })
           .catch((pollError) => {
             if (pollError instanceof PostingStatusUnavailable) {

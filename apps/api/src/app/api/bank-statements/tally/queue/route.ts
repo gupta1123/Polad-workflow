@@ -729,6 +729,11 @@ export async function POST(request: Request) {
       description: string;
       reason: SkippedReason;
     }> = [];
+    // Rows left on the default Suspense selection that could not be posted
+    // because no single company Suspense ledger could be resolved. Reported
+    // loudly (never silently dropped) so the client can pick ledgers or set
+    // up a Suspense ledger instead of wondering why nothing posted.
+    const suspenseHeldRows: Array<{ transactionId: string; description: string }> = [];
     function skipTransaction(transaction: BankTransactionRow, reason: SkippedReason) {
       skipped[reason] += 1;
       skippedRows.push({
@@ -813,6 +818,11 @@ export async function POST(request: Request) {
     const companySuspenseLedgerName = resolveCompanySuspenseLedgerName(
       activeLedgers.map((ledger) => ({ name: ledger.tally_name, parent: ledger.parent_name }))
     ) || "";
+    const suspenseLedgerCandidates = Array.from(new Set(
+      activeLedgers
+        .map((ledger) => String(ledger.tally_name ?? "").trim())
+        .filter((name) => name && isSuspenseLedger(name))
+    )).slice(0, 10);
 
     // Resolve only the ancestor chains needed to classify selected ledgers.
     // Tally group trees are shallow, so this is normally one or two compact
@@ -1059,6 +1069,9 @@ export async function POST(request: Request) {
           skipped.counterpartyLedgerNotSynced += 1;
           skipped.ledgerNotSynced += 1;
           skippedRows.push({ transactionId: transaction.id, description: transaction.description, reason: "counterpartyLedgerNotSynced" });
+          if (isSuspenseLedger(counterpartyLedgerName)) {
+            suspenseHeldRows.push({ transactionId: transaction.id, description: transaction.description });
+          }
           return [];
         }
         const counterpartyIsPartyLedger = shouldCreateCounterpartyLedger
@@ -1181,6 +1194,9 @@ export async function POST(request: Request) {
             companySuspenseLedgerName: companySuspenseLedgerName || null,
             skipped,
             skippedRows,
+            suspenseLedgerUnresolved: !companySuspenseLedgerName && suspenseHeldRows.length > 0,
+            suspenseLedgerCandidates,
+            suspenseHeldRows,
           },
         },
         { status: 400 }
@@ -1314,6 +1330,9 @@ export async function POST(request: Request) {
         companySuspenseLedgerName: companySuspenseLedgerName || null,
         skipped,
         skippedRows,
+        suspenseLedgerUnresolved: !companySuspenseLedgerName && suspenseHeldRows.length > 0,
+        suspenseLedgerCandidates,
+        suspenseHeldRows,
       },
     });
   } catch (error) {
